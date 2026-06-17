@@ -6,7 +6,7 @@ fit and export calibration curves with sensor statistics.
 
 import io
 import json as _json
-from pathlib import Path
+import time
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -14,13 +14,16 @@ import plotly.graph_objects as go
 import matplotlib
 import matplotlib.pyplot as plt
 from scipy import stats
+from streamlit_local_storage import LocalStorage
 
 matplotlib.use("Agg")   # headless backend — no display required
 
-_CONFIG_PATH = Path(__file__).parent / ".sensor_config.json"
-
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Sensor Analysis Studio", layout="wide")
+
+# Config persists in the user's browser (localStorage), not on disk — the
+# deployment filesystem is ephemeral and wipes any saved file on redeploy.
+_local_storage = LocalStorage()
 
 # ── shared colour palette (up to 8 channels + 1 average) ─────────────────────
 PAL = [
@@ -906,34 +909,46 @@ if "cpdf" not in SS:
         "Baseline":      [True, False, False, False],
     })
 
-# Auto-load saved config once per browser session
-if "config_loaded" not in SS:
-    SS["config_loaded"] = True
-    if _CONFIG_PATH.exists():
+def _apply_cfg_dict(d: dict) -> None:
+    """Apply a loaded config dict (from localStorage or an imported JSON file) to session state."""
+    if "conc_unit"   in d: SS.conc_unit   = d["conc_unit"]
+    if "cur_unit"    in d: SS.cur_unit    = d["cur_unit"]
+    if "volt_unit"   in d: SS.volt_unit   = d["volt_unit"]
+    if "cv_cur_unit" in d: SS.cv_cur_unit = d["cv_cur_unit"]
+    if "calibration_points" in d:
+        _cp = pd.DataFrame(d["calibration_points"])
+        for _col in ["Concentration", "t_start", "t_end", "avg_duration"]:
+            if _col in _cp.columns:
+                _cp[_col] = pd.to_numeric(_cp[_col], errors="coerce")
+        if "avg_duration" not in _cp.columns:
+            _cp["avg_duration"] = np.nan
+        if "Baseline" in _cp.columns:
+            _cp["Baseline"] = _cp["Baseline"].astype(bool)
+        SS.cpdf = _cp
+
+
+# Auto-load saved config from the browser's localStorage once per session.
+# The component's value arrives asynchronously, so retry across a couple of
+# reruns before giving up (e.g. first-time users with nothing saved yet).
+if not SS.get("config_loaded"):
+    _raw_cfg = _local_storage.getItem("sensor_config")
+    if _raw_cfg:
         try:
-            _saved = _json.loads(_CONFIG_PATH.read_text())
-            if "conc_unit"   in _saved: SS.conc_unit   = _saved["conc_unit"]
-            if "cur_unit"    in _saved: SS.cur_unit     = _saved["cur_unit"]
-            if "volt_unit"   in _saved: SS.volt_unit    = _saved["volt_unit"]
-            if "cv_cur_unit" in _saved: SS.cv_cur_unit  = _saved["cv_cur_unit"]
-            if "calibration_points" in _saved:
-                _cp = pd.DataFrame(_saved["calibration_points"])
-                for _col in ["Concentration", "t_start", "t_end", "avg_duration"]:
-                    if _col in _cp.columns:
-                        _cp[_col] = pd.to_numeric(_cp[_col], errors="coerce")
-                if "avg_duration" not in _cp.columns:
-                    _cp["avg_duration"] = np.nan
-                if "Baseline" in _cp.columns:
-                    _cp["Baseline"] = _cp["Baseline"].astype(bool)
-                SS.cpdf = _cp
+            _apply_cfg_dict(_json.loads(_raw_cfg))
         except Exception:
             pass
+        SS["config_loaded"] = True
+    else:
+        SS["_cfg_load_tries"] = SS.get("_cfg_load_tries", 0) + 1
+        if SS["_cfg_load_tries"] >= 5:
+            SS["config_loaded"] = True
+        else:
+            time.sleep(0.2)
+            st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar · Save / Load configuration
 # ─────────────────────────────────────────────────────────────────────────────
-import json as _json
-
 with st.sidebar:
     st.header("Sensor Analysis Studio")
     st.radio("Section", ["Amperometry", "Cyclic Voltammetry", "Assay"], key="mode")
@@ -948,22 +963,21 @@ with st.sidebar:
         "calibration_points": SS.cpdf.to_dict(orient="records"),
     }
 
-    # ── Save to disk ──────────────────────────────────────────────────────────
+    # ── Save to browser localStorage ──────────────────────────────────────────
     if st.button("Save", type="primary", use_container_width=True,
-                 help=f"Writes to {_CONFIG_PATH.name} next to app.py — auto-loads next session"):
-        _CONFIG_PATH.write_text(_json.dumps(_cfg, indent=2, default=str))
+                 help="Saves in this browser — auto-loads next time you open the app here"):
+        _local_storage.setItem("sensor_config", _json.dumps(_cfg, default=str))
+        SS["_cfg_saved_at"] = time.strftime("%d %b %Y  %H:%M")
         st.toast("Configuration saved.", icon="✅")
 
-    if _CONFIG_PATH.exists():
-        import datetime as _dt
-        _mtime = _dt.datetime.fromtimestamp(_CONFIG_PATH.stat().st_mtime)
-        st.caption(f"Last saved: {_mtime.strftime('%d %b %Y  %H:%M')}")
+    if SS.get("_cfg_saved_at"):
+        st.caption(f"Last saved: {SS['_cfg_saved_at']}")
     else:
         st.caption("No saved config yet — click Save above.")
 
     st.divider()
 
-    # ── Export / Import (for sharing or backup) ───────────────────────────────
+    # ── Export / Import (for sharing or backup across machines) ────────────────
     with st.expander("Export / Import JSON"):
         st.download_button(
             "Export as JSON",
@@ -981,20 +995,9 @@ with st.sidebar:
         if _cfg_up is not None:
             try:
                 _loaded = _json.loads(_cfg_up.read())
-                if "conc_unit"   in _loaded: SS.conc_unit   = _loaded["conc_unit"]
-                if "cur_unit"    in _loaded: SS.cur_unit     = _loaded["cur_unit"]
-                if "volt_unit"   in _loaded: SS.volt_unit    = _loaded["volt_unit"]
-                if "cv_cur_unit" in _loaded: SS.cv_cur_unit  = _loaded["cv_cur_unit"]
-                if "calibration_points" in _loaded:
-                    _cp = pd.DataFrame(_loaded["calibration_points"])
-                    for _col in ["Concentration", "t_start", "t_end", "avg_duration"]:
-                        if _col in _cp.columns:
-                            _cp[_col] = pd.to_numeric(_cp[_col], errors="coerce")
-                    if "avg_duration" not in _cp.columns:
-                        _cp["avg_duration"] = np.nan
-                    if "Baseline" in _cp.columns:
-                        _cp["Baseline"] = _cp["Baseline"].astype(bool)
-                    SS.cpdf = _cp
+                _apply_cfg_dict(_loaded)
+                _local_storage.setItem("sensor_config", _json.dumps(_loaded, default=str))
+                SS["_cfg_saved_at"] = time.strftime("%d %b %Y  %H:%M")
                 st.success("Imported.")
             except Exception as _exc:
                 st.error(f"Failed: {_exc}")
