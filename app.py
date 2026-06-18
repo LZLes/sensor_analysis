@@ -870,6 +870,8 @@ for _k, _v in [
     ("ts_visible", []),
     ("conc_unit", "mM"),
     ("cur_unit", "µA"),
+    ("vol_unit", "mL"),
+    ("initial_volume", 1.0),
     # Shared / CV
     ("mode",       "Amperometry"),
     ("volt_unit",  "V"),
@@ -903,6 +905,8 @@ if "cpdf" not in SS:
     SS.cpdf = pd.DataFrame({
         "Label":         ["Blank", "Step 1", "Step 2", "Step 3"],
         "Concentration": [0.0, 0.1, 0.5, 1.0],
+        "Spike Vol":     [np.nan, np.nan, np.nan, np.nan],
+        "Stock Conc":    [np.nan, np.nan, np.nan, np.nan],
         "t_start":       [0.0, 120.0, 300.0, 480.0],
         "t_end":         [60.0, 180.0, 360.0, 540.0],
         "avg_duration":  [np.nan, np.nan, np.nan, np.nan],
@@ -911,17 +915,23 @@ if "cpdf" not in SS:
 
 def _apply_cfg_dict(d: dict) -> None:
     """Apply a loaded config dict (from localStorage or an imported JSON file) to session state."""
-    if "conc_unit"   in d: SS.conc_unit   = d["conc_unit"]
-    if "cur_unit"    in d: SS.cur_unit    = d["cur_unit"]
-    if "volt_unit"   in d: SS.volt_unit   = d["volt_unit"]
-    if "cv_cur_unit" in d: SS.cv_cur_unit = d["cv_cur_unit"]
+    if "conc_unit"     in d: SS.conc_unit      = d["conc_unit"]
+    if "cur_unit"      in d: SS.cur_unit       = d["cur_unit"]
+    if "volt_unit"     in d: SS.volt_unit      = d["volt_unit"]
+    if "cv_cur_unit"   in d: SS.cv_cur_unit    = d["cv_cur_unit"]
+    if "vol_unit"      in d: SS.vol_unit       = d["vol_unit"]
+    if "initial_volume" in d: SS.initial_volume = float(d["initial_volume"])
     if "calibration_points" in d:
         _cp = pd.DataFrame(d["calibration_points"])
-        for _col in ["Concentration", "t_start", "t_end", "avg_duration"]:
+        for _col in ["Concentration", "Spike Vol", "Stock Conc", "t_start", "t_end", "avg_duration"]:
             if _col in _cp.columns:
                 _cp[_col] = pd.to_numeric(_cp[_col], errors="coerce")
         if "avg_duration" not in _cp.columns:
             _cp["avg_duration"] = np.nan
+        if "Spike Vol" not in _cp.columns:
+            _cp["Spike Vol"] = np.nan
+        if "Stock Conc" not in _cp.columns:
+            _cp["Stock Conc"] = np.nan
         if "Baseline" in _cp.columns:
             _cp["Baseline"] = _cp["Baseline"].astype(bool)
         SS.cpdf = _cp
@@ -960,6 +970,8 @@ with st.sidebar:
         "cur_unit":           SS.cur_unit,
         "volt_unit":          SS.volt_unit,
         "cv_cur_unit":        SS.cv_cur_unit,
+        "vol_unit":           SS.vol_unit,
+        "initial_volume":     SS.initial_volume,
         "calibration_points": SS.cpdf.to_dict(orient="records"),
     }
 
@@ -2724,11 +2736,16 @@ with T3:
             "**t start / t end** define the averaging window — read these off the "
             "time-series chart. "
             "Check **Baseline?** on the blank or buffer row; its average current "
-            "is subtracted from all other steps."
+            "is subtracted from all other steps. "
+            "**Spike Vol / Stock Conc** are optional — fill them in to use the "
+            "effective concentration calculator below instead of typing "
+            "Concentration by hand."
         )
+        if "cal_editor_version" not in SS:
+            SS.cal_editor_version = 0
         _cpdf_edit = st.data_editor(
             SS.cpdf,
-            key="cal_editor",
+            key=f"cal_editor_{SS.cal_editor_version}",
             num_rows="dynamic",
             use_container_width=True,
             column_config={
@@ -2740,6 +2757,17 @@ with T3:
                     f"Concentration ({SS.conc_unit})",
                     format="%.5g",
                     help="Analyte concentration for this step",
+                ),
+                "Spike Vol": st.column_config.NumberColumn(
+                    f"Spike Vol ({SS.vol_unit})",
+                    format="%.5g",
+                    help="Optional: volume of stock solution spiked in at this step. "
+                         "Used by the effective concentration calculator below.",
+                ),
+                "Stock Conc": st.column_config.NumberColumn(
+                    f"Stock Conc ({SS.conc_unit})",
+                    format="%.5g",
+                    help="Optional: concentration of the stock solution used for this step's spike.",
                 ),
                 "t_start": st.column_config.NumberColumn(
                     "t start (s)",
@@ -2760,6 +2788,43 @@ with T3:
                 ),
             },
         )
+
+        with st.expander("Effective concentration calculator (serial dilution)"):
+            st.caption(
+                "Models a single vessel that starts at **Initial Volume** of blank "
+                "buffer. Each row's **Spike Vol** of **Stock Conc** analyte is added "
+                "in sequence (top to bottom); this computes the cumulative, "
+                "dilution-corrected concentration in the vessel after each "
+                "addition and writes it into the **Concentration** column above. "
+                "Blank Spike Vol / Stock Conc cells are treated as 0."
+            )
+            v1, v2 = st.columns(2)
+            SS.initial_volume = v1.number_input(
+                "Initial volume", min_value=0.0, value=float(SS.initial_volume),
+                format="%.5g",
+                help="Volume of buffer/blank in the vessel before any spikes are added.",
+            )
+            SS.vol_unit = v2.text_input(
+                "Volume unit", SS.vol_unit, help="e.g. mL, µL, L",
+            )
+            if st.button("Compute effective concentrations"):
+                _calc_df = _cpdf_edit.copy()
+                _vol  = float(SS.initial_volume)
+                _mass = 0.0
+                _eff  = []
+                for _, _row in _calc_df.iterrows():
+                    _sv = _row.get("Spike Vol", 0.0)
+                    _sc = _row.get("Stock Conc", 0.0)
+                    _sv = 0.0 if pd.isna(_sv) else float(_sv)
+                    _sc = 0.0 if pd.isna(_sc) else float(_sc)
+                    _vol  += _sv
+                    _mass += _sv * _sc
+                    _eff.append(_mass / _vol if _vol > 0 else np.nan)
+                _calc_df["Concentration"] = _eff
+                SS.cpdf = _calc_df
+                SS.cal_editor_version += 1
+                st.success("Effective concentrations computed — Concentration column updated above.")
+                st.rerun()
 
         st.divider()
 
