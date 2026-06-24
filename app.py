@@ -21,6 +21,28 @@ matplotlib.use("Agg")   # headless backend — no display required
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Sensor Analysis Studio", layout="wide")
 
+# Larger tap targets for touchscreen use — purely cosmetic, no behavior change.
+st.markdown("""
+<style>
+div[data-testid="stButton"] button,
+div[data-testid="stDownloadButton"] button,
+div[data-testid="stFormSubmitButton"] button {
+    min-height: 44px;
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
+}
+div[data-testid="stCheckbox"] label, div[data-testid="stRadio"] label {
+    min-height: 28px;
+    padding: 0.15rem 0;
+}
+div[data-baseweb="select"] { min-height: 44px; }
+div[data-testid="stMultiSelect"] span[data-baseweb="tag"] {
+    padding: 0.3rem 0.5rem;
+    margin: 0.15rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # Config persists in the user's browser (localStorage), not on disk — the
 # deployment filesystem is ephemeral and wipes any saved file on redeploy.
 _local_storage = LocalStorage()
@@ -33,12 +55,41 @@ PAL = [
 AVG_COLOR = "#555555"   # dark charcoal for channel-average — readable on both white and dark backgrounds
 
 
+def _plot_theme() -> dict:
+    """Plotly styling that adapts to the user's actual Streamlit theme (light/dark)."""
+    is_dark = st.context.theme.type != "light"   # None (unknown) treated as dark, today's default
+    return dict(
+        template   = "plotly_dark" if is_dark else "plotly_white",
+        grid       = "rgba(255,255,255,0.1)" if is_dark else "rgba(0,0,0,0.12)",
+        axisline   = "rgba(255,255,255,0.2)" if is_dark else "rgba(0,0,0,0.25)",
+        spike      = "#888" if is_dark else "#555",
+        annot_font = "#e0e0e0" if is_dark else "#222",
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper functions
 # ─────────────────────────────────────────────────────────────────────────────
 
 def to_num(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
+
+
+def smooth_signal(arr: np.ndarray, method: str, window: int, polyorder: int = 2) -> np.ndarray:
+    """Optional smoothing for a 1-D signal. Returns arr unchanged if method == 'None'."""
+    if method == "None" or arr.size == 0:
+        return arr
+    window = max(3, int(window) | 1)   # coerce to odd, >= 3
+    if method == "Moving average":
+        return pd.Series(arr).rolling(window, center=True, min_periods=1).mean().to_numpy()
+    if method == "Savitzky-Golay":
+        from scipy.signal import savgol_filter
+        window = min(window, arr.size if arr.size % 2 else arr.size - 1)
+        if window < 3:
+            return arr
+        po = min(int(polyorder), window - 1)
+        return savgol_filter(arr, window_length=window, polyorder=po, mode="interp")
+    return arr
 
 
 def lin_reg(x: np.ndarray, y: np.ndarray) -> dict | None:
@@ -58,25 +109,59 @@ def lin_reg(x: np.ndarray, y: np.ndarray) -> dict | None:
         return None
 
 
-def _seg_ssr(x: np.ndarray, y: np.ndarray, sl: slice) -> float:
-    xi, yi = x[sl], y[sl]
-    if len(xi) < 2 or np.ptp(xi) == 0:
-        return 1e18
-    try:
-        s, b, *_ = stats.linregress(xi, yi)
-        if not np.isfinite(s):
-            return 1e18
-        return float(np.sum((yi - (s * xi + b)) ** 2))
-    except Exception:
-        return 1e18
-
-
-def piecewise_fit(x_in, y_in, n_seg: int) -> list[dict]:
+def _hinge_fit(x: np.ndarray, y: np.ndarray, breakpoints: list[float]):
     """
-    Optimal piecewise linear fit via exhaustive breakpoint search.
-    Every segment is guaranteed ≥ 2 points; degenerate inputs fall back
-    gracefully to a single-segment fit.
-    Returns [{slope, intercept, r2, xr=(x0, x1)}, ...].
+    Continuous piecewise-linear OLS fit: y = b0 + b1*x + sum_j c_j*relu(x - bp_j).
+    The relu basis forces neighboring segments to meet exactly at each bp_j.
+    Returns (coef, ssr); coef is None (ssr = 1e18) on a degenerate fit.
+    """
+    cols = [np.ones_like(x), x] + [np.clip(x - bp, 0, None) for bp in breakpoints]
+    X = np.column_stack(cols)
+    try:
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    except Exception:
+        return None, 1e18
+    pred = X @ coef
+    if not np.all(np.isfinite(pred)):
+        return None, 1e18
+    return coef, float(np.sum((y - pred) ** 2))
+
+
+def _hinge_segments(x: np.ndarray, y: np.ndarray, idx_bounds: list[int],
+                     breakpoints: list[float], coef: np.ndarray) -> list[dict]:
+    """Derive per-segment {slope, intercept, r2, xr} dicts from continuous hinge coefficients."""
+    cols = [np.ones_like(x), x] + [np.clip(x - bp, 0, None) for bp in breakpoints]
+    pred = np.column_stack(cols) @ coef
+    slope, intercept = coef[1], coef[0]
+    segs = []
+    for i in range(len(idx_bounds) - 1):
+        if i > 0:
+            c, bp = coef[i + 1], breakpoints[i - 1]
+            slope = slope + c
+            intercept = intercept - c * bp
+        sl = slice(idx_bounds[i], idx_bounds[i + 1])
+        xi, yi, pi = x[sl], y[sl], pred[sl]
+        x0 = breakpoints[i - 1] if i > 0 else x[0]
+        x1 = breakpoints[i] if i < len(breakpoints) else x[-1]
+        if xi.size >= 2 and np.ptp(yi) > 0:
+            ss_res = float(np.sum((yi - pi) ** 2))
+            ss_tot = float(np.sum((yi - yi.mean()) ** 2))
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        else:
+            r2 = float("nan")
+        segs.append(dict(slope=float(slope), intercept=float(intercept),
+                          r2=r2, xr=(float(x0), float(x1))))
+    return segs
+
+
+def piecewise_fit(x_in, y_in, n_seg: int) -> dict:
+    """
+    Continuous ("broken-stick") piecewise linear fit via exhaustive breakpoint
+    search. Every segment is guaranteed >= 2 points; degenerate inputs fall
+    back gracefully to a single-segment fit. Because segments share one
+    continuous model, neighboring fit lines always meet exactly at each
+    breakpoint (no jump).
+    Returns {"segments": [{slope, intercept, r2, xr=(x0, x1)}, ...], "breakpoints": [x, ...]}.
     """
     x = np.asarray(x_in, float)
     y = np.asarray(y_in, float)
@@ -84,76 +169,65 @@ def piecewise_fit(x_in, y_in, n_seg: int) -> list[dict]:
     x, y = x[ok], y[ok]
     n = len(x)
     if n < 2:
-        return []
+        return {"segments": [], "breakpoints": []}
     ix = np.argsort(x)
     x, y = x[ix], y[ix]
 
-    def build(bps: list[int]) -> list[dict]:
-        bounds = [0] + bps + [n]
-        out = []
-        for i in range(len(bounds) - 1):
-            sl = slice(bounds[i], bounds[i + 1])
-            xi, yi = x[sl], y[sl]
-            f = lin_reg(xi, yi)
-            if f:
-                f["xr"] = (float(xi[0]), float(xi[-1]))
-                out.append(f)
-        return out
-
-    def _single() -> list[dict]:
+    def _single() -> dict:
         f = lin_reg(x, y)
         if f:
             f["xr"] = (float(x[0]), float(x[-1]))
-            return [f]
-        return []
+            return {"segments": [f], "breakpoints": []}
+        return {"segments": [], "breakpoints": []}
 
     # Need ≥ 2 points per segment
     if n_seg <= 1 or n < n_seg * 2:
         return _single()
 
-    # Defaults are evenly-spaced so build() always has a valid partition even
-    # when the search loop is empty (n exactly equals n_seg * 2).
+    # Defaults are evenly-spaced so the search always has a valid fallback
+    # partition even when the loop below is empty (n exactly equals n_seg * 2).
     if n_seg == 2:
-        best, bi = 1e18, n // 2
+        best, bk = 1e18, n // 2
         # k in [2, n-2) ensures both segments have ≥ 2 points
         for k in range(2, n - 2):
-            v = _seg_ssr(x, y, slice(0, k)) + _seg_ssr(x, y, slice(k, n))
-            if v < best:
-                best, bi = v, k
-        return build([bi])
+            _, ssr = _hinge_fit(x, y, [x[k]])
+            if ssr < best:
+                best, bk = ssr, k
+        bps_idx = [bk]
 
-    if n_seg == 3:
-        best = 1e18
-        bi, bj = n // 3, 2 * n // 3
+    elif n_seg == 3:
+        best, bk1, bk2 = 1e18, n // 3, 2 * n // 3
         for k1 in range(2, n - 4):
             for k2 in range(k1 + 2, n - 2):
-                v = (_seg_ssr(x, y, slice(0, k1)) +
-                     _seg_ssr(x, y, slice(k1, k2)) +
-                     _seg_ssr(x, y, slice(k2, n)))
-                if v < best:
-                    best, bi, bj = v, k1, k2
-        return build([bi, bj])
+                _, ssr = _hinge_fit(x, y, [x[k1], x[k2]])
+                if ssr < best:
+                    best, bk1, bk2 = ssr, k1, k2
+        bps_idx = [bk1, bk2]
 
-    if n_seg == 4:
-        best = 1e18
-        b1, b2, b3 = n // 4, n // 2, 3 * n // 4
+    elif n_seg == 4:
+        best, b1i, b2i, b3i = 1e18, n // 4, n // 2, 3 * n // 4
         for k1 in range(2, n - 6):
             for k2 in range(k1 + 2, n - 4):
                 for k3 in range(k2 + 2, n - 2):
-                    v = (_seg_ssr(x, y, slice(0, k1)) +
-                         _seg_ssr(x, y, slice(k1, k2)) +
-                         _seg_ssr(x, y, slice(k2, k3)) +
-                         _seg_ssr(x, y, slice(k3, n)))
-                    if v < best:
-                        best, b1, b2, b3 = v, k1, k2, k3
-        return build([b1, b2, b3])
+                    _, ssr = _hinge_fit(x, y, [x[k1], x[k2], x[k3]])
+                    if ssr < best:
+                        best, b1i, b2i, b3i = ssr, k1, k2, k3
+        bps_idx = [b1i, b2i, b3i]
 
-    # n_seg > 4: evenly-spaced breakpoints, clamped to ≥ 2 pts per segment
-    bps = sorted(set(
-        max(2 * i, min(n - 2 * (n_seg - i), int(n * i / n_seg)))
-        for i in range(1, n_seg)
-    ))
-    return build(bps)
+    else:
+        # n_seg > 4: evenly-spaced breakpoints, clamped to ≥ 2 pts per segment
+        bps_idx = sorted(set(
+            max(2 * i, min(n - 2 * (n_seg - i), int(n * i / n_seg)))
+            for i in range(1, n_seg)
+        ))
+
+    breakpoints = [float(x[k]) for k in bps_idx]
+    coef, _ = _hinge_fit(x, y, breakpoints)
+    if coef is None:
+        return _single()
+    idx_bounds = [0] + bps_idx + [n]
+    segs = _hinge_segments(x, y, idx_bounds, breakpoints, coef)
+    return {"segments": segs, "breakpoints": breakpoints}
 
 
 def fmt(val, p: int = 4) -> str:
@@ -515,7 +589,8 @@ def render_cal_png(res_map: dict, ft: str, ns: int,
             _yerr  = errs if res.get("is_average") else None
             ax.errorbar(x, y, yerr=_yerr, fmt=marker, color=col, label=ch_name,
                         capsize=4, markersize=7, linewidth=1.4, elinewidth=1.2)
-            segs = piecewise_fit(x, y, int(ns) if ft == "Segmented Linear" else 1)
+            _pf = piecewise_fit(x, y, int(ns) if ft == "Segmented Linear" else 1)
+            segs, breakpoints = _pf["segments"], _pf["breakpoints"]
             sigma_bl = float(res.get("sigma_bl", np.nan))
             _ch_lines = [ch_name + ":"]
             for k, seg in enumerate(segs):
@@ -534,6 +609,11 @@ def render_cal_png(res_map: dict, ft: str, ns: int,
                         f"{_pfx}Sens = {s:.3g} {cur_unit}/{conc_unit}"
                         f"   LOD = {lod:.3g}   LOQ = {loq:.3g} {conc_unit}"
                     )
+            for bp in breakpoints:
+                ax.axvline(bp, linestyle=":", color=col, linewidth=1.2)
+                ax.annotate(f"{bp:.3g} {conc_unit}", xy=(bp, 1), xycoords=("data", "axes fraction"),
+                            xytext=(2, -2), textcoords="offset points",
+                            fontsize=_afs, color=col, rotation=90, va="top", ha="left")
             _annot_blocks.append("\n".join(_ch_lines))
         ax.set_xlabel(f"Concentration ({conc_unit})", fontsize=_lfs)
         ax.set_ylabel(f"ΔI ({cur_unit})", fontsize=_lfs)
@@ -751,8 +831,9 @@ def _plate_fig(plate_df: pd.DataFrame | None, std_wells: dict,
             marker=dict(color=_lcol, size=10, symbol="circle"),
             name=_ltxt, showlegend=True,
         ))
+    _pt = _plot_theme()
     fig.update_layout(
-        height=345, template="plotly_dark",
+        height=345, template=_pt["template"],
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         xaxis=dict(tickmode="array", tickvals=list(range(1, 13)),
                    ticktext=[str(i) for i in range(1, 13)],
@@ -872,6 +953,9 @@ for _k, _v in [
     ("cur_unit", "µA"),
     ("vol_unit", "mL"),
     ("initial_volume", 1.0),
+    ("smooth_method", "None"),
+    ("smooth_window", 11),
+    ("smooth_polyorder", 2),
     # Shared / CV
     ("mode",       "Amperometry"),
     ("volt_unit",  "V"),
@@ -921,6 +1005,9 @@ def _apply_cfg_dict(d: dict) -> None:
     if "cv_cur_unit"   in d: SS.cv_cur_unit    = d["cv_cur_unit"]
     if "vol_unit"      in d: SS.vol_unit       = d["vol_unit"]
     if "initial_volume" in d: SS.initial_volume = float(d["initial_volume"])
+    if "smooth_method"    in d: SS.smooth_method    = d["smooth_method"]
+    if "smooth_window"    in d: SS.smooth_window     = int(d["smooth_window"])
+    if "smooth_polyorder" in d: SS.smooth_polyorder  = int(d["smooth_polyorder"])
     if "calibration_points" in d:
         _cp = pd.DataFrame(d["calibration_points"])
         for _col in ["Concentration", "Spike Vol", "Stock Conc", "t_start", "t_end", "avg_duration"]:
@@ -972,6 +1059,9 @@ with st.sidebar:
         "cv_cur_unit":        SS.cv_cur_unit,
         "vol_unit":           SS.vol_unit,
         "initial_volume":     SS.initial_volume,
+        "smooth_method":      SS.smooth_method,
+        "smooth_window":      SS.smooth_window,
+        "smooth_polyorder":   SS.smooth_polyorder,
         "calibration_points": SS.cpdf.to_dict(orient="records"),
     }
 
@@ -1147,9 +1237,10 @@ if SS.mode == "Cyclic Voltammetry":
                                   key=f"{key_prefix}_sty")
             _fmt = _c2.selectbox("Format", ["SVG", "PNG", "PDF", "TIFF"],
                                   key=f"{key_prefix}_fmt")
-            _dpi = _c3.select_slider("DPI", [150, 300, 600], value=300,
-                                      key=f"{key_prefix}_dpi",
-                                      disabled=_fmt in ["SVG", "PDF"])
+            _dpi = _c3.segmented_control("DPI", [150, 300, 600], default=300,
+                                          required=True,
+                                          key=f"{key_prefix}_dpi",
+                                          disabled=_fmt in ["SVG", "PDF"])
             _sz  = _c4.selectbox(
                 "Width",
                 ["Single (3.5\")", "1.5-col (5\")", "Double (7\")", "Full (6.5\")"],
@@ -1460,21 +1551,22 @@ if SS.mode == "Cyclic Voltammetry":
                                             line=dict(width=1, color="white")),
                             ))
 
-            _fig_cvp.add_hline(y=0, line=dict(color="rgba(255,255,255,0.2)", width=1, dash="dash"))
+            _pt = _plot_theme()
+            _fig_cvp.add_hline(y=0, line=dict(color=_pt["axisline"], width=1, dash="dash"))
             _fig_cvp.update_layout(
                 xaxis_title=f"Potential ({SS.volt_unit})",
                 yaxis_title=f"Current ({SS.cv_cur_unit})",
-                height=560, template="plotly_dark",
+                height=560, template=_pt["template"],
                 paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 showlegend=True, hovermode="closest",
                 legend=dict(
                     orientation="v", x=1.02, y=1, xanchor="left",
                     groupclick="toggleitem",
                 ),
-                xaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.1)",
-                           linecolor="rgba(255,255,255,0.2)"),
-                yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.1)",
-                           linecolor="rgba(255,255,255,0.2)"),
+                xaxis=dict(showgrid=True, gridcolor=_pt["grid"],
+                           linecolor=_pt["axisline"]),
+                yaxis=dict(showgrid=True, gridcolor=_pt["grid"],
+                           linecolor=_pt["axisline"]),
             )
             st.plotly_chart(_fig_cvp, use_container_width=True,
                             config={"scrollZoom": True, "displayModeBar": True,
@@ -1670,15 +1762,16 @@ if SS.mode == "Cyclic Voltammetry":
                     _ch4_data[_chn4] = (pd.DataFrame(_rows4)
                                          .sort_values("scan_rate").reset_index(drop=True))
 
+                _pt4 = _plot_theme()
                 _dl4 = dict(
-                    template="plotly_dark",
+                    template=_pt4["template"],
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     showlegend=True, height=420,
                     legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                    xaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.1)",
-                               linecolor="rgba(255,255,255,0.2)"),
-                    yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.1)",
-                               linecolor="rgba(255,255,255,0.2)"),
+                    xaxis=dict(showgrid=True, gridcolor=_pt4["grid"],
+                               linecolor=_pt4["axisline"]),
+                    yaxis=dict(showgrid=True, gridcolor=_pt4["grid"],
+                               linecolor=_pt4["axisline"]),
                 )
 
                 st.subheader("Peak Current vs Scan Rate")
@@ -2218,24 +2311,26 @@ if SS.mode == "Assay":
                     x=_xp3, y=_yp3, name="Fit", mode="lines",
                     line=dict(color="#ff9230", dash="dash", width=2.5), showlegend=True,
                 ))
+                _pt3 = _plot_theme()
                 _fig_sc.update_layout(
                     xaxis_title=f"Concentration ({SS['assay_conc_unit']})",
                     yaxis_title=f"ΔSignal ({SS['assay_sig_unit']})",
-                    height=500, template="plotly_dark",
+                    height=500, template=_pt3["template"],
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                     showlegend=True,
                     legend=dict(orientation="h", yanchor="bottom", y=1.02),
                     hovermode="closest",
-                    xaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.1)",
-                               linecolor="rgba(255,255,255,0.2)"),
-                    yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.1)",
-                               linecolor="rgba(255,255,255,0.2)",
-                               zeroline=True, zerolinecolor="rgba(255,255,255,0.2)"),
+                    xaxis=dict(showgrid=True, gridcolor=_pt3["grid"],
+                               linecolor=_pt3["axisline"]),
+                    yaxis=dict(showgrid=True, gridcolor=_pt3["grid"],
+                               linecolor=_pt3["axisline"],
+                               zeroline=True, zerolinecolor=_pt3["axisline"]),
                     annotations=[dict(
                         text=_eq3, xref="paper", yref="paper", x=0.02, y=0.98,
                         xanchor="left", yanchor="top",
-                        font=dict(size=11, color="#e0e0e0"), showarrow=False,
-                        bgcolor="rgba(30,30,30,0.75)", bordercolor="#555",
+                        font=dict(size=11, color=_pt3["annot_font"]), showarrow=False,
+                        bgcolor="rgba(30,30,30,0.75)" if _pt3["template"] == "plotly_dark" else "rgba(255,255,255,0.75)",
+                        bordercolor="#555",
                         borderwidth=1, borderpad=6,
                     )],
                 )
@@ -2307,8 +2402,9 @@ if SS.mode == "Assay":
                     _a3p1, _a3p2, _a3p3, _a3p4 = st.columns(4)
                     _a3_sty = _a3p1.selectbox("Style", ["Origin","Minimal"], key="as3_sty")
                     _a3_fmt = _a3p2.selectbox("Format", ["SVG","PNG","PDF","TIFF"], key="as3_fmt")
-                    _a3_dpi = _a3p3.select_slider("DPI", [150,300,600], value=300,
-                                                   key="as3_dpi", disabled=_a3_fmt in ["SVG","PDF"])
+                    _a3_dpi = _a3p3.segmented_control("DPI", [150,300,600], default=300,
+                                                        required=True,
+                                                        key="as3_dpi", disabled=_a3_fmt in ["SVG","PDF"])
                     _a3_sz  = _a3p4.selectbox(
                         "Width",
                         ["Single (3.5\")","1.5-col (5\")","Double (7\")","Full (6.5\")"],
@@ -2620,6 +2716,28 @@ with T2:
             "orange for the baseline, blue for analyte steps."
         )
 
+        with st.expander("Signal smoothing", expanded=False):
+            st.caption(
+                "Optional — smooths the trace shown below and the signal used for the "
+                "calibration averaging windows in the **Calibration Curve** tab. Off by default."
+            )
+            sm1, sm2, sm3 = st.columns(3)
+            SS.smooth_method = sm1.selectbox(
+                "Method", ["None", "Moving average", "Savitzky-Golay"],
+                index=["None", "Moving average", "Savitzky-Golay"].index(SS.smooth_method),
+            )
+            if SS.smooth_method != "None":
+                SS.smooth_window = int(sm2.number_input(
+                    "Window (samples)", min_value=3, value=int(SS.smooth_window), step=2,
+                    help="Odd number of samples in the smoothing window.",
+                ))
+                if SS.smooth_method == "Savitzky-Golay":
+                    SS.smooth_polyorder = int(sm3.number_input(
+                        "Polynomial order", min_value=1, max_value=5,
+                        value=int(SS.smooth_polyorder),
+                        help="Must be less than the window size.",
+                    ))
+
         _all_ch_names = [c["name"] for c in chs]
         _vis_key = "ts_vis_ms"
         # Reset multiselect state if channels have changed since last config apply
@@ -2649,14 +2767,28 @@ with T2:
         for j, ch in enumerate(chs):
             if ch["name"] not in sel:
                 continue
+            _t = to_num(df[ch["tc"]])
+            _i_raw = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+            _i_smooth = smooth_signal(_i_raw, SS.smooth_method, SS.smooth_window, SS.smooth_polyorder)
+            _col = PAL[j % len(PAL)]
+            if SS.smooth_method != "None":
+                fig_ts.add_trace(go.Scatter(
+                    x=_t, y=_i_raw,
+                    name=f"{ch['name']} (raw)",
+                    mode="lines",
+                    opacity=0.35,
+                    line=dict(color=_col, width=1),
+                    showlegend=False,
+                ))
             fig_ts.add_trace(go.Scatter(
-                x=to_num(df[ch["tc"]]),
-                y=to_num(df[ch["ic"]]),
+                x=_t,
+                y=_i_smooth,
                 name=ch["name"],
                 mode="lines",
-                line=dict(color=PAL[j % len(PAL)], width=1.5),
+                line=dict(color=_col, width=1.5),
             ))
 
+        _pt_ts = _plot_theme()
         for _, row in SS.cpdf.iterrows():
             _ets2 = _eff_t_start(row)
             if _ets2 is not None and pd.notna(row.get("t_end")):
@@ -2667,7 +2799,7 @@ with T2:
                     fillcolor=clr, layer="below", line_width=0,
                     annotation_text=str(row["Label"]),
                     annotation_position="top left",
-                    annotation=dict(font_size=10, font_color="#e0e0e0"),
+                    annotation=dict(font_size=10, font_color=_pt_ts["annot_font"]),
                 )
 
         fig_ts.update_layout(
@@ -2675,7 +2807,7 @@ with T2:
             yaxis_title=f"Current ({SS.cur_unit})",
             hovermode="x unified",
             height=580,
-            template="plotly_dark",
+            template=_pt_ts["template"],
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             showlegend=True,
@@ -2689,15 +2821,15 @@ with T2:
                 rangeslider=dict(visible=True, thickness=0.05,
                                  bgcolor="rgba(255,255,255,0.05)"),
                 showspikes=True, spikemode="across", spikesnap="cursor",
-                spikecolor="#888", spikethickness=1, spikedash="dot",
-                showgrid=True, gridcolor="rgba(255,255,255,0.1)",
-                linecolor="rgba(255,255,255,0.2)",
+                spikecolor=_pt_ts["spike"], spikethickness=1, spikedash="dot",
+                showgrid=True, gridcolor=_pt_ts["grid"],
+                linecolor=_pt_ts["axisline"],
             ),
             yaxis=dict(
                 showspikes=True, spikemode="across",
-                spikecolor="#888", spikethickness=1, spikedash="dot",
-                showgrid=True, gridcolor="rgba(255,255,255,0.1)",
-                linecolor="rgba(255,255,255,0.2)",
+                spikecolor=_pt_ts["spike"], spikethickness=1, spikedash="dot",
+                showgrid=True, gridcolor=_pt_ts["grid"],
+                linecolor=_pt_ts["axisline"],
                 fixedrange=False,
             ),
         )
@@ -2830,6 +2962,11 @@ with T3:
 
         # ── Analysis settings ─────────────────────────────────────────────
         st.subheader("Analysis Settings")
+        if SS.smooth_method != "None":
+            st.caption(
+                f"Averaging below uses the **{SS.smooth_method}** smoothing "
+                "configured in the Time Series tab."
+            )
         a1, a2, a3 = st.columns(3)
         analyze_chs = a1.multiselect(
             "Channels to analyse",
@@ -2887,6 +3024,7 @@ with T3:
                 ch    = next(c for c in SS.channels if c["name"] == ch_name)
                 t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
                 i_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+                i_arr = smooth_signal(i_arr, SS.smooth_method, SS.smooth_window, SS.smooth_polyorder)
 
                 avgs, sigs, n_pts, t_starts_used = [], [], [], []
                 for _, row in cpdf.iterrows():
@@ -3030,7 +3168,8 @@ with T3:
                     ),
                 ))
 
-                segs = piecewise_fit(x, y, int(ns) if ft == "Segmented Linear" else 1)
+                _pf = piecewise_fit(x, y, int(ns) if ft == "Segmented Linear" else 1)
+                segs, breakpoints = _pf["segments"], _pf["breakpoints"]
                 for k, seg in enumerate(segs):
                     xp = np.linspace(seg["xr"][0], seg["xr"][1], 300)
                     yp = seg["slope"] * xp + seg["intercept"]
@@ -3064,12 +3203,21 @@ with T3:
                         f"σ blank ({SS.cur_unit})": fmt(sigma),
                     })
 
+                for bp in breakpoints:
+                    fig_cal.add_vline(
+                        x=bp, line_dash="dot", line_color=col, line_width=1.5,
+                        annotation_text=f"{bp:.3g} {SS.conc_unit}",
+                        annotation_position="top",
+                        annotation_font_color=col,
+                    )
+
+            _pt_cal = _plot_theme()
             fig_cal.update_layout(
                 xaxis_title=f"Concentration ({SS.conc_unit})",
                 yaxis_title=f"ΔI ({SS.cur_unit})",
                 hovermode="closest",
                 height=520,
-                template="plotly_dark",
+                template=_pt_cal["template"],
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
                 showlegend=True,
@@ -3077,16 +3225,16 @@ with T3:
                 hoverdistance=40,
                 xaxis=dict(
                     showspikes=True, spikemode="across", spikesnap="cursor",
-                    spikecolor="#888", spikethickness=1, spikedash="dot",
-                    showgrid=True, gridcolor="rgba(255,255,255,0.1)",
-                    linecolor="rgba(255,255,255,0.2)",
+                    spikecolor=_pt_cal["spike"], spikethickness=1, spikedash="dot",
+                    showgrid=True, gridcolor=_pt_cal["grid"],
+                    linecolor=_pt_cal["axisline"],
                 ),
                 yaxis=dict(
                     showspikes=True, spikemode="across",
-                    spikecolor="#888", spikethickness=1, spikedash="dot",
-                    showgrid=True, gridcolor="rgba(255,255,255,0.1)",
-                    linecolor="rgba(255,255,255,0.2)",
-                    zeroline=True, zerolinecolor="rgba(255,255,255,0.2)",
+                    spikecolor=_pt_cal["spike"], spikethickness=1, spikedash="dot",
+                    showgrid=True, gridcolor=_pt_cal["grid"],
+                    linecolor=_pt_cal["axisline"],
+                    zeroline=True, zerolinecolor=_pt_cal["axisline"],
                 ),
             )
             st.plotly_chart(fig_cal, use_container_width=True,
@@ -3234,8 +3382,8 @@ with T4:
                 "Format", ["SVG", "PNG", "PDF", "TIFF"], key="pub_fmt",
                 help="SVG/PDF are vector — infinitely scalable and editable in Illustrator / Inkscape.",
             )
-            _pdpi = _pc3.select_slider(
-                "DPI", options=[150, 300, 600], value=300, key="pub_dpi",
+            _pdpi = _pc3.segmented_control(
+                "DPI", options=[150, 300, 600], default=300, required=True, key="pub_dpi",
                 disabled=_pfmt in ["SVG", "PDF"],
                 help="Ignored for SVG/PDF.",
             )
