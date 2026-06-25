@@ -582,9 +582,13 @@ def render_cal_png(res_map: dict, ft: str, ns: int,
         _annot_blocks = []
         for j, (ch_name, res) in enumerate(res_map.items()):
             col  = AVG_COLOR if res.get("is_average") else PAL[j % len(PAL)]
-            x    = res["concs"]
-            y    = np.array(res["delta_i"], float)
-            errs = [float(s) if (s and not np.isnan(s)) else 0.0 for s in res["sigs"]]
+            # Same blank-exclusion as the in-app Plotly chart, kept in sync.
+            _keep = [not bool(b) for b in
+                     res.get("baselines", [False] * len(res["concs"]))]
+            x    = np.asarray(res["concs"], dtype=float)[_keep]
+            y    = np.array(res["delta_i"], float)[_keep]
+            errs = [float(s) if (s and not np.isnan(s)) else 0.0
+                    for s in np.asarray(res["sigs"], dtype=float)[_keep]]
             marker = "D" if res.get("is_average") else "o"
             _yerr  = errs if res.get("is_average") else None
             ax.errorbar(x, y, yerr=_yerr, fmt=marker, color=col, label=ch_name,
@@ -951,7 +955,7 @@ for _k, _v in [
     ("ts_visible", []),
     ("conc_unit", "mM"),
     ("cur_unit", "µA"),
-    ("vol_unit", "mL"),
+    ("vol_unit", "µL"),
     ("initial_volume", 1.0),
     ("smooth_method", "None"),
     ("smooth_window", 11),
@@ -2925,10 +2929,13 @@ with T3:
             st.caption(
                 "Models a single vessel that starts at **Initial Volume** of blank "
                 "buffer. Each row's **Spike Vol** of **Stock Conc** analyte is added "
-                "in sequence (top to bottom); this computes the cumulative, "
-                "dilution-corrected concentration in the vessel after each "
-                "addition and writes it into the **Concentration** column above. "
-                "Blank Spike Vol / Stock Conc cells are treated as 0."
+                "in sequence (top to bottom); the cumulative, dilution-corrected "
+                "concentration in the vessel after each addition is computed "
+                "automatically and kept in sync with the **Concentration** column "
+                "above (whenever any row has Spike Vol / Stock Conc filled in). "
+                "**t start** is likewise kept in sync with **Avg window (s)** "
+                "whenever that column is set. Blank Spike Vol / Stock Conc cells "
+                "are treated as 0."
             )
             v1, v2 = st.columns(2)
             SS.initial_volume = v1.number_input(
@@ -2939,24 +2946,34 @@ with T3:
             SS.vol_unit = v2.text_input(
                 "Volume unit", SS.vol_unit, help="e.g. mL, µL, L",
             )
-            if st.button("Compute effective concentrations"):
-                _calc_df = _cpdf_edit.copy()
-                _vol  = float(SS.initial_volume)
-                _mass = 0.0
-                _eff  = []
-                for _, _row in _calc_df.iterrows():
-                    _sv = _row.get("Spike Vol", 0.0)
-                    _sc = _row.get("Stock Conc", 0.0)
-                    _sv = 0.0 if pd.isna(_sv) else float(_sv)
-                    _sc = 0.0 if pd.isna(_sc) else float(_sc)
-                    _vol  += _sv
-                    _mass += _sv * _sc
-                    _eff.append(_mass / _vol if _vol > 0 else np.nan)
-                _calc_df["Concentration"] = _eff
-                SS.cpdf = _calc_df
-                SS.cal_editor_version += 1
-                st.success("Effective concentrations computed — Concentration column updated above.")
-                st.rerun()
+
+        # Auto-fill: effective concentration (serial dilution) + t_start from
+        # the averaging window. Runs every rerun so the table always reflects
+        # the latest Spike Vol / Stock Conc / Avg window edits, with no button.
+        _auto_df = _cpdf_edit.copy()
+        if _auto_df[["Spike Vol", "Stock Conc"]].notna().any().any():
+            _vol  = float(SS.initial_volume)
+            _mass = 0.0
+            _eff  = []
+            for _, _row in _auto_df.iterrows():
+                _sv = _row.get("Spike Vol", 0.0)
+                _sc = _row.get("Stock Conc", 0.0)
+                _sv = 0.0 if pd.isna(_sv) else float(_sv)
+                _sc = 0.0 if pd.isna(_sc) else float(_sc)
+                _vol  += _sv
+                _mass += _sv * _sc
+                _eff.append(_mass / _vol if _vol > 0 else np.nan)
+            _auto_df["Concentration"] = _eff
+        for _ti, _trow in _auto_df.iterrows():
+            if pd.notna(_trow.get("avg_duration")) and pd.notna(_trow.get("t_end")):
+                _auto_df.at[_ti, "t_start"] = _eff_t_start(_trow)
+
+        if not _auto_df.equals(_cpdf_edit):
+            SS.cpdf = _auto_df
+            SS.cal_editor_version += 1
+            st.rerun()
+        else:
+            SS.cpdf = _cpdf_edit
 
         st.divider()
 
@@ -3005,7 +3022,6 @@ with T3:
         )
 
         if st.button("Compute Calibration", type="primary"):
-            SS.cpdf = _cpdf_edit
             df   = SS.df
             cpdf = (SS.cpdf
                     .dropna(subset=["Concentration", "t_end"])
@@ -3100,6 +3116,7 @@ with T3:
                     delta_i    = avg_delta_i.tolist(),
                     sigma_bl   = float(sigma_bl_avg),
                     is_average = True,
+                    baselines  = results[analyze_chs[0]]["baselines"],
                 )
 
             SS.cal_results = dict(
@@ -3146,15 +3163,22 @@ with T3:
             for j, (ch_name, res) in enumerate(res_map.items()):
                 is_avg = res.get("is_average", False)
                 col    = AVG_COLOR if is_avg else PAL[j % len(PAL)]
-                x      = res["concs"]
-                y      = np.array(res["delta_i"], float)
+                # Exclude the blank/baseline point from the plotted curve and
+                # the fit — it's ΔI = 0 by construction and isn't a real
+                # calibration step. Still shown in "Averaging window details".
+                _keep  = [not bool(b) for b in
+                          res.get("baselines", [False] * len(res["concs"]))]
+                x      = np.asarray(res["concs"], dtype=float)[_keep]
+                y      = np.array(res["delta_i"], float)[_keep]
+                labels_plot = np.asarray(res["labels"], dtype=object)[_keep]
+                sigs_plot   = np.asarray(res["sigs"], dtype=float)[_keep]
                 marker_sym = "diamond" if is_avg else "circle"
 
                 fig_cal.add_trace(go.Scatter(
                     x=x, y=y,
                     name=ch_name,
                     mode="markers+text",
-                    text=res["labels"],
+                    text=labels_plot,
                     textposition="top center",
                     textfont=dict(size=10),
                     marker=dict(color=col, size=10, symbol=marker_sym,
@@ -3162,7 +3186,7 @@ with T3:
                     error_y=dict(
                         type="data",
                         array=[float(s) if (s and not np.isnan(s)) else 0.0
-                               for s in res["sigs"]],
+                               for s in sigs_plot],
                         visible=is_avg, color=col,
                         thickness=1.5, width=4,
                     ),
