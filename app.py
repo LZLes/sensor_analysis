@@ -2929,13 +2929,12 @@ with T3:
             st.caption(
                 "Models a single vessel that starts at **Initial Volume** of blank "
                 "buffer. Each row's **Spike Vol** of **Stock Conc** analyte is added "
-                "in sequence (top to bottom); the cumulative, dilution-corrected "
-                "concentration in the vessel after each addition is computed "
-                "automatically and kept in sync with the **Concentration** column "
-                "above (whenever any row has Spike Vol / Stock Conc filled in). "
-                "**t start** is likewise kept in sync with **Avg window (s)** "
-                "whenever that column is set. Blank Spike Vol / Stock Conc cells "
-                "are treated as 0."
+                "in sequence (top to bottom); clicking the button below computes "
+                "the cumulative, dilution-corrected concentration after each "
+                "addition and writes it into the **Concentration** column above. "
+                "**t start** is filled in from **Avg window (s)** at the same time, "
+                "for any row where that column is set. Blank Spike Vol / Stock Conc "
+                "cells are treated as 0."
             )
             v1, v2 = st.columns(2)
             SS.initial_volume = v1.number_input(
@@ -2946,35 +2945,30 @@ with T3:
             SS.vol_unit = v2.text_input(
                 "Volume unit", SS.vol_unit, help="e.g. mL, µL, L",
             )
+            if st.button("Update Concentration & t start"):
+                _calc_df = _cpdf_edit.copy()
+                if _calc_df[["Spike Vol", "Stock Conc"]].notna().any().any():
+                    _vol  = float(SS.initial_volume)
+                    _mass = 0.0
+                    _eff  = []
+                    for _, _row in _calc_df.iterrows():
+                        _sv = _row.get("Spike Vol", 0.0)
+                        _sc = _row.get("Stock Conc", 0.0)
+                        _sv = 0.0 if pd.isna(_sv) else float(_sv)
+                        _sc = 0.0 if pd.isna(_sc) else float(_sc)
+                        _vol  += _sv
+                        _mass += _sv * _sc
+                        _eff.append(_mass / _vol if _vol > 0 else np.nan)
+                    _calc_df["Concentration"] = _eff
+                for _ti, _trow in _calc_df.iterrows():
+                    if pd.notna(_trow.get("avg_duration")) and pd.notna(_trow.get("t_end")):
+                        _calc_df.at[_ti, "t_start"] = _eff_t_start(_trow)
+                SS.cpdf = _calc_df
+                SS.cal_editor_version += 1
+                st.success("Concentration / t start updated above.")
+                st.rerun()
 
-        # Auto-fill: effective concentration (serial dilution) + t_start from
-        # the averaging window. Runs every rerun so the table always reflects
-        # the latest Spike Vol / Stock Conc / Avg window edits, with no button.
-        _auto_df = _cpdf_edit.copy()
-        if _auto_df[["Spike Vol", "Stock Conc"]].notna().any().any():
-            _vol  = float(SS.initial_volume)
-            _mass = 0.0
-            _eff  = []
-            for _, _row in _auto_df.iterrows():
-                _sv = _row.get("Spike Vol", 0.0)
-                _sc = _row.get("Stock Conc", 0.0)
-                _sv = 0.0 if pd.isna(_sv) else float(_sv)
-                _sc = 0.0 if pd.isna(_sc) else float(_sc)
-                _vol  += _sv
-                _mass += _sv * _sc
-                _eff.append(_mass / _vol if _vol > 0 else np.nan)
-            _auto_df["Concentration"] = _eff
-        for _ti, _trow in _auto_df.iterrows():
-            if pd.notna(_trow.get("avg_duration")) and pd.notna(_trow.get("t_end")):
-                _auto_df.at[_ti, "t_start"] = _eff_t_start(_trow)
-
-        if not _auto_df.equals(_cpdf_edit):
-            SS.cpdf = _auto_df
-            SS.cal_editor_version += 1
-            st.rerun()
-        else:
-            SS.cpdf = _cpdf_edit
-
+        SS.cpdf = _cpdf_edit
         st.divider()
 
         # ── Analysis settings ─────────────────────────────────────────────
