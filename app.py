@@ -252,6 +252,11 @@ def _eff_t_start(row) -> float | None:
     return float(v) if pd.notna(v) else None
 
 
+def _amp_label(filename: str, ch_name: str, multi: bool) -> str:
+    """Composite (file, channel) label — bare channel name when only one file is loaded."""
+    return f"{filename} · {ch_name}" if multi else ch_name
+
+
 def parse_potentiostat_csv(raw: str, sep: str, mode: str = "amperometry") -> tuple[pd.DataFrame, list[dict]]:
     """
     Parse multi-channel potentiostat exports (Bio-Logic, CH Instruments, etc.).
@@ -533,21 +538,27 @@ def _apply_spine_style(ax, style: str) -> None:
         ax.spines[["top", "right"]].set_visible(False)
 
 
-def render_ts_png(df, channels, cpdf, cur_unit: str, visible: list[str],
+def render_ts_png(amp_files: list[dict], cpdf, cur_unit: str, visible: list[str],
                   dpi: int = 150, fmt: str = "png",
                   figsize: tuple | None = None, style: str = "default") -> bytes:
     _rc  = {"origin": _ORIGIN_RC, "minimal": _MINIMAL_RC}.get(style, {})
     _lfs = 9 if style == "minimal" else 11   # axis label fontsize
     _lgfs = 7 if style == "minimal" else 9   # legend fontsize
     _afs = 7 if style == "minimal" else 8    # annotation fontsize
+    _multi = len(amp_files) > 1
+    _mpl_dashes = ["-", "--", ":", "-.", (0, (5, 1, 1, 1)), (0, (3, 1, 1, 1, 1, 1))]
     with matplotlib.rc_context(_rc):
         fig, ax = plt.subplots(figsize=figsize or (13, 5))
-        for j, ch in enumerate(channels):
-            if ch["name"] not in visible:
-                continue
-            x = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
-            y = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
-            ax.plot(x, y, color=PAL[j % len(PAL)], label=ch["name"], linewidth=1.4)
+        for fi, frec in enumerate(amp_files):
+            for ci, ch in enumerate(frec["channels"]):
+                lbl = _amp_label(frec["filename"], ch["name"], _multi)
+                if lbl not in visible:
+                    continue
+                x = to_num(frec["df"][ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
+                y = to_num(frec["df"][ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+                _col = PAL[(fi if _multi else ci) % len(PAL)]
+                _ls = _mpl_dashes[ci % len(_mpl_dashes)] if _multi else "-"
+                ax.plot(x, y, color=_col, label=lbl, linewidth=1.4, linestyle=_ls)
         for _, row in cpdf.iterrows():
             _ets_png = _eff_t_start(row)
             if _ets_png is not None and pd.notna(row.get("t_end")):
@@ -949,6 +960,7 @@ SS = st.session_state
 for _k, _v in [
     ("df", None),
     ("channels", []),
+    ("amp_files", []),       # [{filename, df, channels}] — multi-file amperometry
     ("cal_results", None),
     ("ts_fig", None),
     ("cal_fig", None),
@@ -2566,90 +2578,152 @@ with T1:
 > **Tip:** Calibration windows are shown as shaded bands on the time-series chart so you can visually verify your time entries.
 """)
 
-    st.subheader("Upload File")
-    up = st.file_uploader(
-        "Drag and drop your raw sensor data here, or click to browse",
+    st.subheader("Upload File(s)")
+    ups = st.file_uploader(
+        "Drag and drop one or more raw sensor data files here, or click to browse",
         type=["csv", "txt", "pssession"],
-        help="Supports comma-, tab-, semicolon-, or space-delimited files with a header row.",
+        accept_multiple_files=True,
+        help=(
+            "Supports comma-, tab-, semicolon-, or space-delimited files with a header row. "
+            "Upload multiple files to compare across runs/sensors — each file gets its own "
+            "column mapping below."
+        ),
     )
 
-    if up is not None:
-        if up.name.lower().endswith(".pssession"):
-            try:
-                df, auto_channels = parse_pssession(up.read())
-                SS.df = df
-                SS.channels   = auto_channels
-                SS.ts_visible = [c["name"] for c in auto_channels]
-                m1, m2 = st.columns(2)
-                m1.metric("Rows loaded", f"{len(SS.df):,}")
-                m2.metric("Columns", len(SS.df.columns))
-                st.dataframe(SS.df.head(10), use_container_width=True)
-            except Exception as exc:
-                st.error(f"Parse error: {exc}")
+    def _parse_one_file(_up, _fi: int) -> tuple[pd.DataFrame | None, list[dict]]:
+        """Parse one uploaded file, returning (df, auto_channels)."""
+        if _up.name.lower().endswith(".pssession"):
+            _df, _auto = parse_pssession(_up.read())
+            return _df, _auto
+
+        _raw_bytes = _up.read()
+        if _raw_bytes[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            _raw = _raw_bytes.decode("utf-16")
         else:
-            _raw_bytes = up.read()
-            if _raw_bytes[:2] in (b"\xff\xfe", b"\xfe\xff"):
-                raw = _raw_bytes.decode("utf-16")
-            else:
-                raw = _raw_bytes.decode("utf-8", errors="replace")
+            _raw = _raw_bytes.decode("utf-8", errors="replace")
 
-            file_fmt = st.selectbox(
-                "File format",
-                ["Standard CSV", "Multi-channel instrument (potentiostat, etc.)"],
-                help=(
-                    "Choose **Multi-channel instrument** for files exported from Bio-Logic, "
-                    "CH Instruments, Autolab, or similar — they have metadata rows, "
-                    "channel-label rows, and a units row above the numeric data."
-                ),
-            )
+        _file_fmt = st.selectbox(
+            "File format",
+            ["Standard CSV", "Multi-channel instrument (potentiostat, etc.)"],
+            help=(
+                "Choose **Multi-channel instrument** for files exported from Bio-Logic, "
+                "CH Instruments, Autolab, or similar — they have metadata rows, "
+                "channel-label rows, and a units row above the numeric data."
+            ),
+            key=f"file_fmt_{_fi}",
+        )
 
-            c1, c2 = st.columns(2)
-            delim_label = c1.selectbox(
-                "Delimiter",
-                ["Auto-detect", "Comma  ,", "Tab  \\t", "Semicolon  ;", "Space"],
-                help="Choose the character that separates columns. Auto-detect works for most files.",
-            )
-            skip = int(c2.number_input(
-                "Rows to skip before header", 0, 50, 0,
-                help="Only applies to Standard CSV mode. Multi-channel mode finds the data start automatically.",
-            ))
+        _c1, _c2 = st.columns(2)
+        _delim_label = _c1.selectbox(
+            "Delimiter",
+            ["Auto-detect", "Comma  ,", "Tab  \\t", "Semicolon  ;", "Space"],
+            help="Choose the character that separates columns. Auto-detect works for most files.",
+            key=f"delim_{_fi}",
+        )
+        _skip = int(_c2.number_input(
+            "Rows to skip before header", 0, 50, 0,
+            help="Only applies to Standard CSV mode. Multi-channel mode finds the data start automatically.",
+            key=f"skip_{_fi}",
+        ))
 
-            _dmap = {
-                "Auto-detect": None,
-                "Comma  ,": ",", "Tab  \\t": "\t",
-                "Semicolon  ;": ";", "Space": r"\s+",
-            }
-            d = _dmap[delim_label]
-            if d is None:
-                lines = raw.splitlines()
-                sniff_line = lines[skip] if skip < len(lines) else (lines[0] if lines else "")
-                d = next((c for c in [",", "\t", ";"] if c in sniff_line), r"\s+")
+        _dmap = {
+            "Auto-detect": None,
+            "Comma  ,": ",", "Tab  \\t": "\t",
+            "Semicolon  ;": ";", "Space": r"\s+",
+        }
+        _d = _dmap[_delim_label]
+        if _d is None:
+            _lines = _raw.splitlines()
+            _sniff_line = _lines[_skip] if _skip < len(_lines) else (_lines[0] if _lines else "")
+            _d = next((c for c in [",", "\t", ";"] if c in _sniff_line), r"\s+")
 
-            engine = "python" if d == r"\s+" else "c"
+        _engine = "python" if _d == r"\s+" else "c"
 
-            try:
-                if file_fmt.startswith("Multi-channel"):
-                    df, auto_channels = parse_potentiostat_csv(raw, d)
-                    SS.df = df
-                    if auto_channels:
-                        SS.channels   = auto_channels
-                        SS.ts_visible = [c["name"] for c in auto_channels]
-                else:
-                    df = pd.read_csv(
-                        io.StringIO(raw), sep=d, skiprows=skip,
-                        engine=engine, skipinitialspace=True,
-                    )
-                    df.columns = [c.lstrip("﻿").strip() for c in df.columns]
-                    SS.df = df
+        if _file_fmt.startswith("Multi-channel"):
+            _df, _auto = parse_potentiostat_csv(_raw, _d)
+            return _df, _auto
+        _df = pd.read_csv(
+            io.StringIO(_raw), sep=_d, skiprows=_skip,
+            engine=_engine, skipinitialspace=True,
+        )
+        _df.columns = [c.lstrip("﻿").strip() for c in _df.columns]
+        return _df, []
+
+    if ups:
+        _existing_by_name = {f["filename"]: f for f in SS.amp_files}
+        _parsed_files = []
+        for _fi, _up in enumerate(ups):
+            with st.expander(f"📄 {_up.name}", expanded=(len(ups) <= 3)):
+                try:
+                    _df, _auto_channels = _parse_one_file(_up, _fi)
+                except Exception as exc:
+                    st.error(f"Parse error: {exc}")
+                    continue
 
                 m1, m2 = st.columns(2)
-                m1.metric("Rows loaded", f"{len(SS.df):,}")
-                m2.metric("Columns", len(SS.df.columns))
-                st.dataframe(SS.df.head(10), use_container_width=True)
-            except Exception as exc:
-                st.error(f"Parse error: {exc}")
+                m1.metric("Rows loaded", f"{len(_df):,}")
+                m2.metric("Columns", len(_df.columns))
+                st.dataframe(_df.head(10), use_container_width=True)
 
-    if SS.df is not None:
+                st.markdown("**Map Columns to Channels**")
+                _all_cols = list(_df.columns)
+                _preset_chs = (
+                    _existing_by_name[_up.name]["channels"]
+                    if _up.name in _existing_by_name
+                    else (_auto_channels or [])
+                )
+                _auto_n = len(_preset_chs) if _preset_chs else max(1, len(_all_cols) // 2)
+                _n_ch = int(st.number_input(
+                    "Number of channels", 1, 8,
+                    value=min(8, _auto_n),
+                    help="Each channel corresponds to one electrode. Most files have pairs of (time, current) columns.",
+                    key=f"n_ch_{_fi}",
+                ))
+
+                _ha, _hb, _hc = st.columns([2, 3, 3])
+                _ha.markdown("**Channel name**")
+                _hb.markdown("**Time column**")
+                _hc.markdown("**Current column**")
+
+                def _col_idx(col: str, _cols=_all_cols) -> int:
+                    return _cols.index(col) if col in _cols else 0
+
+                _new_chs = []
+                for _i in range(_n_ch):
+                    _preset = _preset_chs[_i] if _i < len(_preset_chs) else {}
+                    _ca, _cb, _cc = st.columns([2, 3, 3])
+                    _name = _ca.text_input(
+                        "nm", _preset.get("name", f"Channel {_i + 1}"),
+                        key=f"n{_fi}_{_i}", label_visibility="collapsed",
+                    )
+                    _tc = _cb.selectbox(
+                        "tc", _all_cols,
+                        index=_col_idx(_preset.get("tc", _all_cols[min(_i * 2, len(_all_cols) - 1)])),
+                        key=f"tc{_fi}_{_i}", label_visibility="collapsed",
+                    )
+                    _ic = _cc.selectbox(
+                        "ic", _all_cols,
+                        index=_col_idx(_preset.get("ic", _all_cols[min(_i * 2 + 1, len(_all_cols) - 1)])),
+                        key=f"ic{_fi}_{_i}", label_visibility="collapsed",
+                    )
+                    _new_chs.append({"name": _name, "tc": _tc, "ic": _ic})
+
+                _parsed_files.append({"filename": _up.name, "df": _df, "channels": _new_chs})
+
+        if _parsed_files and st.button("Apply Channel Configuration", type="primary"):
+            SS.amp_files = _parsed_files
+            # Keep SS.df/SS.channels as an alias to the first file for any
+            # legacy single-file consumers.
+            SS.df       = _parsed_files[0]["df"]
+            SS.channels = _parsed_files[0]["channels"]
+            SS.ts_visible = []
+            st.success(
+                f"{len(_parsed_files)} file(s), "
+                f"{sum(len(f['channels']) for f in _parsed_files)} channel(s) saved. "
+                "Head to the **Time Series** tab to inspect your traces."
+            )
+
+    if SS.amp_files:
         st.divider()
         st.subheader("Units")
         st.caption("These labels appear on all plot axes and in the statistics table.")
@@ -2659,60 +2733,17 @@ with T1:
         SS.cur_unit  = u2.text_input("Current unit", SS.cur_unit,
                                       help="e.g. µA, nA, mA")
 
-        st.subheader("Map Columns to Channels")
-        st.caption(
-            "Assign each electrode channel its time and current columns. "
-            "Give each channel a meaningful name — it will appear on all plots."
-        )
-        df       = SS.df
-        all_cols = list(df.columns)
-        auto_n   = len(SS.channels) if SS.channels else max(1, len(all_cols) // 2)
-        n_ch     = int(st.number_input(
-            "Number of channels", 1, 8,
-            value=min(8, auto_n),
-            help="Each channel corresponds to one electrode. Most files have pairs of (time, current) columns.",
-        ))
-
-        ha, hb, hc = st.columns([2, 3, 3])
-        ha.markdown("**Channel name**")
-        hb.markdown("**Time column**")
-        hc.markdown("**Current column**")
-
-        def _col_idx(col: str) -> int:
-            return all_cols.index(col) if col in all_cols else 0
-
-        new_chs = []
-        for i in range(n_ch):
-            preset = SS.channels[i] if i < len(SS.channels) else {}
-            ca, cb, cc = st.columns([2, 3, 3])
-            name = ca.text_input("nm", preset.get("name", f"Channel {i + 1}"),
-                                 key=f"n{i}", label_visibility="collapsed")
-            tc   = cb.selectbox("tc", all_cols,
-                                index=_col_idx(preset.get("tc", all_cols[min(i * 2, len(all_cols) - 1)])),
-                                key=f"tc{i}", label_visibility="collapsed")
-            ic   = cc.selectbox("ic", all_cols,
-                                index=_col_idx(preset.get("ic", all_cols[min(i * 2 + 1, len(all_cols) - 1)])),
-                                key=f"ic{i}", label_visibility="collapsed")
-            new_chs.append({"name": name, "tc": tc, "ic": ic})
-
-        if st.button("Apply Channel Configuration", type="primary"):
-            SS.channels = new_chs
-            SS.ts_visible = [c["name"] for c in new_chs]
-            st.success(
-                f"{len(new_chs)} channel(s) saved. "
-                "Head to the **Time Series** tab to inspect your traces."
-            )
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 2 · Time Series
 # ═════════════════════════════════════════════════════════════════════════════
+_DASHES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
+
 with T2:
-    if not SS.channels or SS.df is None:
+    if not SS.amp_files:
         st.info("Complete the **Import & Configure** step first.")
     else:
-        df  = SS.df
-        chs = SS.channels
+        _multi_file = len(SS.amp_files) > 1
 
         st.caption(
             "Use this chart to identify the time windows for each concentration step. "
@@ -2742,23 +2773,29 @@ with T2:
                         help="Must be less than the window size.",
                     ))
 
-        _all_ch_names = [c["name"] for c in chs]
+        # All (file, channel) combos available across loaded files.
+        _combos = [
+            (fi, ci, frec["filename"], frec["df"], ch)
+            for fi, frec in enumerate(SS.amp_files)
+            for ci, ch in enumerate(frec["channels"])
+        ]
+        _all_ch_names = [_amp_label(fn, ch["name"], _multi_file) for _, _, fn, _, ch in _combos]
         _vis_key = "ts_vis_ms"
         # Reset multiselect state if channels have changed since last config apply
         if _vis_key not in SS or any(c not in _all_ch_names for c in SS.get(_vis_key, [])):
             SS[_vis_key] = _all_ch_names[:]
 
-        # Solo / isolate row (only useful with 2+ channels)
-        if len(chs) >= 2:
-            _iso_cols = st.columns([1.4] + [1] * len(chs))
-            _iso_cols[0].markdown("**Isolate:**", help="Click a channel name to show only that channel")
-            for _j, _ch in enumerate(chs):
+        # Solo / isolate row (only useful with 2+ combos)
+        if len(_combos) >= 2:
+            _iso_cols = st.columns([1.4] + [1] * len(_combos))
+            _iso_cols[0].markdown("**Isolate:**", help="Click a name to show only that trace")
+            for _j, _lbl in enumerate(_all_ch_names):
                 if _iso_cols[_j + 1].button(
-                    _ch["name"], key=f"ts_solo_{_j}",
+                    _lbl, key=f"ts_solo_{_j}",
                     use_container_width=True,
-                    help=f"Show only {_ch['name']}",
+                    help=f"Show only {_lbl}",
                 ):
-                    SS[_vis_key] = [_ch["name"]]
+                    SS[_vis_key] = [_lbl]
 
         sel = st.multiselect(
             "Visible channels",
@@ -2768,28 +2805,30 @@ with T2:
         SS.ts_visible = sel
 
         fig_ts = go.Figure()
-        for j, ch in enumerate(chs):
-            if ch["name"] not in sel:
+        for fi, ci, fn, df, ch in _combos:
+            lbl = _amp_label(fn, ch["name"], _multi_file)
+            if lbl not in sel:
                 continue
             _t = to_num(df[ch["tc"]])
             _i_raw = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
             _i_smooth = smooth_signal(_i_raw, SS.smooth_method, SS.smooth_window, SS.smooth_polyorder)
-            _col = PAL[j % len(PAL)]
+            _col = PAL[(fi if _multi_file else ci) % len(PAL)]
+            _dash = _DASHES[ci % len(_DASHES)] if _multi_file else "solid"
             if SS.smooth_method != "None":
                 fig_ts.add_trace(go.Scatter(
                     x=_t, y=_i_raw,
-                    name=f"{ch['name']} (raw)",
+                    name=f"{lbl} (raw)",
                     mode="lines",
                     opacity=0.35,
-                    line=dict(color=_col, width=1),
+                    line=dict(color=_col, width=1, dash=_dash),
                     showlegend=False,
                 ))
             fig_ts.add_trace(go.Scatter(
                 x=_t,
                 y=_i_smooth,
-                name=ch["name"],
+                name=lbl,
                 mode="lines",
-                line=dict(color=_col, width=1.5),
+                line=dict(color=_col, width=1.5, dash=_dash),
             ))
 
         _pt_ts = _plot_theme()
@@ -2849,7 +2888,7 @@ with T2:
             file_name="time_series.html",
             mime="text/html",
         )
-        ts_png = render_ts_png(df, chs, SS.cpdf, SS.cur_unit, sel)
+        ts_png = render_ts_png(SS.amp_files, SS.cpdf, SS.cur_unit, sel)
         dl2.download_button(
             "Download as PNG",
             data=ts_png,
@@ -2862,7 +2901,7 @@ with T2:
 # TAB 3 · Calibration Curve
 # ═════════════════════════════════════════════════════════════════════════════
 with T3:
-    if not SS.channels or SS.df is None:
+    if not SS.amp_files:
         st.info("Complete the **Import & Configure** step first.")
     else:
         # ── Calibration-point editor ──────────────────────────────────────
@@ -2978,12 +3017,19 @@ with T3:
                 f"Averaging below uses the **{SS.smooth_method}** smoothing "
                 "configured in the Time Series tab."
             )
+        _cal_multi_file = len(SS.amp_files) > 1
+        _cal_combo_lookup = {
+            _amp_label(frec["filename"], ch["name"], _cal_multi_file): (frec["df"], ch)
+            for frec in SS.amp_files
+            for ch in frec["channels"]
+        }
         a1, a2, a3 = st.columns(3)
         analyze_chs = a1.multiselect(
             "Channels to analyse",
-            [c["name"] for c in SS.channels],
-            default=[SS.channels[0]["name"]],
-            help="Select one or more channels. Each gets its own calibration curve.",
+            list(_cal_combo_lookup.keys()),
+            default=list(_cal_combo_lookup.keys())[:1],
+            help="Select one or more channels (and, with multiple files loaded, file·channel pairs). "
+                 "Each gets its own calibration curve, computed over the shared time windows above.",
         )
         fit_type = a2.selectbox(
             "Fit type",
@@ -3016,7 +3062,6 @@ with T3:
         )
 
         if st.button("Compute Calibration", type="primary"):
-            df   = SS.df
             cpdf = (SS.cpdf
                     .dropna(subset=["Concentration", "t_end"])
                     .reset_index(drop=True))
@@ -3031,7 +3076,7 @@ with T3:
 
             results = {}
             for ch_name in analyze_chs:
-                ch    = next(c for c in SS.channels if c["name"] == ch_name)
+                df, ch = _cal_combo_lookup[ch_name]
                 t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
                 i_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
                 i_arr = smooth_signal(i_arr, SS.smooth_method, SS.smooth_window, SS.smooth_polyorder)
@@ -3358,16 +3403,23 @@ with T4:
     else:
         st.info("Run calibration analysis in the **Calibration Curve** tab first.")
 
-    if SS.df is not None and SS.channels:
+    if SS.amp_files:
         st.divider()
         st.markdown("#### Time-series downloads")
         dl4, dl5, dl6 = st.columns(3)
-        dl4.download_button(
-            "Raw data CSV",
-            data=SS.df.to_csv(index=False).encode(),
-            file_name="raw_sensor_data.csv",
-            mime="text/csv",
-        )
+        with dl4:
+            for _frec in SS.amp_files:
+                st.download_button(
+                    f"Raw data CSV — {_frec['filename']}",
+                    data=_frec["df"].to_csv(index=False).encode(),
+                    file_name=f"raw_{_frec['filename']}.csv" if not _frec["filename"].endswith(".csv") else f"raw_{_frec['filename']}",
+                    mime="text/csv",
+                    key=f"raw_dl_{_frec['filename']}",
+                )
+        all_ch_names_export = [
+            _amp_label(f["filename"], c["name"], len(SS.amp_files) > 1)
+            for f in SS.amp_files for c in f["channels"]
+        ]
         if SS.ts_fig is not None:
             dl5.download_button(
                 "Plot — interactive HTML",
@@ -3375,9 +3427,9 @@ with T4:
                 file_name="time_series.html",
                 mime="text/html",
             )
-            ts_vis = SS.ts_visible if SS.ts_visible else [c["name"] for c in SS.channels]
+            ts_vis = SS.ts_visible if SS.ts_visible else all_ch_names_export
             ts_png_bytes = render_ts_png(
-                SS.df, SS.channels, SS.cpdf, SS.cur_unit, ts_vis
+                SS.amp_files, SS.cpdf, SS.cur_unit, ts_vis
             )
             dl6.download_button(
                 "Plot — PNG (150 dpi)",
@@ -3387,7 +3439,7 @@ with T4:
             )
 
     # ── Publication-quality export ────────────────────────────────────────────
-    if SS.df is not None or SS.cal_results:
+    if SS.amp_files or SS.cal_results:
         st.divider()
         st.markdown("#### Publication-quality export")
         with st.expander("Export settings", expanded=True):
@@ -3421,11 +3473,14 @@ with T4:
         _pstyle_l = _pstyle.lower()
 
         _pa, _pb = st.columns(2)
-        if SS.df is not None and SS.channels:
-            _ts_vis  = SS.ts_visible or [c["name"] for c in SS.channels]
-            _prev_ts = render_ts_png(SS.df, SS.channels, SS.cpdf, SS.cur_unit, _ts_vis,
+        if SS.amp_files:
+            _ts_vis  = SS.ts_visible or [
+                _amp_label(f["filename"], c["name"], len(SS.amp_files) > 1)
+                for f in SS.amp_files for c in f["channels"]
+            ]
+            _prev_ts = render_ts_png(SS.amp_files, SS.cpdf, SS.cur_unit, _ts_vis,
                                      dpi=96, fmt="png", figsize=_pfs, style=_pstyle_l)
-            _pub_ts  = render_ts_png(SS.df, SS.channels, SS.cpdf, SS.cur_unit, _ts_vis,
+            _pub_ts  = render_ts_png(SS.amp_files, SS.cpdf, SS.cur_unit, _ts_vis,
                                      dpi=_pdpi_val, fmt=_pfmt_l, figsize=_pfs, style=_pstyle_l)
             with _pa:
                 st.caption("Time series preview")
