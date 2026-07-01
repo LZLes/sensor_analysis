@@ -188,8 +188,8 @@ def piecewise_fit(x_in, y_in, n_seg: int) -> dict:
     # partition even when the loop below is empty (n exactly equals n_seg * 2).
     if n_seg == 2:
         best, bk = 1e18, n // 2
-        # k in [2, n-2) ensures both segments have ≥ 2 points
-        for k in range(2, n - 2):
+        # k in [2, n-2] (inclusive) — each segment gets ≥ 2 points
+        for k in range(2, n - 1):
             _, ssr = _hinge_fit(x, y, [x[k]])
             if ssr < best:
                 best, bk = ssr, k
@@ -197,8 +197,8 @@ def piecewise_fit(x_in, y_in, n_seg: int) -> dict:
 
     elif n_seg == 3:
         best, bk1, bk2 = 1e18, n // 3, 2 * n // 3
-        for k1 in range(2, n - 4):
-            for k2 in range(k1 + 2, n - 2):
+        for k1 in range(2, n - 3):
+            for k2 in range(k1 + 2, n - 1):
                 _, ssr = _hinge_fit(x, y, [x[k1], x[k2]])
                 if ssr < best:
                     best, bk1, bk2 = ssr, k1, k2
@@ -206,9 +206,9 @@ def piecewise_fit(x_in, y_in, n_seg: int) -> dict:
 
     elif n_seg == 4:
         best, b1i, b2i, b3i = 1e18, n // 4, n // 2, 3 * n // 4
-        for k1 in range(2, n - 6):
-            for k2 in range(k1 + 2, n - 4):
-                for k3 in range(k2 + 2, n - 2):
+        for k1 in range(2, n - 5):
+            for k2 in range(k1 + 2, n - 3):
+                for k3 in range(k2 + 2, n - 1):
                     _, ssr = _hinge_fit(x, y, [x[k1], x[k2], x[k3]])
                     if ssr < best:
                         best, b1i, b2i, b3i = ssr, k1, k2, k3
@@ -245,9 +245,10 @@ def _is_float(v: str) -> bool:
 
 
 def _eff_t_start(row) -> float | None:
-    """Effective t_start: t_end − avg_duration if set, otherwise t_start."""
-    if pd.notna(row.get("avg_duration")) and pd.notna(row.get("t_end")):
-        return float(row["t_end"]) - float(row["avg_duration"])
+    """Effective t_start: t_end − avg_duration if set (> 0), otherwise t_start."""
+    ad = row.get("avg_duration")
+    if pd.notna(ad) and float(ad) > 0 and pd.notna(row.get("t_end")):
+        return float(row["t_end"]) - float(ad)
     v = row.get("t_start")
     return float(v) if pd.notna(v) else None
 
@@ -540,7 +541,9 @@ def _apply_spine_style(ax, style: str) -> None:
 
 def render_ts_png(amp_files: list[dict], cpdf, cur_unit: str, visible: list[str],
                   dpi: int = 150, fmt: str = "png",
-                  figsize: tuple | None = None, style: str = "default") -> bytes:
+                  figsize: tuple | None = None, style: str = "default",
+                  smooth_method: str = "None", smooth_window: int = 11,
+                  smooth_polyorder: int = 2) -> bytes:
     _rc  = {"origin": _ORIGIN_RC, "minimal": _MINIMAL_RC}.get(style, {})
     _lfs = 9 if style == "minimal" else 11   # axis label fontsize
     _lgfs = 7 if style == "minimal" else 9   # legend fontsize
@@ -554,10 +557,13 @@ def render_ts_png(amp_files: list[dict], cpdf, cur_unit: str, visible: list[str]
                 lbl = _amp_label(frec["filename"], ch["name"], _multi)
                 if lbl not in visible:
                     continue
-                x = to_num(frec["df"][ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
-                y = to_num(frec["df"][ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+                x   = to_num(frec["df"][ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
+                _yr = to_num(frec["df"][ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+                y   = smooth_signal(_yr, smooth_method, smooth_window, smooth_polyorder)
                 _col = PAL[(fi if _multi else ci) % len(PAL)]
                 _ls = _mpl_dashes[ci % len(_mpl_dashes)] if _multi else "-"
+                if smooth_method != "None":
+                    ax.plot(x, _yr, color=_col, linewidth=0.6, linestyle=_ls, alpha=0.30)
                 ax.plot(x, y, color=_col, label=lbl, linewidth=1.4, linestyle=_ls)
         for _, row in cpdf.iterrows():
             _ets_png = _eff_t_start(row)
@@ -594,7 +600,7 @@ def render_cal_png(res_map: dict, ft: str, ns: int,
         for j, (ch_name, res) in enumerate(res_map.items()):
             col  = AVG_COLOR if res.get("is_average") else PAL[j % len(PAL)]
             # Same blank-exclusion as the in-app Plotly chart, kept in sync.
-            _keep = [not bool(b) for b in
+            _keep = [not (bool(b) if pd.notna(b) else False) for b in
                      res.get("baselines", [False] * len(res["concs"]))]
             x    = np.asarray(res["concs"], dtype=float)[_keep]
             y    = np.array(res["delta_i"], float)[_keep]
@@ -1015,15 +1021,18 @@ if "cpdf" not in SS:
 
 def _apply_cfg_dict(d: dict) -> None:
     """Apply a loaded config dict (from localStorage or an imported JSON file) to session state."""
-    if "conc_unit"     in d: SS.conc_unit      = d["conc_unit"]
-    if "cur_unit"      in d: SS.cur_unit       = d["cur_unit"]
-    if "volt_unit"     in d: SS.volt_unit      = d["volt_unit"]
-    if "cv_cur_unit"   in d: SS.cv_cur_unit    = d["cv_cur_unit"]
-    if "vol_unit"      in d: SS.vol_unit       = d["vol_unit"]
-    if "initial_volume" in d: SS.initial_volume = float(d["initial_volume"])
-    if "smooth_method"    in d: SS.smooth_method    = d["smooth_method"]
-    if "smooth_window"    in d: SS.smooth_window     = int(d["smooth_window"])
-    if "smooth_polyorder" in d: SS.smooth_polyorder  = int(d["smooth_polyorder"])
+    if "conc_unit"       in d: SS.conc_unit       = d["conc_unit"]
+    if "cur_unit"        in d: SS.cur_unit        = d["cur_unit"]
+    if "volt_unit"       in d: SS.volt_unit       = d["volt_unit"]
+    if "cv_cur_unit"     in d: SS.cv_cur_unit     = d["cv_cur_unit"]
+    if "cv_sr_unit"      in d: SS.cv_sr_unit      = d["cv_sr_unit"]
+    if "vol_unit"        in d: SS.vol_unit        = d["vol_unit"]
+    if "initial_volume"  in d: SS.initial_volume  = float(d["initial_volume"])
+    if "smooth_method"   in d: SS.smooth_method   = d["smooth_method"]
+    if "smooth_window"   in d: SS.smooth_window   = int(d["smooth_window"])
+    if "smooth_polyorder" in d: SS.smooth_polyorder = int(d["smooth_polyorder"])
+    if "assay_sig_unit"  in d: SS.assay_sig_unit  = d["assay_sig_unit"]
+    if "assay_conc_unit" in d: SS.assay_conc_unit = d["assay_conc_unit"]
     if "calibration_points" in d:
         _cp = pd.DataFrame(d["calibration_points"])
         for _col in ["Concentration", "Spike Vol", "Stock Conc", "t_start", "t_end", "avg_duration"]:
@@ -1073,11 +1082,14 @@ with st.sidebar:
         "cur_unit":           SS.cur_unit,
         "volt_unit":          SS.volt_unit,
         "cv_cur_unit":        SS.cv_cur_unit,
+        "cv_sr_unit":         SS.cv_sr_unit,
         "vol_unit":           SS.vol_unit,
         "initial_volume":     SS.initial_volume,
         "smooth_method":      SS.smooth_method,
         "smooth_window":      SS.smooth_window,
         "smooth_polyorder":   SS.smooth_polyorder,
+        "assay_sig_unit":     SS.assay_sig_unit,
+        "assay_conc_unit":    SS.assay_conc_unit,
         "calibration_points": SS.cpdf.to_dict(orient="records"),
     }
 
@@ -2888,7 +2900,10 @@ with T2:
             file_name="time_series.html",
             mime="text/html",
         )
-        ts_png = render_ts_png(SS.amp_files, SS.cpdf, SS.cur_unit, sel)
+        ts_png = render_ts_png(SS.amp_files, SS.cpdf, SS.cur_unit, sel,
+                               smooth_method=SS.smooth_method,
+                               smooth_window=SS.smooth_window,
+                               smooth_polyorder=SS.smooth_polyorder)
         dl2.download_button(
             "Download as PNG",
             data=ts_png,
@@ -3063,13 +3078,13 @@ with T3:
 
         if st.button("Compute Calibration", type="primary"):
             cpdf = (SS.cpdf
-                    .dropna(subset=["Concentration", "t_end"])
+                    .dropna(subset=["t_end"])
                     .reset_index(drop=True))
             if cpdf.empty:
                 st.error("No valid rows — fill in the calibration table above.")
                 st.stop()
 
-            base_rows = cpdf[cpdf["Baseline"] == True]
+            base_rows = cpdf[cpdf["Baseline"].apply(lambda b: bool(b) if pd.notna(b) else False)]
             base_idx  = int(base_rows.index[0]) if len(base_rows) else 0
             if len(base_rows) == 0:
                 st.warning("No baseline row marked — using the first row as baseline.")
@@ -3111,6 +3126,14 @@ with T3:
 
                 base_val = avgs[base_idx]
                 sigma_bl = sigs[base_idx]  # NaN if baseline window has < 2 points
+                if np.isnan(base_val):
+                    _bl_lbl = cpdf.at[base_idx, 'Label']
+                    st.error(
+                        f"**{ch_name}**: baseline window (row '{_bl_lbl}') has no data"
+                        " points — ΔI cannot be computed. "
+                        "Adjust the baseline t start / t end to overlap the signal data."
+                    )
+                    continue
                 delta_i  = [
                     (v - base_val) if not np.isnan(v) else np.nan
                     for v in avgs
@@ -3140,11 +3163,11 @@ with T3:
                 n_ch      = len(analyze_chs)
 
                 avg_delta_i   = np.nanmean(all_di, axis=0)
-                std_across_ch = np.nanstd(all_di, axis=0)   # inter-channel spread
+                std_across_ch = np.nanstd(all_di, axis=0, ddof=1)  # inter-channel spread (sample std)
                 avg_avgs      = np.nanmean(all_avgs, axis=0)
-                # propagated blank noise: sqrt(Σσi²) / n
+                # propagated blank noise: sqrt(Σσi²) / n_ch (all channels, not just those with finite σ)
                 _valid_s = [s for s in all_sigma if np.isfinite(s)]
-                sigma_bl_avg = (np.sqrt(sum(s**2 for s in _valid_s)) / len(_valid_s)
+                sigma_bl_avg = (np.sqrt(sum(s**2 for s in _valid_s)) / n_ch
                                 if _valid_s else np.nan)
 
                 results["Channel Average"] = dict(
@@ -3408,13 +3431,13 @@ with T4:
         st.markdown("#### Time-series downloads")
         dl4, dl5, dl6 = st.columns(3)
         with dl4:
-            for _frec in SS.amp_files:
+            for _fi4, _frec in enumerate(SS.amp_files):
                 st.download_button(
                     f"Raw data CSV — {_frec['filename']}",
                     data=_frec["df"].to_csv(index=False).encode(),
                     file_name=f"raw_{_frec['filename']}.csv" if not _frec["filename"].endswith(".csv") else f"raw_{_frec['filename']}",
                     mime="text/csv",
-                    key=f"raw_dl_{_frec['filename']}",
+                    key=f"raw_dl_{_fi4}_{_frec['filename']}",
                 )
         all_ch_names_export = [
             _amp_label(f["filename"], c["name"], len(SS.amp_files) > 1)
@@ -3429,7 +3452,10 @@ with T4:
             )
             ts_vis = SS.ts_visible if SS.ts_visible else all_ch_names_export
             ts_png_bytes = render_ts_png(
-                SS.amp_files, SS.cpdf, SS.cur_unit, ts_vis
+                SS.amp_files, SS.cpdf, SS.cur_unit, ts_vis,
+                smooth_method=SS.smooth_method,
+                smooth_window=SS.smooth_window,
+                smooth_polyorder=SS.smooth_polyorder,
             )
             dl6.download_button(
                 "Plot — PNG (150 dpi)",
@@ -3479,9 +3505,15 @@ with T4:
                 for f in SS.amp_files for c in f["channels"]
             ]
             _prev_ts = render_ts_png(SS.amp_files, SS.cpdf, SS.cur_unit, _ts_vis,
-                                     dpi=96, fmt="png", figsize=_pfs, style=_pstyle_l)
+                                     dpi=96, fmt="png", figsize=_pfs, style=_pstyle_l,
+                                     smooth_method=SS.smooth_method,
+                                     smooth_window=SS.smooth_window,
+                                     smooth_polyorder=SS.smooth_polyorder)
             _pub_ts  = render_ts_png(SS.amp_files, SS.cpdf, SS.cur_unit, _ts_vis,
-                                     dpi=_pdpi_val, fmt=_pfmt_l, figsize=_pfs, style=_pstyle_l)
+                                     dpi=_pdpi_val, fmt=_pfmt_l, figsize=_pfs, style=_pstyle_l,
+                                     smooth_method=SS.smooth_method,
+                                     smooth_window=SS.smooth_window,
+                                     smooth_polyorder=SS.smooth_polyorder)
             with _pa:
                 st.caption("Time series preview")
                 st.image(_prev_ts, use_container_width=True)
