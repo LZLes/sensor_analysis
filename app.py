@@ -2032,13 +2032,13 @@ if SS.mode == "Cyclic Voltammetry":
                     )
 
             st.markdown("#### Raw data by scan rate")
-            for _r5 in SS.cv_runs:
+            for _ri5, _r5 in enumerate(SS.cv_runs):
                 _safe5 = _r5["label"].replace("/","per").replace(" ","_")
                 st.download_button(
                     f"Raw — {_r5['label']}",
                     data=_r5["df"].to_csv(index=False).encode(),
                     file_name=f"cv_raw_{_safe5}.csv", mime="text/csv",
-                    key=f"cv5_raw_{_r5['scan_rate']}",
+                    key=f"cv5_raw_{_ri5}_{_safe5}",
                 )
 
             st.divider()
@@ -2234,7 +2234,8 @@ if SS.mode == "Assay":
                     for _, _r in _a3_sdf.iterrows()
                 ], dtype=float)
 
-                _a3_blank = float(np.nanmean(_a3_raw[0]))
+                _a3_blank_pos = int(np.argmin(_a3_sdf["Conc"].values))
+                _a3_blank = float(np.nanmean(_a3_raw[_a3_blank_pos]))
                 if not np.isfinite(_a3_blank):
                     st.error("Blank row has no valid signal. Check well addresses in **Standards**.")
                     st.stop()
@@ -2497,6 +2498,8 @@ if SS.mode == "Assay":
                     r1 = (-b + np.sqrt(disc)) / (2*a)
                     r2 = (-b - np.sqrt(disc)) / (2*a)
                     pos = [r for r in [r1, r2] if r >= -1e-9]
+                    if a < 0 and len(pos) == 2:
+                        return np.nan
                     return float(min(pos)) if pos else np.nan
                 else:
                     return _4pl_inv(dy, _f4)
