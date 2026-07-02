@@ -978,6 +978,9 @@ for _k, _v in [
     ("smooth_method", "None"),
     ("smooth_window", 11),
     ("smooth_polyorder", 2),
+    ("ts_y_auto", True),
+    ("ts_y_min",  None),
+    ("ts_y_max",  None),
     # Shared / CV
     ("mode",       "Amperometry"),
     ("volt_unit",  "V"),
@@ -2819,6 +2822,32 @@ with T2:
         )
         SS.ts_visible = sel
 
+        with st.expander("Y-axis range", expanded=False):
+            _y_auto = st.checkbox("Auto-scale", value=SS.ts_y_auto, key="ts_y_auto_cb")
+            SS.ts_y_auto = _y_auto
+            if not _y_auto:
+                _ts_all_y: list[float] = []
+                for _fi2, _ci2, _fn2, _df2, _ch2 in _combos:
+                    _lbl2 = _amp_label(_fn2, _ch2["name"], _multi_file)
+                    if _lbl2 not in sel:
+                        continue
+                    _yr2 = to_num(_df2[_ch2["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+                    _ts_all_y.extend(_yr2[np.isfinite(_yr2)].tolist())
+                _dr_lo = float(np.nanmin(_ts_all_y)) if _ts_all_y else 0.0
+                _dr_hi = float(np.nanmax(_ts_all_y)) if _ts_all_y else 1.0
+                _def_min = SS.ts_y_min if SS.ts_y_min is not None else _dr_lo
+                _def_max = SS.ts_y_max if SS.ts_y_max is not None else _dr_hi
+                _yc1, _yc2 = st.columns(2)
+                _range_help = f"Full visible-channel range: {_dr_lo:.4g} – {_dr_hi:.4g}"
+                SS.ts_y_min = float(_yc1.number_input(
+                    "Y min", value=float(_def_min), format="%.6g", step=0.0001,
+                    key="ts_y_min_ni", help=_range_help,
+                ))
+                SS.ts_y_max = float(_yc2.number_input(
+                    "Y max", value=float(_def_max), format="%.6g", step=0.0001,
+                    key="ts_y_max_ni", help=_range_help,
+                ))
+
         fig_ts = go.Figure()
         for fi, ci, fn, df, ch in _combos:
             lbl = _amp_label(fn, ch["name"], _multi_file)
@@ -2889,6 +2918,9 @@ with T2:
                 showgrid=True, gridcolor=_pt_ts["grid"],
                 linecolor=_pt_ts["axisline"],
                 fixedrange=False,
+                **({"range": [SS.ts_y_min, SS.ts_y_max]}
+                   if not SS.ts_y_auto and SS.ts_y_min is not None and SS.ts_y_max is not None
+                   else {}),
             ),
         )
         st.plotly_chart(fig_ts, use_container_width=True,
