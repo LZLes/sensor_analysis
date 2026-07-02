@@ -6,6 +6,7 @@ fit and export calibration curves with sensor statistics.
 
 import io
 import json as _json
+import os
 import time
 import streamlit as st
 import pandas as pd
@@ -265,6 +266,29 @@ def _eff_t_start(row) -> float | None:
         return float(row["t_end"]) - float(ad)
     v = row.get("t_start")
     return float(v) if pd.notna(v) else None
+
+
+def _apply_effective_concentration(cpdf: pd.DataFrame, initial_volume: float) -> pd.DataFrame:
+    """Returns a copy of a calibration table with Concentration derived from
+    cumulative, dilution-corrected Spike Vol / Stock Conc additions (if any
+    are filled in), and t_start derived from avg_duration (if set). A no-op
+    copy when neither is used, so it's safe to call unconditionally."""
+    _calc_df = cpdf.copy()
+    if _calc_df[["Spike Vol", "Stock Conc"]].notna().any().any():
+        _vol, _mass, _eff = float(initial_volume), 0.0, []
+        for _, _row in _calc_df.iterrows():
+            _sv = _row.get("Spike Vol", 0.0)
+            _sc = _row.get("Stock Conc", 0.0)
+            _sv = 0.0 if pd.isna(_sv) else float(_sv)
+            _sc = 0.0 if pd.isna(_sc) else float(_sc)
+            _vol  += _sv
+            _mass += _sv * _sc
+            _eff.append(_mass / _vol if _vol > 0 else np.nan)
+        _calc_df["Concentration"] = _eff
+    for _ti, _trow in _calc_df.iterrows():
+        if pd.notna(_trow.get("avg_duration")) and pd.notna(_trow.get("t_end")):
+            _calc_df.at[_ti, "t_start"] = _eff_t_start(_trow)
+    return _calc_df
 
 
 def _amp_label(filename: str, ch_name: str, multi: bool) -> str:
@@ -553,7 +577,7 @@ def _apply_spine_style(ax, style: str) -> None:
         ax.spines[["top", "right"]].set_visible(False)
 
 
-def render_ts_png(amp_files: list[dict], cpdf, cur_unit: str, visible: list[str],
+def render_ts_png(amp_files: list[dict], cur_unit: str, visible: list[str],
                   dpi: int = 150, fmt: str = "png",
                   figsize: tuple | None = None, style: str = "default",
                   smooth_method: str = "None", smooth_window: int = 11,
@@ -579,14 +603,17 @@ def render_ts_png(amp_files: list[dict], cpdf, cur_unit: str, visible: list[str]
                 if smooth_method != "None":
                     ax.plot(x, _yr, color=_col, linewidth=0.6, linestyle=_ls, alpha=0.30)
                 ax.plot(x, y, color=_col, label=lbl, linewidth=1.4, linestyle=_ls)
-        for _, row in cpdf.iterrows():
-            _ets_png = _eff_t_start(row)
-            if _ets_png is not None and pd.notna(row.get("t_end")):
-                clr = "darkorange" if row.get("Baseline") else "steelblue"
-                ax.axvspan(_ets_png, row["t_end"], alpha=0.10, color=clr)
-                ylim = ax.get_ylim()
-                ax.text(_ets_png + 0.5, ylim[1],
-                        str(row["Label"]), fontsize=_afs, va="top", color=clr)
+        for frec in amp_files:
+            for _, row in frec.get("cpdf", pd.DataFrame()).iterrows():
+                _ets_png = _eff_t_start(row)
+                if _ets_png is not None and pd.notna(row.get("t_end")):
+                    clr = "darkorange" if row.get("Baseline") else "steelblue"
+                    ax.axvspan(_ets_png, row["t_end"], alpha=0.10, color=clr)
+                    ylim = ax.get_ylim()
+                    _lbl_txt = (f"{frec['filename']}: {row['Label']}"
+                                if _multi else str(row["Label"]))
+                    ax.text(_ets_png + 0.5, ylim[1],
+                            _lbl_txt, fontsize=_afs, va="top", color=clr)
         ax.set_xlabel("Time (s)", fontsize=_lfs)
         ax.set_ylabel(f"Current ({cur_unit})", fontsize=_lfs)
         ax.legend(fontsize=_lgfs, loc="upper left",
@@ -1024,8 +1051,10 @@ if "assay_sample_df" not in SS:
         {"Well": pd.Series([], dtype=str), "Label": pd.Series([], dtype=str)}
     )
 
-if "cpdf" not in SS:
-    SS.cpdf = pd.DataFrame({
+def _default_cpdf() -> pd.DataFrame:
+    """A fresh starter calibration table — used to seed each newly-imported
+    file's own table (calibration tables are per-file, not shared)."""
+    return pd.DataFrame({
         "Label":         ["Blank", "Step 1", "Step 2", "Step 3"],
         "Concentration": [0.0, 0.1, 0.5, 1.0],
         "Spike Vol":     [np.nan, np.nan, np.nan, np.nan],
@@ -1035,6 +1064,80 @@ if "cpdf" not in SS:
         "avg_duration":  [np.nan, np.nan, np.nan, np.nan],
         "Baseline":      [True, False, False, False],
     })
+
+def _cpdf_from_records(records: list[dict] | None) -> pd.DataFrame:
+    """Build a well-typed calibration DataFrame from serialized records
+    (localStorage / JSON import / Drive), or a fresh default table if empty."""
+    if not records:
+        return _default_cpdf()
+    _cp = pd.DataFrame(records)
+    for _col in ["Concentration", "Spike Vol", "Stock Conc", "t_start", "t_end", "avg_duration"]:
+        _cp[_col] = pd.to_numeric(_cp[_col], errors="coerce") if _col in _cp.columns else np.nan
+    _cp["Baseline"] = (
+        _cp["Baseline"].apply(lambda b: bool(b) if pd.notna(b) else False)
+        if "Baseline" in _cp.columns else False
+    )
+    if "Label" not in _cp.columns:
+        _cp["Label"] = [f"Row {i + 1}" for i in range(len(_cp))]
+    return _cp
+
+
+def _seed_cpdf_for_new_file() -> pd.DataFrame:
+    """Starter calibration table for a newly-imported file: reuses the
+    table from an imported legacy (pre-per-file) session if one was just
+    restored, otherwise a fresh default."""
+    _tmpl = SS.get("_legacy_cpdf_template")
+    return _tmpl.copy() if _tmpl is not None else _default_cpdf()
+
+
+_SAMPLE_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data")
+
+# Ground truth used to generate sample_data/*.csv — see the calibration
+# steps documented there. Kept in sync so "Load sample data" produces a
+# working, pre-filled calibration table out of the box.
+_SAMPLE_STEPS = [
+    ("Blank",  0.0,   0.0,  50.0, True),
+    ("Step 1", 0.1,  70.0, 110.0, False),
+    ("Step 2", 0.5, 130.0, 170.0, False),
+    ("Step 3", 1.0, 190.0, 230.0, False),
+    ("Step 4", 2.0, 250.0, 290.0, False),
+]
+_SAMPLE_FILES = ["sensor_run_A.csv", "sensor_run_B.csv"]
+
+
+def _sample_cpdf() -> pd.DataFrame:
+    return pd.DataFrame({
+        "Label":         [s[0] for s in _SAMPLE_STEPS],
+        "Concentration": [s[1] for s in _SAMPLE_STEPS],
+        "Spike Vol":     [np.nan] * len(_SAMPLE_STEPS),
+        "Stock Conc":    [np.nan] * len(_SAMPLE_STEPS),
+        "t_start":       [s[2] for s in _SAMPLE_STEPS],
+        "t_end":         [s[3] for s in _SAMPLE_STEPS],
+        "avg_duration":  [np.nan] * len(_SAMPLE_STEPS),
+        "Baseline":      [s[4] for s in _SAMPLE_STEPS],
+    })
+
+
+def _load_sample_data() -> list[dict] | None:
+    """Reads the bundled sample_data/*.csv files and returns fully-configured
+    amp_files entries (channels mapped, calibration table pre-filled), or
+    None if the files aren't present (e.g. a stripped-down deployment)."""
+    _files = []
+    for _fn in _SAMPLE_FILES:
+        _path = os.path.join(_SAMPLE_DATA_DIR, _fn)
+        if not os.path.isfile(_path):
+            return None
+        _df = pd.read_csv(_path)
+        _channels = [
+            {"name": "Channel A", "tc": "Time (s)", "ic": "Channel A (uA)"},
+            {"name": "Channel B", "tc": "Time (s)", "ic": "Channel B (uA)"},
+        ]
+        _files.append({
+            "filename": _fn, "df": _df, "channels": _channels,
+            "cpdf": _sample_cpdf(),
+        })
+    return _files
+
 
 def _apply_cfg_dict(d: dict) -> None:
     """Apply a loaded config dict (from localStorage or an imported JSON file) to session state."""
@@ -1051,24 +1154,15 @@ def _apply_cfg_dict(d: dict) -> None:
     if "assay_sig_unit"  in d: SS.assay_sig_unit  = d["assay_sig_unit"]
     if "assay_conc_unit" in d: SS.assay_conc_unit = d["assay_conc_unit"]
     if "calibration_points" in d:
-        _cp = pd.DataFrame(d["calibration_points"])
-        for _col in ["Concentration", "Spike Vol", "Stock Conc", "t_start", "t_end", "avg_duration"]:
-            if _col in _cp.columns:
-                _cp[_col] = pd.to_numeric(_cp[_col], errors="coerce")
-        if "avg_duration" not in _cp.columns:
-            _cp["avg_duration"] = np.nan
-        if "Spike Vol" not in _cp.columns:
-            _cp["Spike Vol"] = np.nan
-        if "Stock Conc" not in _cp.columns:
-            _cp["Stock Conc"] = np.nan
-        if "Baseline" in _cp.columns:
-            _cp["Baseline"] = _cp["Baseline"].astype(bool)
-        SS.cpdf = _cp
+        # Legacy (pre-per-file-calibration) sessions stored one shared
+        # table — keep it as the seed for any newly-imported file rather
+        # than discarding it.
+        SS["_legacy_cpdf_template"] = _cpdf_from_records(d["calibration_points"])
 
 
 def _build_cfg_dict() -> dict:
-    """Settings + calibration table only (no raw trace data) — used for the
-    lightweight browser-localStorage save and the Export/Import JSON."""
+    """Settings only (no raw trace data or calibration tables, which now
+    live per-file) — used for the lightweight browser-localStorage save."""
     return {
         "conc_unit":          SS.conc_unit,
         "cur_unit":           SS.cur_unit,
@@ -1082,20 +1176,21 @@ def _build_cfg_dict() -> dict:
         "smooth_polyorder":   SS.smooth_polyorder,
         "assay_sig_unit":     SS.assay_sig_unit,
         "assay_conc_unit":    SS.assay_conc_unit,
-        "calibration_points": SS.cpdf.to_dict(orient="records"),
     }
 
 
 def _build_session_bundle() -> dict:
-    """Full session: settings + calibration table + the raw amperometry
-    files themselves (as embedded CSV text), so a cloud-saved session can
-    be restored on any machine without re-uploading the original CSVs."""
+    """Full session: settings + the raw amperometry files themselves (as
+    embedded CSV text) + each file's own calibration table, so a
+    cloud-saved session can be restored on any machine without
+    re-uploading the original CSVs or re-filling calibration tables."""
     d = _build_cfg_dict()
     d["amp_files"] = [
         {
             "filename": f["filename"],
             "csv":      f["df"].to_csv(index=False),
             "channels": f["channels"],
+            "cpdf":     f["cpdf"].to_dict(orient="records"),
         }
         for f in SS.amp_files
     ]
@@ -1103,8 +1198,8 @@ def _build_session_bundle() -> dict:
 
 
 def _apply_session_bundle(d: dict) -> None:
-    """Inverse of _build_session_bundle — restores settings, calibration
-    table, and (if present) the raw amperometry files."""
+    """Inverse of _build_session_bundle — restores settings, the raw
+    amperometry files, and each file's own calibration table."""
     _apply_cfg_dict(d)
     if "amp_files" in d:
         _files = []
@@ -1113,6 +1208,7 @@ def _apply_session_bundle(d: dict) -> None:
                 "filename": f["filename"],
                 "df":       pd.read_csv(io.StringIO(f["csv"])),
                 "channels": f["channels"],
+                "cpdf":     _cpdf_from_records(f.get("cpdf")),
             })
         SS.amp_files = _files
         SS.df       = _files[0]["df"] if _files else pd.DataFrame()
@@ -2805,6 +2901,36 @@ with T1:
 > pick up right where you left off.
 """)
 
+    _sc1, _sc2 = st.columns([1, 3])
+    if _sc1.button("Load sample data", help=(
+        "Loads two bundled example runs (2 channels each, with a "
+        "pre-filled calibration table) so you can try the app immediately "
+        "without your own data."
+    )):
+        _sample_files = _load_sample_data()
+        if _sample_files is None:
+            st.error("Sample data files are missing from this deployment.")
+        else:
+            SS.amp_files   = _sample_files
+            SS.df          = _sample_files[0]["df"]
+            SS.channels    = _sample_files[0]["channels"]
+            SS.conc_unit   = "mM"
+            SS.cur_unit    = "µA"
+            SS.ts_visible  = []
+            SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+            SS["cal_active_file"] = _sample_files[0]["filename"]
+            SS["_files_applied_msg"] = (
+                "Sample data loaded — 2 files, 2 channels each, with a "
+                "matching calibration table already filled in. Head to the "
+                "**Time Series** or **Calibration Curve** tab to explore."
+            )
+            st.rerun()
+    _sc2.caption(
+        "Two synthetic amperometric runs (2 channels each) with a "
+        "ready-made calibration table — a quick way to see the whole "
+        "workflow before importing your own files."
+    )
+
     st.subheader("Upload File(s)")
     ups = st.file_uploader(
         "Drag and drop one or more raw sensor data files here, or click to browse",
@@ -2935,7 +3061,15 @@ with T1:
                     )
                     _new_chs.append({"name": _name, "tc": _tc, "ic": _ic})
 
-                _parsed_files.append({"filename": _up.name, "df": _df, "channels": _new_chs})
+                _preset_cpdf = (
+                    _existing_by_name[_up.name]["cpdf"]
+                    if _up.name in _existing_by_name
+                    else _seed_cpdf_for_new_file()
+                )
+                _parsed_files.append({
+                    "filename": _up.name, "df": _df, "channels": _new_chs,
+                    "cpdf": _preset_cpdf,
+                })
 
         if _parsed_files and st.button("Apply Channel Configuration", type="primary"):
             SS.amp_files = _parsed_files
@@ -2944,6 +3078,9 @@ with T1:
             SS.df       = _parsed_files[0]["df"]
             SS.channels = _parsed_files[0]["channels"]
             SS.ts_visible = []
+            # Bump so any per-file calibration-table editors remount fresh
+            # rather than showing another file's cached widget state.
+            SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
             SS["_files_applied_msg"] = (
                 f"{len(_parsed_files)} file(s), "
                 f"{sum(len(f['channels']) for f in _parsed_files)} channel(s) saved. "
@@ -3093,18 +3230,21 @@ with T2:
             ))
 
         _pt_ts = _plot_theme()
-        for _, row in SS.cpdf.iterrows():
-            _ets2 = _eff_t_start(row)
-            if _ets2 is not None and pd.notna(row.get("t_end")):
-                clr = ("rgba(255,165,0,0.22)"
-                       if row.get("Baseline") else "rgba(100,160,255,0.15)")
-                fig_ts.add_vrect(
-                    x0=_ets2, x1=row["t_end"],
-                    fillcolor=clr, layer="below", line_width=0,
-                    annotation_text=str(row["Label"]),
-                    annotation_position="top left",
-                    annotation=dict(font_size=10, font_color=_pt_ts["annot_font"]),
-                )
+        for _frec_sh in SS.amp_files:
+            for _, row in _frec_sh.get("cpdf", pd.DataFrame()).iterrows():
+                _ets2 = _eff_t_start(row)
+                if _ets2 is not None and pd.notna(row.get("t_end")):
+                    clr = ("rgba(255,165,0,0.22)"
+                           if row.get("Baseline") else "rgba(100,160,255,0.15)")
+                    _lbl_sh = (f"{_frec_sh['filename']}: {row['Label']}"
+                               if _multi_file else str(row["Label"]))
+                    fig_ts.add_vrect(
+                        x0=_ets2, x1=row["t_end"],
+                        fillcolor=clr, layer="below", line_width=0,
+                        annotation_text=_lbl_sh,
+                        annotation_position="top left",
+                        annotation=dict(font_size=10, font_color=_pt_ts["annot_font"]),
+                    )
 
         fig_ts.update_layout(
             xaxis_title="Time (s)",
@@ -3152,7 +3292,7 @@ with T2:
             file_name="time_series.html",
             mime="text/html",
         )
-        ts_png = render_ts_png(SS.amp_files, SS.cpdf, SS.cur_unit, sel,
+        ts_png = render_ts_png(SS.amp_files, SS.cur_unit, sel,
                                smooth_method=SS.smooth_method,
                                smooth_window=SS.smooth_window,
                                smooth_polyorder=SS.smooth_polyorder)
@@ -3171,8 +3311,26 @@ with T3:
     if not SS.amp_files:
         st.info("Complete the **Import & Configure** step first.")
     else:
+        # ── Dataset selector ────────────────────────────────────────────────
+        _file_names_cal = [f["filename"] for f in SS.amp_files]
+        if SS.get("cal_active_file") not in _file_names_cal:
+            SS["cal_active_file"] = _file_names_cal[0]
+        if len(_file_names_cal) > 1:
+            st.selectbox(
+                "Dataset",
+                _file_names_cal,
+                key="cal_active_file",
+                help="Each imported file has its own calibration table — pick "
+                     "which one to edit below.",
+            )
+        _active_fi   = _file_names_cal.index(SS["cal_active_file"])
+        _active_frec = SS.amp_files[_active_fi]
+
         # ── Calibration-point editor ──────────────────────────────────────
-        st.subheader("Calibration Points")
+        st.subheader(
+            "Calibration Points"
+            + (f" — {_active_frec['filename']}" if len(_file_names_cal) > 1 else "")
+        )
         st.caption(
             "Add one row per concentration step. "
             "**t start / t end** define the averaging window — read these off the "
@@ -3181,13 +3339,15 @@ with T3:
             "is subtracted from all other steps. "
             "**Spike Vol / Stock Conc** are optional — fill them in to use the "
             "effective concentration calculator below instead of typing "
-            "Concentration by hand."
+            "Concentration by hand. "
+            + ("Each imported file keeps its own table, so switch **Dataset** "
+               "above to edit another one." if len(_file_names_cal) > 1 else "")
         )
         if "cal_editor_version" not in SS:
             SS.cal_editor_version = 0
         _cpdf_edit = st.data_editor(
-            SS.cpdf,
-            key=f"cal_editor_{SS.cal_editor_version}",
+            _active_frec["cpdf"],
+            key=f"cal_editor_{_active_fi}_{SS.cal_editor_version}",
             num_rows="dynamic",
             use_container_width=True,
             column_config={
@@ -3230,17 +3390,21 @@ with T3:
                 ),
             },
         )
+        # Persist every edit immediately so any other code running later in
+        # this same pass (dataset switches, Compute Calibration, session
+        # export) always sees the latest typed values, not a stale copy.
+        _active_frec["cpdf"] = _cpdf_edit
 
         with st.expander("Effective concentration calculator (serial dilution)"):
             st.caption(
                 "Models a single vessel that starts at **Initial Volume** of blank "
                 "buffer. Each row's **Spike Vol** of **Stock Conc** analyte is added "
-                "in sequence (top to bottom); clicking the button below computes "
-                "the cumulative, dilution-corrected concentration after each "
-                "addition and writes it into the **Concentration** column above. "
+                "in sequence (top to bottom); computing the calibration below "
+                "automatically applies this to the **Concentration** column. "
                 "**t start** is filled in from **Avg window (s)** at the same time, "
                 "for any row where that column is set. Blank Spike Vol / Stock Conc "
-                "cells are treated as 0."
+                "cells are treated as 0. Use the button below to preview the result "
+                "here without running the full calibration yet."
             )
             v1, v2 = st.columns(2)
             SS.initial_volume = v1.number_input(
@@ -3251,30 +3415,12 @@ with T3:
             SS.vol_unit = v2.text_input(
                 "Volume unit", SS.vol_unit, help="e.g. mL, µL, L",
             )
-            if st.button("Update Concentration & t start"):
-                _calc_df = _cpdf_edit.copy()
-                if _calc_df[["Spike Vol", "Stock Conc"]].notna().any().any():
-                    _vol  = float(SS.initial_volume)
-                    _mass = 0.0
-                    _eff  = []
-                    for _, _row in _calc_df.iterrows():
-                        _sv = _row.get("Spike Vol", 0.0)
-                        _sc = _row.get("Stock Conc", 0.0)
-                        _sv = 0.0 if pd.isna(_sv) else float(_sv)
-                        _sc = 0.0 if pd.isna(_sc) else float(_sc)
-                        _vol  += _sv
-                        _mass += _sv * _sc
-                        _eff.append(_mass / _vol if _vol > 0 else np.nan)
-                    _calc_df["Concentration"] = _eff
-                for _ti, _trow in _calc_df.iterrows():
-                    if pd.notna(_trow.get("avg_duration")) and pd.notna(_trow.get("t_end")):
-                        _calc_df.at[_ti, "t_start"] = _eff_t_start(_trow)
-                SS.cpdf = _calc_df
+            if st.button("Preview: update Concentration & t start"):
+                _active_frec["cpdf"] = _apply_effective_concentration(_cpdf_edit, SS.initial_volume)
                 SS.cal_editor_version += 1
                 st.success("Concentration / t start updated above.")
                 st.rerun()
 
-        SS.cpdf = _cpdf_edit
         st.divider()
 
         # ── Analysis settings ─────────────────────────────────────────────
@@ -3285,8 +3431,11 @@ with T3:
                 "configured in the Time Series tab."
             )
         _cal_multi_file = len(SS.amp_files) > 1
+        # Store the live file dict (not a snapshot of its cpdf) so that any
+        # updates made below — including the auto-recompute inside Compute
+        # Calibration itself — are picked up without a stale-copy bug.
         _cal_combo_lookup = {
-            _amp_label(frec["filename"], ch["name"], _cal_multi_file): (frec["df"], ch)
+            _amp_label(frec["filename"], ch["name"], _cal_multi_file): (frec, ch)
             for frec in SS.amp_files
             for ch in frec["channels"]
         }
@@ -3296,7 +3445,7 @@ with T3:
             list(_cal_combo_lookup.keys()),
             default=list(_cal_combo_lookup.keys())[:1],
             help="Select one or more channels (and, with multiple files loaded, file·channel pairs). "
-                 "Each gets its own calibration curve, computed over the shared time windows above.",
+                 "Each uses its own dataset's calibration table above.",
         )
         fit_type = a2.selectbox(
             "Fit type",
@@ -3328,22 +3477,28 @@ with T3:
             if len(analyze_chs) >= 2 else False
         )
 
-        if st.button("Compute Calibration", type="primary"):
-            cpdf = (SS.cpdf
-                    .dropna(subset=["t_end"])
-                    .reset_index(drop=True))
-            if cpdf.empty:
-                st.error("No valid rows — fill in the calibration table above.")
-                st.stop()
-
-            base_rows = cpdf[cpdf["Baseline"].apply(lambda b: bool(b) if pd.notna(b) else False)]
-            base_idx  = int(base_rows.index[0]) if len(base_rows) else 0
-            if len(base_rows) == 0:
-                st.warning("No baseline row marked — using the first row as baseline.")
-
+        def _do_compute_calibration() -> bool:
+            """Runs the full per-channel calibration compute, each channel
+            pulling its OWN dataset's current calibration table. Returns
+            True iff at least one channel produced results."""
             results = {}
             for ch_name in analyze_chs:
-                df, ch = _cal_combo_lookup[ch_name]
+                frec, ch = _cal_combo_lookup[ch_name]
+                cpdf = (frec["cpdf"]
+                        .dropna(subset=["t_end"])
+                        .reset_index(drop=True))
+                if cpdf.empty:
+                    st.error(f"**{ch_name}**: no valid calibration rows — fill in "
+                             f"{frec['filename']}'s table above.")
+                    continue
+
+                base_rows = cpdf[cpdf["Baseline"].apply(lambda b: bool(b) if pd.notna(b) else False)]
+                base_idx  = int(base_rows.index[0]) if len(base_rows) else 0
+                if len(base_rows) == 0:
+                    st.warning(f"**{ch_name}**: no baseline row marked in "
+                               f"{frec['filename']} — using the first row as baseline.")
+
+                df = frec["df"]
                 t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
                 i_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
                 i_arr = smooth_signal(i_arr, SS.smooth_method, SS.smooth_window, SS.smooth_polyorder)
@@ -3406,13 +3561,14 @@ with T3:
                 )
 
             # ── Channel average ───────────────────────────────────────────
-            if show_avg and len(analyze_chs) >= 2:
-                all_di    = np.array([results[c]["delta_i"] for c in analyze_chs],
+            _avg_chs = [c for c in analyze_chs if c in results]
+            if show_avg and len(_avg_chs) >= 2:
+                all_di    = np.array([results[c]["delta_i"] for c in _avg_chs],
                                      dtype=float)
-                all_avgs  = np.array([results[c]["avgs"]    for c in analyze_chs],
+                all_avgs  = np.array([results[c]["avgs"]    for c in _avg_chs],
                                      dtype=float)
-                all_sigma = [results[c]["sigma_bl"] for c in analyze_chs]
-                n_ch      = len(analyze_chs)
+                all_sigma = [results[c]["sigma_bl"] for c in _avg_chs]
+                n_ch      = len(_avg_chs)
 
                 avg_delta_i   = np.nanmean(all_di, axis=0)
                 std_across_ch = np.nanstd(all_di, axis=0, ddof=1)  # inter-channel spread (sample std)
@@ -3423,20 +3579,53 @@ with T3:
                                 if _valid_s else np.nan)
 
                 results["Channel Average"] = dict(
-                    concs      = results[analyze_chs[0]]["concs"],
-                    labels     = results[analyze_chs[0]]["labels"],
+                    concs      = results[_avg_chs[0]]["concs"],
+                    labels     = results[_avg_chs[0]]["labels"],
                     avgs       = avg_avgs.tolist(),
                     sigs       = std_across_ch.tolist(),
                     delta_i    = avg_delta_i.tolist(),
                     sigma_bl   = float(sigma_bl_avg),
                     is_average = True,
-                    baselines  = results[analyze_chs[0]]["baselines"],
+                    baselines  = results[_avg_chs[0]]["baselines"],
                 )
 
-            SS.cal_results = dict(
-                results=results, fit_type=fit_type, n_seg=n_seg
+            if not results:
+                SS.cal_results = None
+                return False
+            SS.cal_results = dict(results=results, fit_type=fit_type, n_seg=n_seg)
+            return True
+
+        # A single, robust action: type values into the table above, click
+        # this once, and everything downstream — effective-concentration
+        # derivation, the active dataset's table display, and the
+        # calibration curve/statistics below — updates together.
+        if st.button("Compute Calibration", type="primary"):
+            if not analyze_chs:
+                st.error("Select at least one channel to analyse above.")
+            else:
+                _calc_df = _apply_effective_concentration(_cpdf_edit, SS.initial_volume)
+                _active_frec["cpdf"] = _calc_df
+                if not _calc_df.equals(_cpdf_edit):
+                    # Table content changed (e.g. Spike Vol/Stock Conc derived
+                    # new Concentration values) — bump + rerun so the editor
+                    # widget itself refreshes to show them, then finish the
+                    # compute automatically on the very next pass.
+                    SS.cal_editor_version += 1
+                    SS["_cal_pending_compute"] = True
+                    st.rerun()
+                else:
+                    SS["_cal_computed_msg"] = (
+                        "Calibration computed — results below."
+                        if _do_compute_calibration() else None
+                    )
+
+        if SS.pop("_cal_pending_compute", False):
+            SS["_cal_computed_msg"] = (
+                "Calibration computed — results below."
+                if _do_compute_calibration() else None
             )
-            st.success("Calibration computed — results below.")
+        if SS.get("_cal_computed_msg"):
+            st.success(SS.pop("_cal_computed_msg"))
 
         # ── Plot & statistics ─────────────────────────────────────────────
         if SS.cal_results:
@@ -3704,7 +3893,7 @@ with T4:
             )
             ts_vis = SS.ts_visible if SS.ts_visible else all_ch_names_export
             ts_png_bytes = render_ts_png(
-                SS.amp_files, SS.cpdf, SS.cur_unit, ts_vis,
+                SS.amp_files, SS.cur_unit, ts_vis,
                 smooth_method=SS.smooth_method,
                 smooth_window=SS.smooth_window,
                 smooth_polyorder=SS.smooth_polyorder,
@@ -3756,12 +3945,12 @@ with T4:
                 _amp_label(f["filename"], c["name"], len(SS.amp_files) > 1)
                 for f in SS.amp_files for c in f["channels"]
             ]
-            _prev_ts = render_ts_png(SS.amp_files, SS.cpdf, SS.cur_unit, _ts_vis,
+            _prev_ts = render_ts_png(SS.amp_files, SS.cur_unit, _ts_vis,
                                      dpi=96, fmt="png", figsize=_pfs, style=_pstyle_l,
                                      smooth_method=SS.smooth_method,
                                      smooth_window=SS.smooth_window,
                                      smooth_polyorder=SS.smooth_polyorder)
-            _pub_ts  = render_ts_png(SS.amp_files, SS.cpdf, SS.cur_unit, _ts_vis,
+            _pub_ts  = render_ts_png(SS.amp_files, SS.cur_unit, _ts_vis,
                                      dpi=_pdpi_val, fmt=_pfmt_l, figsize=_pfs, style=_pstyle_l,
                                      smooth_method=SS.smooth_method,
                                      smooth_window=SS.smooth_window,
