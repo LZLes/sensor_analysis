@@ -16,6 +16,20 @@ import matplotlib.pyplot as plt
 from scipy import stats
 from streamlit_local_storage import LocalStorage
 
+try:
+    from google.oauth2 import service_account as _gsa
+    from googleapiclient.discovery import build as _gbuild
+    from googleapiclient.http import MediaIoBaseUpload as _GMediaUpload, MediaIoBaseDownload as _GMediaDownload
+    _GDRIVE_LIBS_OK = True
+except BaseException:
+    # Deliberately catches BaseException, not just Exception: a broken or
+    # incompatible crypto backend in the deploy environment can blow up this
+    # import with a Rust-side pyo3 PanicException (observed from
+    # google-auth's crypto deps), which does not subclass Exception and
+    # would otherwise crash the whole app at import time. Either way, Cloud
+    # Sessions should just stay unavailable.
+    _GDRIVE_LIBS_OK = False
+
 matplotlib.use("Agg")   # headless backend — no display required
 
 # ── page config ───────────────────────────────────────────────────────────────
@@ -1052,6 +1066,117 @@ def _apply_cfg_dict(d: dict) -> None:
         SS.cpdf = _cp
 
 
+def _build_cfg_dict() -> dict:
+    """Settings + calibration table only (no raw trace data) — used for the
+    lightweight browser-localStorage save and the Export/Import JSON."""
+    return {
+        "conc_unit":          SS.conc_unit,
+        "cur_unit":           SS.cur_unit,
+        "volt_unit":          SS.volt_unit,
+        "cv_cur_unit":        SS.cv_cur_unit,
+        "cv_sr_unit":         SS.cv_sr_unit,
+        "vol_unit":           SS.vol_unit,
+        "initial_volume":     SS.initial_volume,
+        "smooth_method":      SS.smooth_method,
+        "smooth_window":      SS.smooth_window,
+        "smooth_polyorder":   SS.smooth_polyorder,
+        "assay_sig_unit":     SS.assay_sig_unit,
+        "assay_conc_unit":    SS.assay_conc_unit,
+        "calibration_points": SS.cpdf.to_dict(orient="records"),
+    }
+
+
+def _build_session_bundle() -> dict:
+    """Full session: settings + calibration table + the raw amperometry
+    files themselves (as embedded CSV text), so a cloud-saved session can
+    be restored on any machine without re-uploading the original CSVs."""
+    d = _build_cfg_dict()
+    d["amp_files"] = [
+        {
+            "filename": f["filename"],
+            "csv":      f["df"].to_csv(index=False),
+            "channels": f["channels"],
+        }
+        for f in SS.amp_files
+    ]
+    return d
+
+
+def _apply_session_bundle(d: dict) -> None:
+    """Inverse of _build_session_bundle — restores settings, calibration
+    table, and (if present) the raw amperometry files."""
+    _apply_cfg_dict(d)
+    if "amp_files" in d:
+        _files = []
+        for f in d["amp_files"]:
+            _files.append({
+                "filename": f["filename"],
+                "df":       pd.read_csv(io.StringIO(f["csv"])),
+                "channels": f["channels"],
+            })
+        SS.amp_files = _files
+        SS.df       = _files[0]["df"] if _files else pd.DataFrame()
+        SS.channels = _files[0]["channels"] if _files else []
+
+
+# ── Google Drive cloud sessions (optional — needs secrets configured) ──────────
+_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+def _drive_enabled() -> bool:
+    return (_GDRIVE_LIBS_OK
+            and "gcp_service_account" in st.secrets
+            and "gdrive_folder_id" in st.secrets)
+
+@st.cache_resource(show_spinner=False)
+def _drive_service():
+    info = dict(st.secrets["gcp_service_account"])
+    creds = _gsa.Credentials.from_service_account_info(info, scopes=_DRIVE_SCOPES)
+    return _gbuild("drive", "v3", credentials=creds, cache_discovery=False)
+
+def _drive_folder_id() -> str:
+    return st.secrets["gdrive_folder_id"]
+
+def _drive_esc(name: str) -> str:
+    """Escape a name for safe inclusion in a Drive API query string."""
+    return name.replace("\\", "\\\\").replace("'", "\\'")
+
+def _drive_list_sessions() -> list[dict]:
+    svc = _drive_service()
+    q = (f"'{_drive_folder_id()}' in parents and trashed = false "
+         "and mimeType = 'application/json'")
+    res = svc.files().list(
+        q=q, fields="files(id,name,modifiedTime)",
+        orderBy="modifiedTime desc", pageSize=200,
+    ).execute()
+    return res.get("files", [])
+
+def _drive_save_session(name: str, data: bytes) -> None:
+    svc = _drive_service()
+    fname = f"{name}.json"
+    q = (f"'{_drive_folder_id()}' in parents and trashed = false "
+         f"and name = '{_drive_esc(fname)}'")
+    existing = svc.files().list(q=q, fields="files(id)").execute().get("files", [])
+    media = _GMediaUpload(io.BytesIO(data), mimetype="application/json", resumable=False)
+    if existing:
+        svc.files().update(fileId=existing[0]["id"], media_body=media).execute()
+    else:
+        meta = {"name": fname, "parents": [_drive_folder_id()]}
+        svc.files().create(body=meta, media_body=media, fields="id").execute()
+
+def _drive_load_session(file_id: str) -> dict:
+    svc = _drive_service()
+    buf = io.BytesIO()
+    downloader = _GMediaDownload(buf, svc.files().get_media(fileId=file_id))
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buf.seek(0)
+    return _json.loads(buf.read().decode())
+
+def _drive_delete_session(file_id: str) -> None:
+    _drive_service().files().delete(fileId=file_id).execute()
+
+
 # Auto-load saved config from the browser's localStorage once per session.
 # The component's value arrives asynchronously, so retry across a couple of
 # reruns before giving up (e.g. first-time users with nothing saved yet).
@@ -1079,26 +1204,23 @@ with st.sidebar:
     st.radio("Section", ["Amperometry", "Cyclic Voltammetry", "Assay"], key="mode")
     st.divider()
     st.subheader("Configuration")
+    st.caption(
+        "Three ways to pick up where you left off: **Save** remembers your "
+        "settings in this browser only. **Export/Import JSON** bundles "
+        "settings + calibration table + your uploaded files into one file "
+        "you keep or share. **Cloud Sessions** does the same to a shared "
+        "Google Drive folder, so anyone on the team can load it."
+    )
 
-    _cfg = {
-        "conc_unit":          SS.conc_unit,
-        "cur_unit":           SS.cur_unit,
-        "volt_unit":          SS.volt_unit,
-        "cv_cur_unit":        SS.cv_cur_unit,
-        "cv_sr_unit":         SS.cv_sr_unit,
-        "vol_unit":           SS.vol_unit,
-        "initial_volume":     SS.initial_volume,
-        "smooth_method":      SS.smooth_method,
-        "smooth_window":      SS.smooth_window,
-        "smooth_polyorder":   SS.smooth_polyorder,
-        "assay_sig_unit":     SS.assay_sig_unit,
-        "assay_conc_unit":    SS.assay_conc_unit,
-        "calibration_points": SS.cpdf.to_dict(orient="records"),
-    }
+    _cfg = _build_cfg_dict()
 
-    # ── Save to browser localStorage ──────────────────────────────────────────
+    # ── Save to browser localStorage (settings only — no raw trace data,
+    #    to stay well inside the browser's storage quota) ───────────────────
     if st.button("Save", type="primary", use_container_width=True,
-                 help="Saves in this browser — auto-loads next time you open the app here"):
+                 help="Saves settings + calibration table in this browser — "
+                      "auto-loads next time you open the app here. Does not "
+                      "include your uploaded files; use Export/Import JSON "
+                      "or Cloud Sessions for that."):
         _local_storage.setItem("sensor_config", _json.dumps(_cfg, default=str))
         SS["_cfg_saved_at"] = time.strftime("%d %b %Y  %H:%M")
         st.toast("Configuration saved.", icon="✅")
@@ -1110,30 +1232,109 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Export / Import (for sharing or backup across machines) ────────────────
+    # ── Export / Import (full session, for sharing or backup across machines) ──
     with st.expander("Export / Import JSON"):
+        st.caption(
+            "Includes your uploaded amperometry files, so restoring one "
+            "doesn't require re-uploading the original CSVs."
+        )
         st.download_button(
-            "Export as JSON",
-            data=_json.dumps(_cfg, indent=2, default=str).encode(),
-            file_name="sensor_config.json",
+            "Export session as JSON",
+            data=_json.dumps(_build_session_bundle(), indent=2, default=str).encode(),
+            file_name="sensor_session.json",
             mime="application/json",
             use_container_width=True,
         )
         _cfg_up = st.file_uploader(
-            "Import JSON",
+            "Import session JSON",
             type=["json"],
             key="cfg_uploader",
-            help="Load a config saved on another machine or shared by a colleague.",
+            help="Load a session saved on another machine or shared by a colleague.",
         )
-        if _cfg_up is not None:
+        if _cfg_up is not None and _cfg_up.file_id != SS.get("_cfg_up_last_id"):
+            # file_id changes each time a new file is chosen (even a
+            # same-named re-upload) but stays constant across reruns of an
+            # already-processed upload — guards against re-applying (and
+            # clobbering any newer edits) on every unrelated rerun, since
+            # the uploader keeps returning the same file until replaced.
+            SS["_cfg_up_last_id"] = _cfg_up.file_id
             try:
                 _loaded = _json.loads(_cfg_up.read())
-                _apply_cfg_dict(_loaded)
-                _local_storage.setItem("sensor_config", _json.dumps(_loaded, default=str))
+                _apply_session_bundle(_loaded)
+                _local_storage.setItem("sensor_config", _json.dumps(_build_cfg_dict(), default=str))
                 SS["_cfg_saved_at"] = time.strftime("%d %b %Y  %H:%M")
                 st.success("Imported.")
             except Exception as _exc:
                 st.error(f"Failed: {_exc}")
+
+    st.divider()
+
+    # ── Cloud sessions (Google Drive) — full session incl. raw trace data ──────
+    if _drive_enabled():
+        with st.expander("Cloud Sessions (Google Drive)"):
+            st.caption(
+                "Save/load full sessions — settings, calibration table, and the "
+                "raw amperometry files — to a shared Drive folder. Anyone with "
+                "access to this app and that folder can pick it up."
+            )
+            _sess_name = st.text_input(
+                "Session name", key="drive_sess_name",
+                placeholder="e.g. Run 2026-07-02",
+            )
+            if st.button("Save to Drive", use_container_width=True,
+                         disabled=not _sess_name.strip()):
+                try:
+                    _bundle = _build_session_bundle()
+                    _drive_save_session(_sess_name.strip(),
+                                         _json.dumps(_bundle, default=str).encode())
+                    st.toast(f"Saved '{_sess_name.strip()}' to Drive.", icon="☁️")
+                    SS.pop("_drive_sessions_cache", None)
+                except Exception as _exc:
+                    st.error(f"Save failed: {_exc}")
+
+            if st.button("Refresh list", use_container_width=True):
+                SS.pop("_drive_sessions_cache", None)
+
+            try:
+                if "_drive_sessions_cache" not in SS:
+                    SS["_drive_sessions_cache"] = _drive_list_sessions()
+                _sessions = SS["_drive_sessions_cache"]
+            except Exception as _exc:
+                _sessions = []
+                st.error(f"Couldn't list Drive sessions: {_exc}")
+
+            if _sessions:
+                _opts = {
+                    f"{s['name'][:-5]}  ·  {s['modifiedTime'][:16].replace('T', ' ')}": s
+                    for s in _sessions
+                }
+                _pick = st.selectbox("Saved sessions", list(_opts.keys()), key="drive_sess_pick")
+                _lc, _dc = st.columns(2)
+                if _lc.button("Load", use_container_width=True, type="primary"):
+                    try:
+                        _data = _drive_load_session(_opts[_pick]["id"])
+                        _apply_session_bundle(_data)
+                        _local_storage.setItem("sensor_config", _json.dumps(_build_cfg_dict(), default=str))
+                        SS["_cfg_saved_at"] = time.strftime("%d %b %Y  %H:%M")
+                        st.success("Session loaded.")
+                        st.rerun()
+                    except Exception as _exc:
+                        st.error(f"Load failed: {_exc}")
+                if _dc.button("Delete", use_container_width=True):
+                    try:
+                        _drive_delete_session(_opts[_pick]["id"])
+                        SS.pop("_drive_sessions_cache", None)
+                        st.toast("Deleted.", icon="🗑️")
+                        st.rerun()
+                    except Exception as _exc:
+                        st.error(f"Delete failed: {_exc}")
+            else:
+                st.caption("No sessions saved yet.")
+    else:
+        st.caption(
+            "Cloud sessions unavailable — add `gcp_service_account` and "
+            "`gdrive_folder_id` to secrets to enable saving to Google Drive."
+        )
 
     st.divider()
     st.caption("Sensor Analysis Studio")
@@ -2594,6 +2795,14 @@ with T1:
 4. **Export** — download the calibration CSV, plots (PNG or interactive HTML), or the raw data.
 
 > **Tip:** Calibration windows are shown as shaded bands on the time-series chart so you can visually verify your time entries.
+
+> **Resuming previous work:** don't want to re-upload and re-map every time?
+> The sidebar's **Configuration** section can save your settings and
+> calibration table to this browser (**Save**), to a downloadable JSON file
+> (**Export / Import JSON**) to move between machines, or — if your team has
+> set it up — a full session including the raw uploaded files themselves to a
+> shared Google Drive folder (**Cloud Sessions**), so anyone with access can
+> pick up right where you left off.
 """)
 
     st.subheader("Upload File(s)")
@@ -2735,11 +2944,19 @@ with T1:
             SS.df       = _parsed_files[0]["df"]
             SS.channels = _parsed_files[0]["channels"]
             SS.ts_visible = []
-            st.success(
+            SS["_files_applied_msg"] = (
                 f"{len(_parsed_files)} file(s), "
                 f"{sum(len(f['channels']) for f in _parsed_files)} channel(s) saved. "
                 "Head to the **Time Series** tab to inspect your traces."
             )
+            # Rerun so the sidebar (rendered earlier in script order, so it
+            # would otherwise see last run's stale SS.amp_files) picks up
+            # the new files immediately — this is what the Save/Export/
+            # Cloud-Session buttons embed.
+            st.rerun()
+
+    if SS.get("_files_applied_msg"):
+        st.success(SS.pop("_files_applied_msg"))
 
     if SS.amp_files:
         st.divider()
