@@ -1,5 +1,6 @@
 """App configuration, loaded from environment variables (.env locally,
-Render's environment tab in production). See .env.example for the full list."""
+Cloud Run's --set-env-vars / Secret Manager in production). See
+.env.example for the full list."""
 from __future__ import annotations
 
 from functools import lru_cache
@@ -20,9 +21,11 @@ class Settings(BaseSettings):
     @field_validator("database_url")
     @classmethod
     def _use_psycopg3_driver(cls, v: str) -> str:
-        # Render (and most managed Postgres providers) hand out a bare
-        # "postgresql://..." URL, but we're on psycopg3 — normalize it
-        # rather than requiring every deploy target to know this detail.
+        # Neon (and most managed Postgres providers) hand out a bare
+        # "postgresql://...?sslmode=require" URL, but we're on psycopg3 —
+        # normalize the scheme rather than requiring every deploy target
+        # to know this detail. psycopg3 honors the ?sslmode=require query
+        # param as-is, so it passes through untouched.
         if v.startswith("postgresql://"):
             return "postgresql+psycopg://" + v[len("postgresql://"):]
         return v

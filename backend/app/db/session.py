@@ -1,5 +1,5 @@
 """SQLAlchemy engine/session setup. DATABASE_URL comes from settings (env var),
-pointing at Render's managed Postgres in production and a local Postgres
+pointing at Neon's serverless Postgres in production and a local Postgres
 (or SQLite for quick local iteration only — never for deployment, see the
 migration plan's reasoning on concurrency) in development."""
 from __future__ import annotations

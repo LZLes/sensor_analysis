@@ -13,7 +13,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8000
+EXPOSE 8080
 
-# Run migrations then start the API. Render sets $PORT; default to 8000 locally.
-CMD alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Cloud Run injects $PORT (8080 by default) and expects the container to
+# listen on it; default to 8080 locally too so `docker run` matches.
+# Migrations are NOT run here on purpose: Cloud Run can cold-start several
+# container instances concurrently under load, and racing `alembic upgrade
+# head` across instances is a real failure mode. Run migrations as a
+# separate one-off step (see DEPLOYMENT.md) before deploying a new revision.
+CMD exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}
