@@ -1,0 +1,38 @@
+# Cloud Build config for continuous deploy: build the image, push it to
+# Artifact Registry, deploy it to Cloud Run. Wire this up via Cloud Build →
+# Triggers → Connect Repository in the GCP console (see DEPLOYMENT.md) —
+# that's a one-time manual step; every push after that redeploys automatically.
+#
+# Prerequisite (one-time): create the Artifact Registry repo this pushes to:
+#   gcloud artifacts repositories create sensor-analysis \
+#     --repository-format=docker --location=us-central1
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/sensor-analysis/api:$COMMIT_SHA'
+      - '.'
+    dir: backend
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - push
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/sensor-analysis/api:$COMMIT_SHA'
+
+  - name: 'gcr.io/google.com/cloudsdk/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - sensor-analysis-api
+      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/sensor-analysis/api:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--quiet'
+      # Secrets/env vars are NOT set here — Cloud Run keeps whatever was
+      # configured on the service from the last `gcloud run deploy` (see
+      # DEPLOYMENT.md step 2). This step only updates the image, so it
+      # can't accidentally wipe or leak secrets into build logs.
+
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/sensor-analysis/api:$COMMIT_SHA'
