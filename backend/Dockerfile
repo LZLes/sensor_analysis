@@ -15,10 +15,11 @@ COPY . .
 
 EXPOSE 8080
 
-# Cloud Run injects $PORT (8080 by default) and expects the container to
-# listen on it; default to 8080 locally too so `docker run` matches.
-# Migrations are NOT run here on purpose: Cloud Run can cold-start several
-# container instances concurrently under load, and racing `alembic upgrade
-# head` across instances is a real failure mode. Run migrations as a
-# separate one-off step (see DEPLOYMENT.md) before deploying a new revision.
+# Render (like most container platforms) injects $PORT and expects the
+# container to listen on it; default to 8080 locally so `docker run`
+# matches. Migrations are NOT run here on purpose — keeping "deploy a new
+# image" and "change the schema" as separate, explicit steps means a
+# redeploy (or a restart after a crash) never silently re-runs migrations
+# as a side effect. Run migrations as a one-off step (see DEPLOYMENT.md)
+# before deploying a revision that needs them.
 CMD exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}

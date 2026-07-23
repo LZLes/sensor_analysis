@@ -1,43 +1,37 @@
 # Deployment
 
-Free-tier-friendly stack: **Vercel** for the React frontend, **Neon** for a
-serverless Postgres that never expires and scales to zero, **Google Cloud
-Run** for the FastAPI backend (also scales to zero — you're unlikely to be
-billed anything at this app's scale). All three have real, indefinite free
-tiers, unlike Render's free web service (spins down + cold-starts on every
-idle period) or free Postgres (expires after 30 days).
+**Render** hosts both the frontend (static site) and the backend (Docker
+web service); **Neon** hosts Postgres. No credit card required anywhere.
+This replaced two earlier options considered for this app — see the
+"Hosting" section of the migration plan for the full history — Google
+Cloud Run required a billing-enabled project even for its free tier, and
+Vercel's serverless functions have a 250 MB size limit that this backend's
+scientific-computing dependencies (numpy+scipy+pandas+matplotlib alone
+measure 277 MB installed) blow past on their own.
+
+The one tradeoff worth knowing up front: Render's free web service spins
+down after 15 minutes idle and takes 30-60s to wake on the next request.
+For a tool the team dips into occasionally rather than continuously,
+that's a real but bounded cost — no data loss, just a slow first load.
+
+`render.yaml` at the repo root is a Render **Blueprint** — it describes
+both services declaratively, so most of this is "click Apply" rather than
+filling in forms by hand.
 
 ## 1. Database (Neon)
 
-1. Sign up at neon.tech, create a project (pick a region close to wherever
-   Cloud Run ends up, e.g. `us-central1` for both).
+1. Sign up at neon.tech, create a project.
 2. Neon gives you a connection string immediately, e.g.
    `postgresql://user:password@ep-xxxx.us-east-2.aws.neon.tech/sensor_analysis?sslmode=require`.
    Copy it — `app/config.py` already normalizes the bare `postgresql://`
    scheme to `postgresql+psycopg://` for you, and passes the `?sslmode=require`
    query param straight through (psycopg3 understands it natively).
-3. Run migrations against it. Either from your machine:
+3. Run migrations against it from your machine:
    ```bash
    cd backend
    DATABASE_URL="postgresql://user:password@ep-xxxx...neon.tech/sensor_analysis?sslmode=require" \
      alembic upgrade head
    ```
-   or, once you have a Google Cloud project (step 2 below), as a **Cloud
-   Run Job** — same container image, no local network access to Neon
-   required, and it's the version you'll want once a teammate other than
-   you needs to run a migration:
-   ```bash
-   gcloud run jobs deploy migrate \
-     --source backend \
-     --region us-central1 \
-     --set-secrets "DATABASE_URL=database-url:latest" \
-     --command alembic --args upgrade,head
-
-   gcloud run jobs execute migrate --region us-central1 --wait
-   ```
-   (assumes the `database-url` secret from step 2's Secret Manager section
-   below already exists — create that first if you're doing the Job route
-   before the service route.)
 4. Bootstrap the first admin user (there's no self-signup — `users` rows
    ARE the allowlist):
    ```bash
@@ -46,91 +40,40 @@ idle period) or free Postgres (expires after 30 days).
    ```
    From then on, add teammates the same way (direct SQL, until an admin UI exists).
 
-## 2. Backend (Google Cloud Run)
+## 2. Both services (Render Blueprint)
 
-Requires a Google Cloud project with billing enabled (Cloud Run's free tier
-is generous, but the project still needs a billing account attached) and
-the `gcloud` CLI installed and logged in (`gcloud auth login`).
+1. In the Render dashboard: **New +** → **Blueprint**, connect this GitHub
+   repo. Render reads `render.yaml` and shows you two services to create:
+   - `sensor-analysis-api` — the FastAPI backend (Docker, `backend/Dockerfile`).
+   - `sensor-analysis-frontend` — the React frontend (static site, built
+     from `frontend/`).
+2. Click **Apply**. Render creates both, generates `SESSION_SECRET`
+   automatically, and leaves the rest of the env vars blank (marked
+   `sync: false` in `render.yaml`) for you to fill in next.
+3. Once `sensor-analysis-api` has deployed, copy its URL (e.g.
+   `https://sensor-analysis-api.onrender.com`) and set these in its
+   **Environment** tab:
+   - `DATABASE_URL` — the Neon connection string from step 1.
+   - `GOOGLE_OAUTH_CLIENT_ID` — from the Google Cloud Console OAuth client
+     you create for "Sign in with Google" (Authorized JavaScript origins:
+     the frontend's Render URL from step 4 below).
+   - `ANTHROPIC_API_KEY` — for the AI Insights feature. Leaving it unset
+     just disables that one endpoint (503), everything else works fine.
+4. Once `sensor-analysis-frontend` has deployed, copy its URL (e.g.
+   `https://sensor-analysis-frontend.onrender.com`) and set:
+   - On `sensor-analysis-frontend`: `VITE_API_BASE` = the backend URL from
+     step 3. **Redeploy the frontend after setting this** — Vite bakes env
+     vars in at build time, not read at runtime, so a plain env var change
+     alone won't take effect.
+   - On `sensor-analysis-api`: `FRONTEND_ORIGIN` = this frontend URL, then
+     it redeploys automatically. CORS will reject the frontend's requests
+     until this is set correctly.
+5. Add the frontend's URL as an Authorized JavaScript origin on the Google
+   OAuth client from step 3.
 
-### 2a. Store secrets in Secret Manager
-
-Anything that's actually sensitive (the database URL contains a password;
-`SESSION_SECRET` signs auth cookies; the Anthropic key costs money if
-leaked) goes in Secret Manager instead of a plain `--set-env-vars` value —
-those show up in `gcloud` shell history and the console's env var list in
-cleartext, secrets don't:
-
-```bash
-printf '%s' "postgresql://user:password@ep-xxxx...neon.tech/sensor_analysis?sslmode=require" \
-  | gcloud secrets create database-url --data-file=-
-printf '%s' "$(openssl rand -hex 32)" \
-  | gcloud secrets create session-secret --data-file=-
-printf '%s' "sk-ant-..." \
-  | gcloud secrets create anthropic-api-key --data-file=-
-```
-
-`gcloud run deploy`/`jobs deploy` auto-grant the service's default runtime
-account access to secrets referenced via `--set-secrets`, so no separate
-IAM step is needed for the common case.
-
-### 2b. Deploy the service
-
-```bash
-cd backend
-gcloud run deploy sensor-analysis-api \
-  --source . \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --set-secrets "DATABASE_URL=database-url:latest,SESSION_SECRET=session-secret:latest,ANTHROPIC_API_KEY=anthropic-api-key:latest" \
-  --set-env-vars "FRONTEND_ORIGIN=http://localhost:5173,GOOGLE_OAUTH_CLIENT_ID=your-client-id.apps.googleusercontent.com"
-```
-(`--allow-unauthenticated` means "anyone can reach the API" at the network
-level — your own Google-OAuth-plus-allowlist auth is still what actually
-gates access to data; Cloud Run's IAM auth is a separate, coarser layer you
-don't need here. Omitting `ANTHROPIC_API_KEY`/the whole secret entirely is
-fine too — it just disables the AI Insights endpoint, 503, nothing else
-breaks.)
-
-Note the service URL it prints, e.g.
-`https://sensor-analysis-api-xxxxx-uc.a.run.app` — you'll need it for the
-frontend and for the Google OAuth client's Authorized JavaScript Origins.
-
-Once the frontend has a URL (step 3 below), come back and update
-`FRONTEND_ORIGIN` to it and redeploy — CORS will reject the frontend's
-requests otherwise. Redeploying after a code change is the same command;
-Cloud Run reuses the previous revision's env vars/secrets unless you
-explicitly change them.
-
-### 2c. Optional: continuous deploy via Cloud Build
-
-So you don't run `gcloud run deploy` by hand every time:
-
-1. One-time: create the Artifact Registry repo `backend/cloudbuild.yaml` pushes to:
-   ```bash
-   gcloud artifacts repositories create sensor-analysis \
-     --repository-format=docker --location=us-central1
-   ```
-2. In the GCP Console → Cloud Build → Triggers → Connect Repository, link
-   this GitHub repo, then create a trigger (on push to your deploy branch)
-   pointing at `backend/cloudbuild.yaml`.
-3. Every push after that builds the image, pushes it, and redeploys the
-   Cloud Run service automatically — env vars/secrets from 2a/2b carry
-   forward unchanged (see the comment in `cloudbuild.yaml` for why).
-
-## 3. Frontend (Vercel)
-
-1. Import the repo into Vercel. In the project's Settings → General, set
-   **Root Directory** to `frontend/` (this is a monorepo — Vercel needs to
-   know which subdirectory to build; `frontend/vercel.json` only covers the
-   build command/output/rewrites, not the root directory).
-2. Add an environment variable `VITE_API_BASE` = your Cloud Run URL from
-   step 2b above (e.g. `https://sensor-analysis-api-xxxxx-uc.a.run.app`).
-3. Deploy. Vercel auto-detects Vite and uses `frontend/vercel.json`'s
-   `buildCommand`/`outputDirectory`; the `rewrites` entry makes client-side
-   routing (React Router) work on a hard refresh/deep link.
-4. Add this Vercel URL as an Authorized JavaScript origin on your Google
-   OAuth client, and as `FRONTEND_ORIGIN` on the Cloud Run service
-   (step 2b above).
+From here, every push to the connected branch redeploys both services
+automatically — that's Render's default behavior, no separate CI config
+needed (unlike Cloud Build, which this app used briefly and no longer needs).
 
 ## Local development
 

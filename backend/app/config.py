@@ -1,6 +1,5 @@
 """App configuration, loaded from environment variables (.env locally,
-Cloud Run's --set-env-vars / Secret Manager in production). See
-.env.example for the full list."""
+Render's Environment tab in production). See .env.example for the full list."""
 from __future__ import annotations
 
 from functools import lru_cache

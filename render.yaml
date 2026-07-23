@@ -1,0 +1,38 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Both frontend and backend on Render (no credit card required for either),
+# database on Neon (free, no expiry — see DEPLOYMENT.md for why not Render's
+# own free Postgres, which expires after 30 days).
+services:
+  # Backend API — Docker web service, built from backend/Dockerfile.
+  - type: web
+    name: sensor-analysis-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        sync: false   # paste your Neon connection string in the Render dashboard
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false   # set to the frontend's *.onrender.com URL once it exists (step 3 in DEPLOYMENT.md)
+
+  # Frontend — static site (Vite build), served from Render's CDN.
+  - type: web
+    name: sensor-analysis-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE
+        sync: false   # set to the backend service's *.onrender.com URL (see above)
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html   # client-side routing (React Router) on hard refresh/deep link
