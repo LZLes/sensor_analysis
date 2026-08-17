@@ -3740,6 +3740,25 @@ if SS.mode == "Solid-State":
             _active_fi_s   = _file_names_solid.index(SS["solid_active_file"])
             _active_frec_s = SS.solid_files[_active_fi_s]
 
+            # Analysis Settings lives outside the form (below) so it stays
+            # live/reactive — only the editor itself needs form-batching to
+            # avoid the blur-race, not this multiselect.
+            st.subheader("Analysis Settings")
+            _solid_multi_file = len(SS.solid_files) > 1
+            _solid_combo_lookup = {
+                _amp_label(frec["filename"], ch["name"], _solid_multi_file): (frec, ch)
+                for frec in SS.solid_files
+                for ch in frec["channels"]
+            }
+            analyze_chs_solid = st.multiselect(
+                "Channels to analyse",
+                list(_solid_combo_lookup.keys()),
+                default=list(_solid_combo_lookup.keys())[:1],
+                help="Select one or more channels (and, with multiple files "
+                     "loaded, file·channel pairs). Each uses its own "
+                     "dataset's calibration table above.",
+            )
+
             st.subheader(
                 "Calibration Points"
                 + (f" — {_active_frec_s['filename']}" if len(_file_names_solid) > 1 else "")
@@ -3756,10 +3775,10 @@ if SS.mode == "Solid-State":
             if "cal_editor_version" not in SS:
                 SS.cal_editor_version = 0
 
-            # Editor + settings + Compute button share one st.form so the
-            # button's rerun reads each widget's live value at submit time,
+            # Only the editor + Compute button share the form now — so the
+            # button's rerun reads the grid's live value at submit time,
             # rather than depending on a separate blur event racing the
-            # click — see nernstian section of the plan for why.
+            # click — while channel selection above stays reactive.
             with st.form(key=f"solid_cal_form_{_active_fi_s}"):
                 _scpdf_edit = st.data_editor(
                     _active_frec_s["cpdf"],
@@ -3796,23 +3815,6 @@ if SS.mode == "Solid-State":
                                  "calibration point (no averaging window needed).",
                         ),
                     },
-                )
-
-                st.divider()
-                st.subheader("Analysis Settings")
-                _solid_multi_file = len(SS.solid_files) > 1
-                _solid_combo_lookup = {
-                    _amp_label(frec["filename"], ch["name"], _solid_multi_file): (frec, ch)
-                    for frec in SS.solid_files
-                    for ch in frec["channels"]
-                }
-                analyze_chs_solid = st.multiselect(
-                    "Channels to analyse",
-                    list(_solid_combo_lookup.keys()),
-                    default=list(_solid_combo_lookup.keys())[:1],
-                    help="Select one or more channels (and, with multiple files "
-                         "loaded, file·channel pairs). Each uses its own "
-                         "dataset's calibration table above.",
                 )
 
                 compute_clicked_solid = st.form_submit_button(
@@ -4157,6 +4159,60 @@ with T3:
         _active_fi   = _file_names_cal.index(SS["cal_active_file"])
         _active_frec = SS.amp_files[_active_fi]
 
+        # ── Analysis settings ─────────────────────────────────────────────
+        st.subheader("Analysis Settings")
+        if SS.smooth_method != "None":
+            st.caption(
+                f"Averaging below uses the **{SS.smooth_method}** smoothing "
+                "configured in the Time Series tab."
+            )
+        _cal_multi_file = len(SS.amp_files) > 1
+        # Store the live file dict (not a snapshot of its cpdf) so that any
+        # updates made below — including the auto-recompute inside Compute
+        # Calibration itself — are picked up without a stale-copy bug.
+        _cal_combo_lookup = {
+            _amp_label(frec["filename"], ch["name"], _cal_multi_file): (frec, ch)
+            for frec in SS.amp_files
+            for ch in frec["channels"]
+        }
+        a1, a2, a3 = st.columns(3)
+        analyze_chs = a1.multiselect(
+            "Channels to analyse",
+            list(_cal_combo_lookup.keys()),
+            default=list(_cal_combo_lookup.keys())[:1],
+            help="Select one or more channels (and, with multiple files loaded, file·channel pairs). "
+                 "Each uses its own dataset's calibration table above.",
+        )
+        fit_type = a2.selectbox(
+            "Fit type",
+            ["Linear", "Segmented Linear"],
+            help=(
+                "**Linear** — single straight-line fit across all concentrations.\n\n"
+                "**Segmented Linear** — piecewise fit for sensors with two linear "
+                "dynamic ranges (e.g. different slopes at low vs high concentration). "
+                "Breakpoints are found automatically."
+            ),
+        )
+        n_seg = (int(a3.number_input(
+                    "Segments", 2, 4, 2,
+                    help="Number of linear segments. 2 = one breakpoint, 3 = two breakpoints.",
+                 ))
+                 if fit_type == "Segmented Linear" else 1)
+
+        show_avg = (
+            st.checkbox(
+                "Add channel average trace",
+                value=False,
+                help=(
+                    "Plots the element-wise mean of all selected channels as an "
+                    "additional trace (black diamonds). Error bars show the "
+                    "channel-to-channel standard deviation at each step, and "
+                    "LOD/LOQ are based on the propagated blank noise."
+                ),
+            )
+            if len(analyze_chs) >= 2 else False
+        )
+
         # ── Calibration-point editor ──────────────────────────────────────
         st.subheader(
             "Calibration Points"
@@ -4254,60 +4310,6 @@ with T3:
                     st.rerun()
 
             st.divider()
-
-            # ── Analysis settings ─────────────────────────────────────────────
-            st.subheader("Analysis Settings")
-            if SS.smooth_method != "None":
-                st.caption(
-                    f"Averaging below uses the **{SS.smooth_method}** smoothing "
-                    "configured in the Time Series tab."
-                )
-            _cal_multi_file = len(SS.amp_files) > 1
-            # Store the live file dict (not a snapshot of its cpdf) so that any
-            # updates made below — including the auto-recompute inside Compute
-            # Calibration itself — are picked up without a stale-copy bug.
-            _cal_combo_lookup = {
-                _amp_label(frec["filename"], ch["name"], _cal_multi_file): (frec, ch)
-                for frec in SS.amp_files
-                for ch in frec["channels"]
-            }
-            a1, a2, a3 = st.columns(3)
-            analyze_chs = a1.multiselect(
-                "Channels to analyse",
-                list(_cal_combo_lookup.keys()),
-                default=list(_cal_combo_lookup.keys())[:1],
-                help="Select one or more channels (and, with multiple files loaded, file·channel pairs). "
-                     "Each uses its own dataset's calibration table above.",
-            )
-            fit_type = a2.selectbox(
-                "Fit type",
-                ["Linear", "Segmented Linear"],
-                help=(
-                    "**Linear** — single straight-line fit across all concentrations.\n\n"
-                    "**Segmented Linear** — piecewise fit for sensors with two linear "
-                    "dynamic ranges (e.g. different slopes at low vs high concentration). "
-                    "Breakpoints are found automatically."
-                ),
-            )
-            n_seg = (int(a3.number_input(
-                        "Segments", 2, 4, 2,
-                        help="Number of linear segments. 2 = one breakpoint, 3 = two breakpoints.",
-                     ))
-                     if fit_type == "Segmented Linear" else 1)
-
-            show_avg = (
-                st.checkbox(
-                    "Add channel average trace",
-                    value=False,
-                    help=(
-                        "Plots the element-wise mean of all selected channels as an "
-                        "additional trace (black diamonds). Error bars show the "
-                        "channel-to-channel standard deviation at each step, and "
-                        "LOD/LOQ are based on the propagated blank noise."
-                    ),
-                )
-                if len(analyze_chs) >= 2 else False
-            )
 
             def _do_compute_calibration() -> bool:
                 """Runs the full per-channel calibration compute, each channel
