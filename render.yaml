@@ -32,6 +32,10 @@ services:
         sync: false
       - key: FRONTEND_ORIGIN
         sync: false   # set to the frontend's *.onrender.com URL once it exists (step 3 in DEPLOYMENT.md)
+      - key: INITIAL_ADMIN_EMAIL
+        sync: false   # your email — creates your admin account automatically on first boot, no terminal needed
+      - key: INITIAL_ADMIN_NAME
+        sync: false   # your name (optional, defaults to "Admin")
 
   # Frontend — static site (Vite build), served from Render's CDN.
   - type: web

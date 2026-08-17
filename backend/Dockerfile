@@ -17,9 +17,11 @@ EXPOSE 8080
 
 # Render (like most container platforms) injects $PORT and expects the
 # container to listen on it; default to 8080 locally so `docker run`
-# matches. Migrations are NOT run here on purpose — keeping "deploy a new
-# image" and "change the schema" as separate, explicit steps means a
-# redeploy (or a restart after a crash) never silently re-runs migrations
-# as a side effect. Run migrations as a one-off step (see DEPLOYMENT.md)
-# before deploying a revision that needs them.
-CMD exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}
+# matches.
+#
+# app/bootstrap.py runs migrations + (optionally) creates the first admin
+# user on every startup, so a fresh deploy needs no local terminal at all
+# — see that file's docstring for why this is safe specifically on
+# Render's single-instance free tier, and what to change if that ever
+# stops being true.
+CMD python -m app.bootstrap && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}

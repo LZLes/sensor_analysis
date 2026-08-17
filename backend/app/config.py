@@ -17,6 +17,13 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     frontend_origin: str = "http://localhost:5173"
 
+    # Set these in the Render dashboard (no terminal needed) to have the
+    # very first admin user created automatically on container startup —
+    # see app/bootstrap.py. Safe to leave blank after the first deploy;
+    # the bootstrap step no-ops once that email already exists.
+    initial_admin_email: str = ""
+    initial_admin_name: str = "Admin"
+
     @field_validator("database_url")
     @classmethod
     def _use_psycopg3_driver(cls, v: str) -> str:

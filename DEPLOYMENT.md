@@ -18,6 +18,12 @@ quick first deploy:
   `databases:` block in `render.yaml`, nothing else in the app cares which
   Postgres it's talking to.
 
+**No terminal required for any of this** — migrations run automatically on
+every backend startup, and your admin account is created automatically
+from an environment variable you type into the Render dashboard (a plain
+text box, same as any other website settings page). See
+`backend/app/bootstrap.py` if you want the details of how.
+
 ## 1. Deploy the Blueprint
 
 1. In the Render dashboard: **New +** → **Blueprint**, connect this GitHub
@@ -27,32 +33,23 @@ quick first deploy:
      with `DATABASE_URL` wired to `sensor-analysis-db` automatically.
    - `sensor-analysis-frontend` — the React frontend (static site, built
      from `frontend/`).
-2. Click **Apply**. Render creates all three, generates `SESSION_SECRET`
-   automatically, and leaves a few env vars blank (marked `sync: false` in
-   `render.yaml`) for you to fill in next.
+2. Click **Apply**. Render creates all three and generates `SESSION_SECRET`
+   automatically. A few fields are left blank (marked `sync: false` in
+   `render.yaml`) — Render will prompt you for them right there in the
+   same flow, or you can fill them in after under each service's
+   **Environment** tab. The important one: set `INITIAL_ADMIN_EMAIL` (and
+   optionally `INITIAL_ADMIN_NAME`) on `sensor-analysis-api` to your own
+   email — this is what creates your account, since there's no
+   self-signup (`users` rows are the allowlist). Add teammates later the
+   same way one email/name pair at a time, or ask an admin.
 
-## 2. Run migrations + bootstrap an admin user
+## 2. Wire the two services together
 
-Grab the database's connection string from the Render dashboard
-(`sensor-analysis-db` → **Connect** → External Connection String), then
-from your machine:
-
-```bash
-cd backend
-DATABASE_URL="<paste the External Connection String>" alembic upgrade head
-
-# There's no self-signup — `users` rows ARE the allowlist — so insert yourself:
-psql "<paste the External Connection String>" -c \
-  "INSERT INTO users (id, email, name, is_admin) VALUES (gen_random_uuid(), 'you@yourteam.com', 'Your Name', true);"
-```
-
-From then on, add teammates the same way (direct SQL, until an admin UI exists).
-
-## 3. Wire the two services together
+Both need to know the other's URL, which only exists after their first deploy:
 
 1. Once `sensor-analysis-api` has deployed, copy its URL (e.g.
-   `https://sensor-analysis-api.onrender.com`) and set on it, in its
-   **Environment** tab:
+   `https://sensor-analysis-api.onrender.com`) from the top of its page.
+   While you're in its **Environment** tab, also set:
    - `GOOGLE_OAUTH_CLIENT_ID` — from the Google Cloud Console OAuth client
      you create for "Sign in with Google" (Authorized JavaScript origins:
      the frontend's Render URL from step 2 below).
