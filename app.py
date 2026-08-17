@@ -31,6 +31,14 @@ except BaseException:
     # Sessions should just stay unavailable.
     _GDRIVE_LIBS_OK = False
 
+try:
+    import ollama as _ollama
+    _OLLAMA_LIB_OK = True
+except BaseException:
+    # AI Insights should just stay unavailable if the optional `ollama`
+    # package isn't installed — never crash the whole app over it.
+    _OLLAMA_LIB_OK = False
+
 matplotlib.use("Agg")   # headless backend — no display required
 
 # ── page config ───────────────────────────────────────────────────────────────
@@ -266,6 +274,107 @@ def _eff_t_start(row) -> float | None:
         return float(row["t_end"]) - float(ad)
     v = row.get("t_start")
     return float(v) if pd.notna(v) else None
+
+
+_GAS_CONSTANT_R = 8.314462618   # J/(mol*K)
+_FARADAY_F      = 96485.33212   # C/mol
+
+
+def nernst_ideal_slope_mv(temp_c: float = 25.0, z: int = 1) -> float:
+    """
+    Ideal Nernstian slope in mV/decade: (R*T*ln(10)) / (z*F), converted to mV.
+    z is the ion charge (e.g. 1 for Na+/K+/Cl-, 2 for Ca2+/Mg2+). Temperature
+    matters — don't hardcode 59 mV, since lab temperature varies.
+    """
+    temp_k = temp_c + 273.15
+    slope_v = (_GAS_CONSTANT_R * temp_k * np.log(10)) / (abs(z) * _FARADAY_F)
+    return float(slope_v * 1000.0)
+
+
+def nernstian_lod_fit(log_conc: np.ndarray, potential_mv: np.ndarray) -> dict:
+    """
+    Fit two independent linear regressions — a low-concentration
+    ("flattened") regime and a high-concentration ("Nernstian") regime —
+    choosing the split point by exhaustive search to minimize total SSR
+    across both segments (each segment requires >= 2 points). The
+    reported LOD is where the two independently-fitted lines intersect,
+    which generally does not coincide with any input data point. This is
+    NOT the same as piecewise_fit's continuous ("broken-stick") fit above:
+    piecewise_fit forces its segments to meet exactly at a breakpoint that
+    must land on an existing standard's x-value, which is a display-
+    friendly continuous curve but not what "LOD" means in the ISE
+    literature, where the two regimes are fit independently and the LOD is
+    wherever those two (generally non-touching) lines would cross.
+
+    Inputs are assumed pre-validated: log_conc must not contain -inf/NaN
+    (i.e. the caller has already rejected Concentration <= 0 rows, since
+    log10(0) is undefined and log10(negative) is complex).
+
+    Returns:
+        {
+          "low_segment":       {slope, intercept, r2} | None,
+          "nernstian_segment": {slope, intercept, r2} | None,
+          "lod_log10": float,   # NaN if no valid intersection
+          "lod_conc":  float,   # 10**lod_log10, NaN if lod_log10 is NaN
+          "split_index": int | None,   # index into the sorted, filtered input
+        }
+    """
+    x = np.asarray(log_conc, dtype=float)
+    y = np.asarray(potential_mv, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    n = len(x)
+
+    _empty = {
+        "low_segment": None, "nernstian_segment": None,
+        "lod_log10": float("nan"), "lod_conc": float("nan"),
+        "split_index": None,
+    }
+    if n < 4:
+        # Not enough points to fit two independent >=2-point segments.
+        # Fall back to reporting a single overall fit as the "Nernstian"
+        # segment so callers still get a usable slope/intercept/R².
+        single = lin_reg(x, y)
+        return {**_empty, "nernstian_segment": single}
+
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+
+    best_ssr = float("inf")
+    best_k = None
+    best_low = None
+    best_high = None
+    for k in range(2, n - 1):   # both sides get >= 2 points
+        low_fit = lin_reg(x[:k], y[:k])
+        high_fit = lin_reg(x[k:], y[k:])
+        if low_fit is None or high_fit is None:
+            continue
+        pred_low = low_fit["slope"] * x[:k] + low_fit["intercept"]
+        pred_high = high_fit["slope"] * x[k:] + high_fit["intercept"]
+        ssr = float(np.sum((y[:k] - pred_low) ** 2) + np.sum((y[k:] - pred_high) ** 2))
+        if ssr < best_ssr:
+            best_ssr, best_k = ssr, k
+            best_low, best_high = low_fit, high_fit
+
+    if best_low is None or best_high is None:
+        single = lin_reg(x, y)
+        return {**_empty, "nernstian_segment": single}
+
+    slope_diff = best_high["slope"] - best_low["slope"]
+    if slope_diff == 0:
+        lod_log10 = float("nan")
+    else:
+        lod_log10 = (best_low["intercept"] - best_high["intercept"]) / slope_diff
+
+    lod_conc = float(10.0 ** lod_log10) if np.isfinite(lod_log10) else float("nan")
+
+    return {
+        "low_segment": best_low,
+        "nernstian_segment": best_high,
+        "lod_log10": float(lod_log10) if np.isfinite(lod_log10) else float("nan"),
+        "lod_conc": lod_conc,
+        "split_index": int(best_k),
+    }
 
 
 def _apply_effective_concentration(cpdf: pd.DataFrame, initial_volume: float) -> pd.DataFrame:
@@ -699,6 +808,89 @@ def render_cal_png(res_map: dict, ft: str, ns: int,
     return buf.getvalue()
 
 
+def render_solid_cal_png(res_map: dict, conc_unit: str, signal_unit: str,
+                         dpi: int = 150, fmt: str = "png",
+                         figsize: tuple | None = None, style: str = "default") -> bytes:
+    """Matplotlib export for the Solid-State (Nernstian) calibration curve —
+    mirrors render_cal_png()'s structure: E (mV) vs log10(Concentration),
+    the two independently-fit segments, and an LOD marker instead of
+    piecewise_fit's breakpoint lines."""
+    _rc  = {"origin": _ORIGIN_RC, "minimal": _MINIMAL_RC}.get(style, {})
+    _lfs = 9 if style == "minimal" else 11
+    _lgfs = 7 if style == "minimal" else 9
+    _afs = 6.5 if style == "minimal" else 7.5
+    with matplotlib.rc_context(_rc):
+        fig, ax = plt.subplots(figsize=figsize or (8, 6))
+        _annot_blocks = []
+        for j, (ch_name, res) in enumerate(res_map.items()):
+            col = PAL[j % len(PAL)]
+            x = np.asarray(res["log_conc"], dtype=float)
+            y = np.asarray(res["potential_mv"], dtype=float)
+            ax.scatter(x, y, color=col, label=ch_name, marker="o", s=45,
+                      edgecolors="white", linewidths=1.0, zorder=3)
+
+            _low  = res.get("low_segment")
+            _nern = res.get("nernstian_segment")
+            _lod_log10 = res.get("lod_log10")
+            _has_lod = _lod_log10 is not None and np.isfinite(_lod_log10)
+
+            _ch_lines = [ch_name + ":"]
+            for _seg, _seg_name, _ls in [(_low, "low", ":"), (_nern, "Nernstian", "--")]:
+                if _seg is None:
+                    continue
+                if _seg_name == "low" and _has_lod:
+                    _x0, _x1 = float(np.min(x)), _lod_log10
+                elif _seg_name == "Nernstian" and _has_lod:
+                    _x0, _x1 = _lod_log10, float(np.max(x))
+                else:
+                    _x0, _x1 = float(np.min(x)), float(np.max(x))
+                if _x1 <= _x0:
+                    _x0, _x1 = float(np.min(x)), float(np.max(x))
+                xp = np.linspace(_x0, _x1, 200)
+                yp = _seg["slope"] * xp + _seg["intercept"]
+                ax.plot(xp, yp, linestyle=_ls, color=col, linewidth=2)
+                s, b, r2 = _seg["slope"], _seg["intercept"], _seg["r2"]
+                sign = "+" if b >= 0 else "−"
+                _ch_lines.append(f"  {_seg_name}: y = {s:.3g}x {sign} {abs(b):.3g}   R² = {r2:.4f}")
+
+            if _nern is not None:
+                _pct = res.get("pct_of_ideal_nernstian")
+                _pct_txt = f"{_pct:.1f}% of ideal" if _pct is not None else "—"
+                _ch_lines.append(f"  Sens = {_nern['slope']:.3g} {signal_unit}/decade ({_pct_txt})")
+
+            if _has_lod:
+                ax.axvline(_lod_log10, linestyle="-.", color=col, linewidth=1.2)
+                _lod_conc = res.get("lod_conc")
+                _lod_conc_txt = f"{_lod_conc:.3g} {conc_unit}" if _lod_conc is not None and np.isfinite(_lod_conc) else "—"
+                ax.annotate(f"LOD {_lod_conc_txt}", xy=(_lod_log10, 1),
+                           xycoords=("data", "axes fraction"),
+                           xytext=(2, -2), textcoords="offset points",
+                           fontsize=_afs, color=col, rotation=90, va="top", ha="left")
+                _ch_lines.append(f"  LOD = {_lod_conc_txt}")
+
+            _annot_blocks.append("\n".join(_ch_lines))
+
+        ax.set_xlabel(f"log₁₀(Concentration [{conc_unit}])", fontsize=_lfs)
+        ax.set_ylabel(f"Potential ({signal_unit})", fontsize=_lfs)
+        ax.legend(fontsize=_lgfs, loc="upper left",
+                  bbox_to_anchor=(1.02, 1), borderaxespad=0)
+        _apply_spine_style(ax, style)
+        fig.tight_layout()
+        if _annot_blocks:
+            ax.text(
+                0.5, -0.22, "\n\n".join(_annot_blocks),
+                transform=ax.transAxes, fontsize=_afs,
+                va="top", ha="center", family="monospace",
+                bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
+                          alpha=0.88, edgecolor="#cccccc", linewidth=0.8),
+            )
+        buf = io.BytesIO()
+        fig.savefig(buf, format=fmt, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def find_cv_peaks(voltage: np.ndarray, current: np.ndarray,
                   prominence: float, distance: int,
                   width: int | None = None,
@@ -1008,12 +1200,15 @@ for _k, _v in [
     ("df", None),
     ("channels", []),
     ("amp_files", []),       # [{filename, df, channels}] — multi-file amperometry
+    ("solid_files", []),     # [{filename, df, channels}] — multi-file solid-state (potentiometric)
+    ("solid_cal_results", None),
     ("cal_results", None),
     ("ts_fig", None),
     ("cal_fig", None),
     ("ts_visible", []),
     ("conc_unit", "mM"),
     ("cur_unit", "µA"),
+    ("solid_unit", "mV"),
     ("vol_unit", "µL"),
     ("initial_volume", 1.0),
     ("smooth_method", "None"),
@@ -1090,6 +1285,95 @@ def _seed_cpdf_for_new_file() -> pd.DataFrame:
     return _tmpl.copy() if _tmpl is not None else _default_cpdf()
 
 
+def _default_solid_cpdf() -> pd.DataFrame:
+    """Starter calibration table for solid-state (potentiometric) sensors.
+    No Baseline/Spike Vol/Stock Conc — Nernstian fits use raw potential
+    directly, and there's no dilution-calculator support here. Reading_mV
+    is a nullable direct-entry column: fill it in to skip windowed
+    averaging from an imported trace entirely."""
+    return pd.DataFrame({
+        "Label":         ["Std 1", "Std 2", "Std 3", "Std 4"],
+        "Concentration": [0.1, 1.0, 10.0, 100.0],
+        "t_start":       [0.0, 120.0, 240.0, 360.0],
+        "t_end":         [60.0, 180.0, 300.0, 420.0],
+        "avg_duration":  [np.nan, np.nan, np.nan, np.nan],
+        "Reading_mV":    [np.nan, np.nan, np.nan, np.nan],
+    })
+
+
+def _seed_solid_cpdf_for_new_file() -> pd.DataFrame:
+    """Starter calibration table for a newly-imported solid-state file."""
+    return _default_solid_cpdf()
+
+
+# Quick-fill presets for common calibration protocols. Each maps to a
+# generator below; "increments" (Amperometry) are cumulative mM added at
+# each step (serial spike), "values" (Solid-State) are the absolute
+# concentration at each standard — the two modes' tables mean different
+# things by "Concentration" (ΔI-vs-conc addition series vs. Nernstian
+# standards), so the presets aren't interchangeable.
+_AMP_PRESETS = {
+    "Serial spike: 25 mM ×2, 50 mM ×2, 100 mM ×4": {
+        "increments": [25, 25, 50, 50, 100, 100, 100, 100],
+        "start": 600.0,
+        "interval": 300.0,
+    },
+}
+_SOLID_PRESETS = {
+    "Serial standards: 10, 25, 50, 100": {
+        "values": [10, 25, 50, 100],
+        "start": 600.0,
+        "interval": 600.0,
+    },
+}
+
+
+def _preset_cpdf_amp(increments: list[float], start: float, interval: float,
+                      include_blank: bool) -> pd.DataFrame:
+    """Builds an Amperometry calibration table from a serial-spike protocol:
+    cumulative concentration steps of fixed duration (`interval`), the
+    first starting at `start`, optionally preceded by a Blank/baseline
+    row spanning 0 → start."""
+    labels, concs, t_starts, t_ends, baselines = [], [], [], [], []
+    if include_blank:
+        labels.append("Blank"); concs.append(0.0)
+        t_starts.append(0.0); t_ends.append(start); baselines.append(True)
+    cum, t = 0.0, start
+    for i, inc in enumerate(increments, start=1):
+        cum += inc
+        labels.append(f"Step {i}"); concs.append(cum)
+        t_starts.append(t); t_ends.append(t + interval); baselines.append(False)
+        t += interval
+    n = len(labels)
+    return pd.DataFrame({
+        "Label":         labels,
+        "Concentration": concs,
+        "Spike Vol":     [np.nan] * n,
+        "Stock Conc":    [np.nan] * n,
+        "t_start":       t_starts,
+        "t_end":         t_ends,
+        "avg_duration":  [np.nan] * n,
+        "Baseline":      baselines,
+    })
+
+
+def _preset_cpdf_solid(values: list[float], start: float, interval: float) -> pd.DataFrame:
+    """Builds a Solid-State calibration table from a series of absolute
+    standard concentrations, each held for `interval` seconds, the first
+    starting at `start`."""
+    n = len(values)
+    t_starts = [start + i * interval for i in range(n)]
+    t_ends   = [t + interval for t in t_starts]
+    return pd.DataFrame({
+        "Label":         [f"Std {i}" for i in range(1, n + 1)],
+        "Concentration": list(values),
+        "t_start":       t_starts,
+        "t_end":         t_ends,
+        "avg_duration":  [np.nan] * n,
+        "Reading_mV":    [np.nan] * n,
+    })
+
+
 _SAMPLE_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data")
 
 # Ground truth used to generate sample_data/*.csv — see the calibration
@@ -1137,6 +1421,582 @@ def _load_sample_data() -> list[dict] | None:
             "cpdf": _sample_cpdf(),
         })
     return _files
+
+
+# Ground truth used to generate sample_data/solid_state_run.csv — a
+# two-regime potentiometric response (flattened low-concentration plateau,
+# near-Nernstian high-concentration slope), matching the same shape
+# nernstian_lod_fit() is designed to recover. Kept in sync with the CSV so
+# "Load sample data" produces a working, pre-filled calibration table.
+_SOLID_SAMPLE_STEPS = [
+    ("Std 1", 1e-6,   0.0,  50.0),
+    ("Std 2", 1e-5,  70.0, 110.0),
+    ("Std 3", 1e-4, 130.0, 170.0),
+    ("Std 4", 1e-3, 190.0, 230.0),
+    ("Std 5", 1e-2, 250.0, 290.0),
+    ("Std 6", 1e-1, 310.0, 350.0),
+]
+_SOLID_SAMPLE_FILES = ["solid_state_run.csv"]
+
+
+def _solid_sample_cpdf() -> pd.DataFrame:
+    return pd.DataFrame({
+        "Label":         [s[0] for s in _SOLID_SAMPLE_STEPS],
+        "Concentration": [s[1] for s in _SOLID_SAMPLE_STEPS],
+        "t_start":       [s[2] for s in _SOLID_SAMPLE_STEPS],
+        "t_end":         [s[3] for s in _SOLID_SAMPLE_STEPS],
+        "avg_duration":  [np.nan] * len(_SOLID_SAMPLE_STEPS),
+        "Reading_mV":    [np.nan] * len(_SOLID_SAMPLE_STEPS),
+    })
+
+
+def _load_solid_sample_data() -> list[dict] | None:
+    """Reads the bundled solid_state_run.csv and returns a fully-configured
+    solid_files entry (channel mapped, calibration table pre-filled), or
+    None if the file isn't present (e.g. a stripped-down deployment)."""
+    _files = []
+    for _fn in _SOLID_SAMPLE_FILES:
+        _path = os.path.join(_SAMPLE_DATA_DIR, _fn)
+        if not os.path.isfile(_path):
+            return None
+        _df = pd.read_csv(_path)
+        _channels = [{"name": "Electrode 1", "tc": "Time (s)", "ic": "Potential (mV)"}]
+        _files.append({
+            "filename": _fn, "df": _df, "channels": _channels,
+            "cpdf": _solid_sample_cpdf(),
+        })
+    return _files
+
+
+def _parse_one_file(_up, _fi: int, key_prefix: str = "amp") -> tuple[pd.DataFrame | None, list[dict]]:
+    """Parse one uploaded file, returning (df, auto_channels). key_prefix
+    keeps this file's format/delimiter/skip widgets independent when the
+    same import UI is reused across modes (Amperometry vs Solid-State)."""
+    if _up.name.lower().endswith(".pssession"):
+        _df, _auto = parse_pssession(_up.read())
+        return _df, _auto
+
+    _raw_bytes = _up.read()
+    if _raw_bytes[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        _raw = _raw_bytes.decode("utf-16")
+    else:
+        _raw = _raw_bytes.decode("utf-8", errors="replace")
+
+    _file_fmt = st.selectbox(
+        "File format",
+        ["Standard CSV", "Multi-channel instrument (potentiostat, etc.)"],
+        help=(
+            "Choose **Multi-channel instrument** for files exported from Bio-Logic, "
+            "CH Instruments, Autolab, or similar — they have metadata rows, "
+            "channel-label rows, and a units row above the numeric data."
+        ),
+        key=f"{key_prefix}_file_fmt_{_fi}",
+    )
+
+    _c1, _c2 = st.columns(2)
+    _delim_label = _c1.selectbox(
+        "Delimiter",
+        ["Auto-detect", "Comma  ,", "Tab  \\t", "Semicolon  ;", "Space"],
+        help="Choose the character that separates columns. Auto-detect works for most files.",
+        key=f"{key_prefix}_delim_{_fi}",
+    )
+    _skip = int(_c2.number_input(
+        "Rows to skip before header", 0, 50, 0,
+        help="Only applies to Standard CSV mode. Multi-channel mode finds the data start automatically.",
+        key=f"{key_prefix}_skip_{_fi}",
+    ))
+
+    _dmap = {
+        "Auto-detect": None,
+        "Comma  ,": ",", "Tab  \\t": "\t",
+        "Semicolon  ;": ";", "Space": r"\s+",
+    }
+    _d = _dmap[_delim_label]
+    if _d is None:
+        _lines = _raw.splitlines()
+        _sniff_line = _lines[_skip] if _skip < len(_lines) else (_lines[0] if _lines else "")
+        _d = next((c for c in [",", "\t", ";"] if c in _sniff_line), r"\s+")
+
+    _engine = "python" if _d == r"\s+" else "c"
+
+    if _file_fmt.startswith("Multi-channel"):
+        _df, _auto = parse_potentiostat_csv(_raw, _d)
+        return _df, _auto
+    _df = pd.read_csv(
+        io.StringIO(_raw), sep=_d, skiprows=_skip,
+        engine=_engine, skipinitialspace=True,
+    )
+    _df.columns = [c.lstrip("﻿").strip() for c in _df.columns]
+    return _df, []
+
+
+def _render_import_tab(
+    files_key: str,
+    signal_col_label: str,
+    unit_key: str,
+    active_file_key: str,
+    seed_cpdf_fn,
+    sample_loader_fn=None,
+    sample_caption: str = "",
+    sample_button_help: str = (
+        "Loads a bundled example run with a pre-filled calibration "
+        "table so you can try the app immediately without your own data."
+    ),
+    sample_loaded_msg: str = (
+        "Sample data loaded — head to the **Time Series** or "
+        "**Calibration Curve** tab to explore."
+    ),
+    sample_conc_unit: str | None = None,
+    sample_signal_unit: str | None = None,
+    set_legacy_alias: bool = False,
+) -> None:
+    """Shared 'Import & Configure' tab body — used by both Amperometry
+    (files_key='amp_files', signal_col_label='Current', unit_key='cur_unit')
+    and Solid-State (files_key='solid_files', signal_col_label='Potential',
+    unit_key='solid_unit'). Upload, per-file channel mapping, and units are
+    identical in shape between the two modes — only the starter calibration
+    table (seed_cpdf_fn) and sample-data source differ."""
+    with st.expander("Quick-start guide", expanded=False):
+        st.markdown(f"""
+**Typical workflow:**
+
+1. **Import & Configure** — upload your CSV/TXT file, map each column pair (time + {signal_col_label.lower()}) to a named channel, set your concentration and {signal_col_label.lower()} units.
+2. **Time Series** — inspect the raw traces. Use this to identify the time windows where each concentration was applied.
+3. **Calibration Curve** — fill in the calibration table (one row per concentration step), click *Compute*, and review the statistics.
+4. **Export** — download the calibration CSV, plots (PNG or interactive HTML), or the raw data.
+
+> **Tip:** Calibration windows are shown as shaded bands on the time-series chart so you can visually verify your time entries.
+
+> **Resuming previous work:** don't want to re-upload and re-map every time?
+> The sidebar's **Configuration** section can save your settings and
+> calibration table to this browser (**Save**), to a downloadable JSON file
+> (**Export / Import JSON**) to move between machines, or — if your team has
+> set it up — a full session including the raw uploaded files themselves to a
+> shared Google Drive folder (**Cloud Sessions**), so anyone with access can
+> pick up right where you left off.
+""")
+
+    if sample_loader_fn is not None:
+        _sc1, _sc2 = st.columns([1, 3])
+        if _sc1.button("Load sample data", key=f"{files_key}_load_sample", help=sample_button_help):
+            _sample_files = sample_loader_fn()
+            if _sample_files is None:
+                st.error("Sample data files are missing from this deployment.")
+            else:
+                SS[files_key] = _sample_files
+                if set_legacy_alias:
+                    SS.df       = _sample_files[0]["df"]
+                    SS.channels = _sample_files[0]["channels"]
+                if sample_conc_unit is not None:
+                    SS.conc_unit = sample_conc_unit
+                if sample_signal_unit is not None:
+                    SS[unit_key] = sample_signal_unit
+                SS.ts_visible = []
+                SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+                SS[active_file_key] = _sample_files[0]["filename"]
+                SS["_files_applied_msg"] = sample_loaded_msg
+                st.rerun()
+        _sc2.caption(sample_caption)
+
+    st.subheader("Upload File(s)")
+    ups = st.file_uploader(
+        "Drag and drop one or more raw sensor data files here, or click to browse",
+        type=["csv", "txt", "pssession"],
+        accept_multiple_files=True,
+        key=f"{files_key}_uploader",
+        help=(
+            "Supports comma-, tab-, semicolon-, or space-delimited files with a header row. "
+            "Upload multiple files to compare across runs/sensors — each file gets its own "
+            "column mapping below."
+        ),
+    )
+
+    if ups:
+        _existing_by_name = {f["filename"]: f for f in SS[files_key]}
+        _parsed_files = []
+        for _fi, _up in enumerate(ups):
+            with st.expander(f"📄 {_up.name}", expanded=(len(ups) <= 3)):
+                try:
+                    _df, _auto_channels = _parse_one_file(_up, _fi, key_prefix=files_key)
+                except Exception as exc:
+                    st.error(f"Parse error: {exc}")
+                    continue
+
+                m1, m2 = st.columns(2)
+                m1.metric("Rows loaded", f"{len(_df):,}")
+                m2.metric("Columns", len(_df.columns))
+                st.dataframe(_df.head(10), use_container_width=True)
+
+                st.markdown("**Map Columns to Channels**")
+                _all_cols = list(_df.columns)
+                _preset_chs = (
+                    _existing_by_name[_up.name]["channels"]
+                    if _up.name in _existing_by_name
+                    else (_auto_channels or [])
+                )
+                _auto_n = len(_preset_chs) if _preset_chs else max(1, len(_all_cols) // 2)
+                _n_ch = int(st.number_input(
+                    "Number of channels", 1, 8,
+                    value=min(8, _auto_n),
+                    help="Each channel corresponds to one electrode. Most files have pairs of (time, signal) columns.",
+                    key=f"{files_key}_n_ch_{_fi}",
+                ))
+
+                _ha, _hb, _hc = st.columns([2, 3, 3])
+                _ha.markdown("**Channel name**")
+                _hb.markdown("**Time column**")
+                _hc.markdown(f"**{signal_col_label} column**")
+
+                def _col_idx(col: str, _cols=_all_cols) -> int:
+                    return _cols.index(col) if col in _cols else 0
+
+                _new_chs = []
+                for _i in range(_n_ch):
+                    _preset = _preset_chs[_i] if _i < len(_preset_chs) else {}
+                    _ca, _cb, _cc = st.columns([2, 3, 3])
+                    _name = _ca.text_input(
+                        "nm", _preset.get("name", f"Channel {_i + 1}"),
+                        key=f"{files_key}_n{_fi}_{_i}", label_visibility="collapsed",
+                    )
+                    _tc = _cb.selectbox(
+                        "tc", _all_cols,
+                        index=_col_idx(_preset.get("tc", _all_cols[min(_i * 2, len(_all_cols) - 1)])),
+                        key=f"{files_key}_tc{_fi}_{_i}", label_visibility="collapsed",
+                    )
+                    _ic = _cc.selectbox(
+                        "ic", _all_cols,
+                        index=_col_idx(_preset.get("ic", _all_cols[min(_i * 2 + 1, len(_all_cols) - 1)])),
+                        key=f"{files_key}_ic{_fi}_{_i}", label_visibility="collapsed",
+                    )
+                    _new_chs.append({"name": _name, "tc": _tc, "ic": _ic})
+
+                _preset_cpdf = (
+                    _existing_by_name[_up.name]["cpdf"]
+                    if _up.name in _existing_by_name
+                    else seed_cpdf_fn()
+                )
+                _parsed_files.append({
+                    "filename": _up.name, "df": _df, "channels": _new_chs,
+                    "cpdf": _preset_cpdf,
+                })
+
+        if _parsed_files and st.button("Apply Channel Configuration", type="primary", key=f"{files_key}_apply_cfg"):
+            SS[files_key] = _parsed_files
+            if set_legacy_alias:
+                SS.df       = _parsed_files[0]["df"]
+                SS.channels = _parsed_files[0]["channels"]
+            SS.ts_visible = []
+            SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+            SS["_files_applied_msg"] = (
+                f"{len(_parsed_files)} file(s), "
+                f"{sum(len(f['channels']) for f in _parsed_files)} channel(s) saved. "
+                "Head to the **Time Series** tab to inspect your traces."
+            )
+            st.rerun()
+
+    if SS.get("_files_applied_msg"):
+        st.success(SS.pop("_files_applied_msg"))
+
+    if SS[files_key]:
+        st.divider()
+        st.subheader("Units")
+        st.caption("These labels appear on all plot axes and in the statistics table.")
+        u1, u2 = st.columns(2)
+        SS.conc_unit = u1.text_input("Concentration unit", SS.conc_unit,
+                                      help="e.g. mM, µM, ppm, ng/mL",
+                                      key="conc_unit_input")
+        SS[unit_key] = u2.text_input(f"{signal_col_label} unit", SS[unit_key],
+                                      help="Shown on plot axes and in the statistics table",
+                                      key=f"{files_key}_signal_unit_input")
+
+
+_DASHES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
+
+
+def _render_timeseries_tab(files_key: str, unit_key: str, signal_axis_label: str) -> None:
+    """Shared 'Time Series' tab body — generic over which files list /
+    signal-unit setting to read from SS. Amperometry and Solid-State share
+    this verbatim; only the y-axis label and file source differ."""
+    _files = SS[files_key]
+    if not _files:
+        st.info("Complete the **Import & Configure** step first.")
+        return
+
+    _multi_file = len(_files) > 1
+
+    st.caption(
+        "Use this chart to identify the time windows for each concentration step. "
+        "Shaded bands show the averaging windows defined in the **Calibration Curve** tab — "
+        "orange for the baseline, blue for analyte steps."
+    )
+
+    with st.expander("Signal smoothing", expanded=False):
+        st.caption(
+            "Optional — smooths the trace shown below and the signal used for the "
+            "calibration averaging windows in the **Calibration Curve** tab. Off by default."
+        )
+        sm1, sm2, sm3 = st.columns(3)
+        SS.smooth_method = sm1.selectbox(
+            "Method", ["None", "Moving average", "Savitzky-Golay"],
+            index=["None", "Moving average", "Savitzky-Golay"].index(SS.smooth_method),
+            key=f"{files_key}_smooth_method",
+        )
+        if SS.smooth_method != "None":
+            SS.smooth_window = int(sm2.number_input(
+                "Window (samples)", min_value=3, value=int(SS.smooth_window), step=2,
+                help="Odd number of samples in the smoothing window.",
+                key=f"{files_key}_smooth_window",
+            ))
+            if SS.smooth_method == "Savitzky-Golay":
+                SS.smooth_polyorder = int(sm3.number_input(
+                    "Polynomial order", min_value=1, max_value=5,
+                    value=int(SS.smooth_polyorder),
+                    help="Must be less than the window size.",
+                    key=f"{files_key}_smooth_polyorder",
+                ))
+
+    _combos = [
+        (fi, ci, frec["filename"], frec["df"], ch)
+        for fi, frec in enumerate(_files)
+        for ci, ch in enumerate(frec["channels"])
+    ]
+    _all_ch_names = [_amp_label(fn, ch["name"], _multi_file) for _, _, fn, _, ch in _combos]
+    _vis_key = f"{files_key}_ts_vis_ms"
+    if _vis_key not in SS or any(c not in _all_ch_names for c in SS.get(_vis_key, [])):
+        SS[_vis_key] = _all_ch_names[:]
+
+    if len(_combos) >= 2:
+        _iso_cols = st.columns([1.4] + [1] * len(_combos))
+        _iso_cols[0].markdown("**Isolate:**", help="Click a name to show only that trace")
+        for _j, _lbl in enumerate(_all_ch_names):
+            if _iso_cols[_j + 1].button(
+                _lbl, key=f"{files_key}_ts_solo_{_j}",
+                use_container_width=True,
+                help=f"Show only {_lbl}",
+            ):
+                SS[_vis_key] = [_lbl]
+
+    sel = st.multiselect("Visible channels", _all_ch_names, key=_vis_key)
+    SS.ts_visible = sel
+
+    with st.expander("Y-axis range", expanded=False):
+        _y_auto = st.checkbox("Auto-scale", value=SS.ts_y_auto, key=f"{files_key}_ts_y_auto_cb")
+        SS.ts_y_auto = _y_auto
+        if not _y_auto:
+            _ts_all_y: list[float] = []
+            for _fi2, _ci2, _fn2, _df2, _ch2 in _combos:
+                _lbl2 = _amp_label(_fn2, _ch2["name"], _multi_file)
+                if _lbl2 not in sel:
+                    continue
+                _yr2 = to_num(_df2[_ch2["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+                _ts_all_y.extend(_yr2[np.isfinite(_yr2)].tolist())
+            _dr_lo = float(np.nanmin(_ts_all_y)) if _ts_all_y else 0.0
+            _dr_hi = float(np.nanmax(_ts_all_y)) if _ts_all_y else 1.0
+            _def_min = SS.ts_y_min if SS.ts_y_min is not None else _dr_lo
+            _def_max = SS.ts_y_max if SS.ts_y_max is not None else _dr_hi
+            _yc1, _yc2 = st.columns(2)
+            _range_help = f"Full visible-channel range: {_dr_lo:.4g} – {_dr_hi:.4g}"
+            SS.ts_y_min = float(_yc1.number_input(
+                "Y min", value=float(_def_min), format="%.6g", step=0.0001,
+                key=f"{files_key}_ts_y_min_ni", help=_range_help,
+            ))
+            SS.ts_y_max = float(_yc2.number_input(
+                "Y max", value=float(_def_max), format="%.6g", step=0.0001,
+                key=f"{files_key}_ts_y_max_ni", help=_range_help,
+            ))
+
+    fig_ts = go.Figure()
+    for fi, ci, fn, df, ch in _combos:
+        lbl = _amp_label(fn, ch["name"], _multi_file)
+        if lbl not in sel:
+            continue
+        _t = to_num(df[ch["tc"]])
+        _i_raw = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+        _i_smooth = smooth_signal(_i_raw, SS.smooth_method, SS.smooth_window, SS.smooth_polyorder)
+        _col = PAL[(fi if _multi_file else ci) % len(PAL)]
+        _dash = _DASHES[ci % len(_DASHES)] if _multi_file else "solid"
+        if SS.smooth_method != "None":
+            fig_ts.add_trace(go.Scatter(
+                x=_t, y=_i_raw,
+                name=f"{lbl} (raw)",
+                mode="lines",
+                opacity=0.35,
+                line=dict(color=_col, width=1, dash=_dash),
+                showlegend=False,
+            ))
+        fig_ts.add_trace(go.Scatter(
+            x=_t,
+            y=_i_smooth,
+            name=lbl,
+            mode="lines",
+            line=dict(color=_col, width=1.5, dash=_dash),
+        ))
+
+    _pt_ts = _plot_theme()
+    for _frec_sh in _files:
+        for _, row in _frec_sh.get("cpdf", pd.DataFrame()).iterrows():
+            _ets2 = _eff_t_start(row)
+            if _ets2 is not None and pd.notna(row.get("t_end")):
+                clr = ("rgba(255,165,0,0.22)"
+                       if row.get("Baseline") else "rgba(100,160,255,0.15)")
+                _lbl_sh = (f"{_frec_sh['filename']}: {row['Label']}"
+                           if _multi_file else str(row["Label"]))
+                fig_ts.add_vrect(
+                    x0=_ets2, x1=row["t_end"],
+                    fillcolor=clr, layer="below", line_width=0,
+                    annotation_text=_lbl_sh,
+                    annotation_position="top left",
+                    annotation=dict(font_size=10, font_color=_pt_ts["annot_font"]),
+                )
+
+    fig_ts.update_layout(
+        xaxis_title="Time (s)",
+        yaxis_title=f"{signal_axis_label} ({SS[unit_key]})",
+        hovermode="x unified",
+        height=580,
+        template=_pt_ts["template"],
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=True,
+        legend=dict(
+            orientation="v", x=1.01, y=1,
+            xanchor="left", yanchor="top",
+            bgcolor="rgba(0,0,0,0)",
+        ),
+        hoverdistance=40,
+        xaxis=dict(
+            rangeslider=dict(visible=True, thickness=0.05,
+                             bgcolor="rgba(255,255,255,0.05)"),
+            showspikes=True, spikemode="across", spikesnap="cursor",
+            spikecolor=_pt_ts["spike"], spikethickness=1, spikedash="dot",
+            showgrid=True, gridcolor=_pt_ts["grid"],
+            linecolor=_pt_ts["axisline"],
+        ),
+        yaxis=dict(
+            showspikes=True, spikemode="across",
+            spikecolor=_pt_ts["spike"], spikethickness=1, spikedash="dot",
+            showgrid=True, gridcolor=_pt_ts["grid"],
+            linecolor=_pt_ts["axisline"],
+            fixedrange=False,
+            **({"range": [SS.ts_y_min, SS.ts_y_max]}
+               if not SS.ts_y_auto and SS.ts_y_min is not None and SS.ts_y_max is not None
+               else {}),
+        ),
+    )
+    st.plotly_chart(fig_ts, use_container_width=True,
+                    config={"scrollZoom": True, "displayModeBar": True,
+                            "modeBarButtonsToRemove": ["select2d", "lasso2d"]},
+                    key=f"{files_key}_ts_chart")
+    SS.ts_fig = fig_ts
+
+    dl1, dl2 = st.columns(2)
+    dl1.download_button(
+        "Download as interactive HTML",
+        data=fig_ts.to_html(include_plotlyjs="cdn"),
+        file_name="time_series.html",
+        mime="text/html",
+        key=f"{files_key}_ts_html_dl",
+    )
+    ts_png = render_ts_png(_files, SS[unit_key], sel,
+                           smooth_method=SS.smooth_method,
+                           smooth_window=SS.smooth_window,
+                           smooth_polyorder=SS.smooth_polyorder)
+    dl2.download_button(
+        "Download as PNG",
+        data=ts_png,
+        file_name="time_series.png",
+        mime="image/png",
+        key=f"{files_key}_ts_png_dl",
+    )
+
+
+_INSIGHTS_SYSTEM_PROMPT = (
+    "You are assisting a lab scientist reviewing a sensor calibration run. "
+    "You are given ONLY the computed fit statistics for one or more channels "
+    "(never raw trace data). Write a short, plain-language assessment covering: "
+    "(1) overall fit quality — is R² good, is the sensitivity reasonable; "
+    "(2) how it compares to the relevant ideal (e.g. Nernstian ideal slope for "
+    "solid-state sensors) or to other channels analyzed together, flagging any "
+    "outlier channel; (3) concrete next-step suggestions (e.g. narrow an "
+    "averaging window, add a standard in an underrepresented concentration "
+    "range). Be specific and use the actual numbers given. Keep it under 200 words."
+)
+
+
+def _build_insights_prompt(results: dict, fit_type: str) -> str:
+    """Builds the plain-text prompt sent to the model — only computed stats,
+    never raw trace data. fit_type is 'Nernstian' for Solid-State, or
+    'Linear'/'Segmented Linear' for Amperometry."""
+    lines = [f"Fit type: {fit_type}", ""]
+    for ch_name, res in results.items():
+        lines.append(f"Channel: {ch_name}")
+        if fit_type == "Nernstian":
+            seg = res.get("nernstian_segment") or {}
+            lines.append(f"  Nernstian slope: {seg.get('slope')} mV/decade "
+                         f"(ideal: {res.get('ideal_slope_mv_per_decade')})")
+            lines.append(f"  % of ideal: {res.get('pct_of_ideal_nernstian')}")
+            lines.append(f"  R²: {seg.get('r2')}")
+            lines.append(f"  LOD: {res.get('lod_conc')}")
+        else:
+            lines.append(f"  Concentrations: {res.get('concs')}")
+            lines.append(f"  ΔI: {res.get('delta_i')}")
+            lines.append(f"  Blank noise (sigma): {res.get('sigma_bl')}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _generate_ai_insights_ollama(results: dict, fit_type: str, model: str) -> str:
+    """Sends only the computed fit statistics (never raw trace data) to a
+    local Ollama model and returns its plain-language assessment. Requires
+    Ollama (https://ollama.com) running locally with `model` already pulled
+    — raises if it can't be reached, so the caller can show a friendly
+    error instead of a crash."""
+    response = _ollama.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": _INSIGHTS_SYSTEM_PROMPT},
+            {"role": "user", "content": _build_insights_prompt(results, fit_type)},
+        ],
+    )
+    return response["message"]["content"]
+
+
+def _render_ai_insights_section(res_map: dict, fit_type: str, key_prefix: str) -> None:
+    """Optional 'AI Insights' panel shown below a calibration's statistics
+    table. Uses a local Ollama model instead of a paid API — no key, no
+    cost, and nothing leaves this machine. Cached per result set (a simple
+    hash of the stats) so it isn't regenerated on every rerun, only when
+    the user asks."""
+    with st.expander("🤖 AI Insights (local model via Ollama)", expanded=False):
+        if not _OLLAMA_LIB_OK:
+            st.info(
+                "Not available in this environment — the `ollama` Python "
+                "package isn't installed (`pip install ollama`)."
+            )
+            return
+        st.caption(
+            "Sends only the computed fit statistics shown above — never raw "
+            "trace data — to a model running locally via "
+            "[Ollama](https://ollama.com). No API key, no cost, nothing "
+            "leaves this machine. One-time setup: install Ollama, then "
+            "`ollama pull llama3.2` (or any other model you already have)."
+        )
+        _model = st.text_input(
+            "Ollama model", value=SS.get("ollama_model", "llama3.2"),
+            key=f"{key_prefix}_ollama_model",
+        )
+        SS["ollama_model"] = _model
+        _cache_key = f"{key_prefix}_{fit_type}_{hash(str(res_map))}"
+        if st.button("Generate insights", key=f"{key_prefix}_ai_insights_btn"):
+            try:
+                with st.spinner("Asking the local model..."):
+                    _text = _generate_ai_insights_ollama(res_map, fit_type, _model)
+                SS.setdefault("_ai_insights_cache", {})[_cache_key] = _text
+            except Exception as exc:
+                st.error(f"Couldn't reach Ollama — is it running? ({exc})")
+        _cached = SS.get("_ai_insights_cache", {}).get(_cache_key)
+        if _cached:
+            st.markdown(_cached)
 
 
 def _apply_cfg_dict(d: dict) -> None:
@@ -1297,7 +2157,7 @@ if not SS.get("config_loaded"):
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Sensor Analysis Studio")
-    st.radio("Section", ["Amperometry", "Cyclic Voltammetry", "Assay"], key="mode")
+    st.radio("Section", ["Amperometry", "Solid-State", "Cyclic Voltammetry", "Assay"], key="mode")
     st.divider()
     st.subheader("Configuration")
     st.caption(
@@ -2414,14 +3274,19 @@ if SS.mode == "Assay":
                     pd.DataFrame(np.full((8, 12), np.nan),
                                  index=pd.Index(_PLATE_ROWS, name="Row"),
                                  columns=pd.Index(range(1, 13), name="Col")))
-        _a1_edited = st.data_editor(
-            _a1_init.reset_index(),
-            key="assay_plate_editor",
-            use_container_width=True,
-            hide_index=True,
-            column_config={"Row": st.column_config.TextColumn("Row", disabled=True)},
-        )
-        if st.button("Apply manual values", key="assay_apply_manual"):
+        # Editor + Apply button share one st.form so the button's rerun
+        # reads the grid's live value at submit time, instead of depending
+        # on a separate blur event racing the click.
+        with st.form(key="assay_plate_form"):
+            _a1_edited = st.data_editor(
+                _a1_init.reset_index(),
+                key="assay_plate_editor",
+                use_container_width=True,
+                hide_index=True,
+                column_config={"Row": st.column_config.TextColumn("Row", disabled=True)},
+            )
+            _a1_apply_clicked = st.form_submit_button("Apply manual values")
+        if _a1_apply_clicked:
             _mdf = _a1_edited.copy()
             if "Row" in _mdf.columns:
                 _mdf = _mdf.set_index("Row")
@@ -2451,41 +3316,47 @@ if SS.mode == "Assay":
                 "Enter the well address for each of the 3 replicate sets — "
                 "leave a cell blank if that set doesn't include this level."
             )
-            _a2_std_edit = st.data_editor(
-                SS["assay_std_df"],
-                key="assay_std_editor",
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "Label": st.column_config.TextColumn(
-                        "Label", help="e.g. 'Blank', '10 µM'"),
-                    "Conc": st.column_config.NumberColumn(
-                        f"Conc ({SS['assay_conc_unit']})", format="%.5g",
-                        help="Known analyte concentration"),
-                    "S1": st.column_config.TextColumn("Set 1 well", help="e.g. A1"),
-                    "S2": st.column_config.TextColumn("Set 2 well", help="e.g. B1"),
-                    "S3": st.column_config.TextColumn("Set 3 well", help="e.g. C1"),
-                },
-            )
+            # Both editors + Apply share one st.form so the button's rerun
+            # reads their live grid values at submit time, instead of
+            # depending on a separate blur event racing the click.
+            with st.form(key="assay_std_form"):
+                _a2_std_edit = st.data_editor(
+                    SS["assay_std_df"],
+                    key="assay_std_editor",
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "Label": st.column_config.TextColumn(
+                            "Label", help="e.g. 'Blank', '10 µM'"),
+                        "Conc": st.column_config.NumberColumn(
+                            f"Conc ({SS['assay_conc_unit']})", format="%.5g",
+                            help="Known analyte concentration"),
+                        "S1": st.column_config.TextColumn("Set 1 well", help="e.g. A1"),
+                        "S2": st.column_config.TextColumn("Set 2 well", help="e.g. B1"),
+                        "S3": st.column_config.TextColumn("Set 3 well", help="e.g. C1"),
+                    },
+                )
 
-            st.divider()
-            st.subheader("Sample well labels  *(optional)*")
-            st.caption(
-                "Every well not listed as a standard is treated as a sample. "
-                "Add rows here to assign group names — used as labels in the results table."
-            )
-            _a2_samp_edit = st.data_editor(
-                SS["assay_sample_df"],
-                key="assay_samp_editor",
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "Well":  st.column_config.TextColumn("Well",  help="e.g. D1, E4, H12"),
-                    "Label": st.column_config.TextColumn("Label", help="e.g. 'Patient 1'"),
-                },
-            )
+                st.divider()
+                st.subheader("Sample well labels  *(optional)*")
+                st.caption(
+                    "Every well not listed as a standard is treated as a sample. "
+                    "Add rows here to assign group names — used as labels in the results table."
+                )
+                _a2_samp_edit = st.data_editor(
+                    SS["assay_sample_df"],
+                    key="assay_samp_editor",
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "Well":  st.column_config.TextColumn("Well",  help="e.g. D1, E4, H12"),
+                        "Label": st.column_config.TextColumn("Label", help="e.g. 'Patient 1'"),
+                    },
+                )
 
-            if st.button("Apply layout", type="primary", key="assay_apply_std"):
+                _a2_apply_clicked = st.form_submit_button("Apply layout", type="primary")
+
+            if _a2_apply_clicked:
                 SS["assay_std_df"]    = _a2_std_edit.copy()
                 SS["assay_sample_df"] = _a2_samp_edit.copy()
                 SS["assay_std_res"]   = None
@@ -2870,6 +3741,462 @@ if SS.mode == "Assay":
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SOLID-STATE section  (only reached when mode == "Solid-State")
+# Potentiometric (ISE/ISFET-style) calibration: E (mV) vs log10(Concentration),
+# fit via nernstian_lod_fit() rather than Amperometry's linear ΔI model. No
+# Baseline/blank-subtraction, no effective-concentration dilution calculator.
+# ─────────────────────────────────────────────────────────────────────────────
+if SS.mode == "Solid-State":
+    ST1, ST2, ST3, ST4 = st.tabs([
+        "① Import & Configure", "② Time Series", "③ Calibration Curve", "④ Export",
+    ])
+
+    with ST1:
+        _render_import_tab(
+            files_key="solid_files",
+            signal_col_label="Potential",
+            unit_key="solid_unit",
+            active_file_key="solid_active_file",
+            seed_cpdf_fn=_seed_solid_cpdf_for_new_file,
+            sample_loader_fn=_load_solid_sample_data,
+            sample_caption=(
+                "A synthetic potentiometric (ISE-style) run with a two-regime "
+                "response — a flattened low-concentration plateau and a "
+                "near-Nernstian high-concentration slope — and a ready-made "
+                "calibration table."
+            ),
+            sample_button_help=(
+                "Loads a bundled example potentiometric run with a pre-filled "
+                "calibration table so you can try this mode immediately."
+            ),
+            sample_loaded_msg=(
+                "Sample data loaded — head to the **Time Series** or "
+                "**Calibration Curve** tab to explore."
+            ),
+            sample_conc_unit="M",
+            sample_signal_unit="mV",
+            set_legacy_alias=False,
+        )
+        if SS.solid_files:
+            st.info(
+                "**Solid-state calibration tables have no Baseline or dilution "
+                "calculator** — Nernstian fits use the raw potential directly, "
+                "and rows with Concentration ≤ 0 are excluded automatically "
+                "before the log₁₀ transform."
+            )
+
+    with ST2:
+        _render_timeseries_tab(files_key="solid_files", unit_key="solid_unit",
+                               signal_axis_label="Potential")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # TAB 3 · Calibration Curve  (Nernstian: E vs log10(Concentration))
+    # ═════════════════════════════════════════════════════════════════════════
+    with ST3:
+        if not SS.solid_files:
+            st.info("Complete the **Import & Configure** step first.")
+        else:
+            _file_names_solid = [f["filename"] for f in SS.solid_files]
+            if SS.get("solid_active_file") not in _file_names_solid:
+                SS["solid_active_file"] = _file_names_solid[0]
+            if len(_file_names_solid) > 1:
+                st.selectbox(
+                    "Dataset", _file_names_solid, key="solid_active_file",
+                    help="Each imported file has its own calibration table — "
+                         "pick which one to edit below.",
+                )
+            _active_fi_s   = _file_names_solid.index(SS["solid_active_file"])
+            _active_frec_s = SS.solid_files[_active_fi_s]
+
+            # Analysis Settings lives outside the form (below) so it stays
+            # live/reactive — only the editor itself needs form-batching to
+            # avoid the blur-race, not this multiselect.
+            st.subheader("Analysis Settings")
+            _solid_multi_file = len(SS.solid_files) > 1
+            _solid_combo_lookup = {
+                _amp_label(frec["filename"], ch["name"], _solid_multi_file): (frec, ch)
+                for frec in SS.solid_files
+                for ch in frec["channels"]
+            }
+            analyze_chs_solid = st.multiselect(
+                "Channels to analyse",
+                list(_solid_combo_lookup.keys()),
+                default=list(_solid_combo_lookup.keys())[:1],
+                help="Select one or more channels (and, with multiple files "
+                     "loaded, file·channel pairs). Each uses its own "
+                     "dataset's calibration table above.",
+            )
+
+            with st.expander("Quick-fill: common calibration protocols"):
+                _preset_name_s = st.selectbox(
+                    "Preset", list(_SOLID_PRESETS.keys()), key="solid_cal_preset_choice",
+                )
+                _preset_s = _SOLID_PRESETS[_preset_name_s]
+                ps1, ps2 = st.columns(2)
+                _preset_start_s = ps1.number_input(
+                    "Start time (s)", min_value=0.0, value=float(_preset_s["start"]),
+                    format="%.5g", key="solid_preset_start",
+                    help="When the first standard's averaging window begins.",
+                )
+                _preset_interval_s = ps2.number_input(
+                    "Interval (s)", min_value=0.001, value=float(_preset_s["interval"]),
+                    format="%.5g", key="solid_preset_interval",
+                    help="Duration held at each standard before moving to the next.",
+                )
+                _preset_values_str_s = st.text_input(
+                    f"Concentration values ({SS.conc_unit}), comma-separated — absolute, "
+                    "one per standard. Add more to extend the series.",
+                    value=", ".join(str(v) for v in _preset_s["values"]),
+                    key="solid_preset_values",
+                )
+                if st.button("Apply preset — replaces the table below", key="apply_solid_preset"):
+                    try:
+                        _values_s = [float(v.strip()) for v in _preset_values_str_s.split(",") if v.strip()]
+                        if not _values_s:
+                            raise ValueError("empty")
+                    except ValueError:
+                        st.error("Couldn't parse the concentration values — use comma-separated "
+                                 "numbers, e.g. 10, 25, 50, 100.")
+                    else:
+                        _active_frec_s["cpdf"] = _preset_cpdf_solid(
+                            _values_s, _preset_start_s, _preset_interval_s)
+                        SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+                        st.success(f"Preset applied — {len(_values_s)} rows. Edit any cell below, "
+                                   "or add more rows with the grid's ➕ button.")
+                        st.rerun()
+
+            st.subheader(
+                "Calibration Points"
+                + (f" — {_active_frec_s['filename']}" if len(_file_names_solid) > 1 else "")
+            )
+            st.caption(
+                "One row per standard. Fill in **Reading** directly, or leave it "
+                "blank and set **t start / t end** (read off the time-series chart) "
+                "to average the imported trace over that window instead. "
+                "**Concentration** must be > 0 — rows that aren't are excluded "
+                "automatically before fitting. "
+                + ("Each imported file keeps its own table, so switch **Dataset** "
+                   "above to edit another one." if len(_file_names_solid) > 1 else "")
+            )
+            if "cal_editor_version" not in SS:
+                SS.cal_editor_version = 0
+
+            # Only the editor + Compute button share the form now — so the
+            # button's rerun reads the grid's live value at submit time,
+            # rather than depending on a separate blur event racing the
+            # click — while channel selection above stays reactive.
+            with st.form(key=f"solid_cal_form_{_active_fi_s}"):
+                _scpdf_edit = st.data_editor(
+                    _active_frec_s["cpdf"],
+                    key=f"solid_cal_editor_{_active_fi_s}_{SS.cal_editor_version}",
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "Label": st.column_config.TextColumn(
+                            "Label",
+                            help="Short name shown on the plot, e.g. 'Std 1'",
+                        ),
+                        "Concentration": st.column_config.NumberColumn(
+                            f"Concentration ({SS.conc_unit})",
+                            format="%.5g",
+                            help="Must be > 0 — used as log10(Concentration) in the fit.",
+                        ),
+                        "t_start": st.column_config.NumberColumn(
+                            "t start (s)",
+                            help="Start of the averaging window (seconds). Used only if Reading is blank.",
+                        ),
+                        "t_end": st.column_config.NumberColumn(
+                            "t end (s)",
+                            help="End of the averaging window (seconds). Used only if Reading is blank.",
+                        ),
+                        "avg_duration": st.column_config.NumberColumn(
+                            "Avg window (s)",
+                            format="%.4g",
+                            help="If set, t start = t end − this value (overrides t start)",
+                        ),
+                        "Reading_mV": st.column_config.NumberColumn(
+                            f"Reading ({SS.solid_unit})",
+                            format="%.5g",
+                            help="Optional direct entry — if filled, this IS the "
+                                 "calibration point (no averaging window needed).",
+                        ),
+                    },
+                )
+
+                compute_clicked_solid = st.form_submit_button(
+                    "Compute Calibration", type="primary")
+
+            # Persist every edit immediately, same as Amperometry, so any
+            # other code running later this pass sees the latest table.
+            _active_frec_s["cpdf"] = _scpdf_edit
+
+            def _do_compute_calibration_solid() -> bool:
+                """Nernstian (E vs log10 concentration) fit per channel — see
+                nernstian_lod_fit()'s docstring for why this differs from
+                Amperometry's linear ΔI model (no baseline subtraction, LOD
+                via independent-segment intersection, not 3·sigma/slope)."""
+                results = {}
+                for ch_name in analyze_chs_solid:
+                    frec, ch = _solid_combo_lookup[ch_name]
+                    cpdf = frec["cpdf"].copy()
+                    if cpdf.empty:
+                        continue
+                    _rejected = cpdf["Concentration"].astype(float) <= 0
+                    if _rejected.any():
+                        st.warning(
+                            f"**{ch_name}**: {int(_rejected.sum())} row(s) with "
+                            "Concentration ≤ 0 excluded from the fit."
+                        )
+                        cpdf = cpdf[~_rejected].reset_index(drop=True)
+                    if cpdf.empty:
+                        st.error(f"**{ch_name}**: no valid calibration rows.")
+                        continue
+
+                    df = frec["df"]
+                    t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
+                    e_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+
+                    readings = []
+                    for _, row in cpdf.iterrows():
+                        if pd.notna(row.get("Reading_mV")):
+                            readings.append(float(row["Reading_mV"]))
+                            continue
+                        _ets = _eff_t_start(row)
+                        if _ets is None or pd.isna(row.get("t_end")):
+                            readings.append(np.nan)
+                            continue
+                        mask = (t_arr >= _ets) & (t_arr <= row["t_end"])
+                        pts  = e_arr[mask]
+                        pts  = pts[~np.isnan(pts)]
+                        readings.append(float(np.mean(pts)) if pts.size > 0 else np.nan)
+
+                    log_conc  = np.log10(cpdf["Concentration"].astype(float).to_numpy())
+                    potential = np.array(readings, dtype=float)
+                    valid     = ~np.isnan(potential)
+                    if valid.sum() < 2:
+                        st.error(
+                            f"**{ch_name}**: fewer than 2 valid readings — fill "
+                            "in Reading or a valid averaging window for more rows."
+                        )
+                        continue
+
+                    lod_fit = nernstian_lod_fit(log_conc[valid], potential[valid])
+                    nernst_seg = lod_fit["nernstian_segment"]
+                    ideal = nernst_ideal_slope_mv()
+
+                    results[ch_name] = dict(
+                        concs             = cpdf["Concentration"].astype(float).tolist(),
+                        labels            = cpdf["Label"].tolist(),
+                        log_conc          = log_conc[valid].tolist(),
+                        potential_mv      = potential[valid].tolist(),
+                        low_segment       = lod_fit["low_segment"],
+                        nernstian_segment = nernst_seg,
+                        lod_log10         = lod_fit["lod_log10"],
+                        lod_conc          = lod_fit["lod_conc"],
+                        sensitivity_mv_per_decade = nernst_seg["slope"] if nernst_seg else None,
+                        pct_of_ideal_nernstian    = (
+                            100.0 * abs(nernst_seg["slope"]) / ideal if nernst_seg else None
+                        ),
+                        ideal_slope_mv_per_decade = ideal,
+                        is_average = False,
+                    )
+                if not results:
+                    SS.solid_cal_results = None
+                    return False
+                SS.solid_cal_results = dict(results=results)
+                return True
+
+            if compute_clicked_solid:
+                if not analyze_chs_solid:
+                    st.error("Select at least one channel to analyse above.")
+                else:
+                    SS["_solid_cal_computed_msg"] = (
+                        "Calibration computed — results below."
+                        if _do_compute_calibration_solid() else None
+                    )
+            if SS.get("_solid_cal_computed_msg"):
+                st.success(SS.pop("_solid_cal_computed_msg"))
+
+            # ── Plot & statistics ───────────────────────────────────────────
+            if SS.solid_cal_results:
+                res_map_s = SS.solid_cal_results["results"]
+
+                fig_solid = go.Figure()
+                stat_rows_s = []
+                for j, (ch_name, res) in enumerate(res_map_s.items()):
+                    col = PAL[j % len(PAL)]
+                    x = np.asarray(res["log_conc"], dtype=float)
+                    y = np.asarray(res["potential_mv"], dtype=float)
+                    labels_plot = res["labels"][:len(x)]
+
+                    fig_solid.add_trace(go.Scatter(
+                        x=x, y=y, name=ch_name, mode="markers+text",
+                        text=labels_plot, textposition="top center",
+                        textfont=dict(size=10),
+                        marker=dict(color=col, size=10, symbol="circle",
+                                    line=dict(width=1.5, color="white")),
+                    ))
+
+                    _low  = res.get("low_segment")
+                    _nern = res.get("nernstian_segment")
+                    _lod_log10 = res.get("lod_log10")
+                    _has_lod = _lod_log10 is not None and np.isfinite(_lod_log10)
+                    for _seg, _seg_name, _dash in [(_low, "low", "dot"), (_nern, "Nernstian", "dash")]:
+                        if _seg is None:
+                            continue
+                        if _seg_name == "low" and _has_lod:
+                            _x0, _x1 = float(np.min(x)), _lod_log10
+                        elif _seg_name == "Nernstian" and _has_lod:
+                            _x0, _x1 = _lod_log10, float(np.max(x))
+                        else:
+                            _x0, _x1 = float(np.min(x)), float(np.max(x))
+                        if _x1 <= _x0:
+                            _x0, _x1 = float(np.min(x)), float(np.max(x))
+                        xp = np.linspace(_x0, _x1, 200)
+                        yp = _seg["slope"] * xp + _seg["intercept"]
+                        fig_solid.add_trace(go.Scatter(
+                            x=xp, y=yp, name=f"{ch_name} {_seg_name} fit",
+                            mode="lines", showlegend=False,
+                            line=dict(color=col, dash=_dash, width=2),
+                        ))
+
+                    if _has_lod:
+                        fig_solid.add_vline(
+                            x=_lod_log10, line=dict(color=col, dash="dashdot", width=1.2),
+                            annotation_text=f"{ch_name} LOD", annotation_position="top",
+                        )
+
+                    ideal = res.get("ideal_slope_mv_per_decade")
+                    stat_rows_s.append({
+                        "Channel": ch_name,
+                        "Sensitivity (mV/decade)": fmt(res.get("sensitivity_mv_per_decade")),
+                        "% of ideal Nernstian": (
+                            f"{res['pct_of_ideal_nernstian']:.1f}%"
+                            if res.get("pct_of_ideal_nernstian") is not None else "—"
+                        ),
+                        "Ideal (mV/decade)": fmt(ideal),
+                        "R² (Nernstian)": (f"{_nern['r2']:.4f}" if _nern else "—"),
+                        "R² (low)": (f"{_low['r2']:.4f}" if _low else "—"),
+                        f"LOD ({SS.conc_unit})": fmt(res.get("lod_conc")),
+                        "LOD (log₁₀)": fmt(res.get("lod_log10")),
+                    })
+
+                _pt_s = _plot_theme()
+                fig_solid.update_layout(
+                    xaxis_title=f"log₁₀(Concentration [{SS.conc_unit}])",
+                    yaxis_title=f"Potential ({SS.solid_unit})",
+                    hovermode="closest",
+                    height=560,
+                    template=_pt_s["template"],
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    showlegend=True,
+                    legend=dict(orientation="v", x=1.01, y=1, xanchor="left",
+                                yanchor="top", bgcolor="rgba(0,0,0,0)"),
+                )
+                st.plotly_chart(fig_solid, use_container_width=True,
+                                config={"displayModeBar": True,
+                                        "modeBarButtonsToRemove": ["select2d", "lasso2d"]})
+                SS.solid_cal_fig = fig_solid
+
+                st.subheader("Statistics")
+                st.dataframe(pd.DataFrame(stat_rows_s), hide_index=True, use_container_width=True)
+
+                _render_ai_insights_section(res_map_s, "Nernstian", key_prefix="solid")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # TAB 4 · Export
+    # ═════════════════════════════════════════════════════════════════════════
+    with ST4:
+        st.subheader("Export")
+        st.caption("All exports are also available inline on the Time Series and Calibration Curve tabs.")
+
+        if SS.solid_cal_results:
+            st.markdown("#### Calibration summary table")
+            rows_out_s = []
+            cal_res_s: dict = SS.solid_cal_results["results"]
+            for ch_name, res in cal_res_s.items():
+                for lbl, conc in zip(res["labels"], res["concs"]):
+                    rows_out_s.append({
+                        "Channel": ch_name,
+                        "Label": lbl,
+                        f"Concentration ({SS.conc_unit})": conc,
+                    })
+            export_df_s = pd.DataFrame(rows_out_s)
+            st.dataframe(export_df_s, use_container_width=True, hide_index=True)
+
+            st.markdown("#### Calibration curve downloads")
+            sdl1, sdl2, sdl3 = st.columns(3)
+            sdl1.download_button(
+                "Calibration CSV",
+                data=export_df_s.to_csv(index=False).encode(),
+                file_name="solid_state_calibration_data.csv",
+                mime="text/csv",
+            )
+            if SS.get("solid_cal_fig") is not None:
+                sdl2.download_button(
+                    "Plot — interactive HTML",
+                    data=SS.solid_cal_fig.to_html(include_plotlyjs="cdn"),
+                    file_name="solid_state_calibration_curve.html",
+                    mime="text/html",
+                )
+                solid_cal_png_bytes = render_solid_cal_png(
+                    dict(cal_res_s), SS.conc_unit, SS.solid_unit,
+                )
+                sdl3.download_button(
+                    "Plot — PNG (150 dpi)",
+                    data=solid_cal_png_bytes,
+                    file_name="solid_state_calibration_curve.png",
+                    mime="image/png",
+                )
+        else:
+            st.info("Run calibration analysis in the **Calibration Curve** tab first.")
+
+        if SS.solid_files:
+            st.divider()
+            st.markdown("#### Time-series downloads")
+            sdl4, sdl5, sdl6 = st.columns(3)
+            with sdl4:
+                for _fi4s, _frec_s in enumerate(SS.solid_files):
+                    st.download_button(
+                        f"Raw data CSV — {_frec_s['filename']}",
+                        data=_frec_s["df"].to_csv(index=False).encode(),
+                        file_name=(f"raw_{_frec_s['filename']}.csv"
+                                   if not _frec_s["filename"].endswith(".csv")
+                                   else f"raw_{_frec_s['filename']}"),
+                        mime="text/csv",
+                        key=f"solid_raw_dl_{_fi4s}_{_frec_s['filename']}",
+                    )
+            all_ch_names_export_s = [
+                _amp_label(f["filename"], c["name"], len(SS.solid_files) > 1)
+                for f in SS.solid_files for c in f["channels"]
+            ]
+            if SS.ts_fig is not None:
+                sdl5.download_button(
+                    "Plot — interactive HTML",
+                    data=SS.ts_fig.to_html(include_plotlyjs="cdn"),
+                    file_name="solid_state_time_series.html",
+                    mime="text/html",
+                    key="solid_ts_html_dl",
+                )
+                ts_vis_s = SS.ts_visible if SS.ts_visible else all_ch_names_export_s
+                ts_png_bytes_s = render_ts_png(
+                    SS.solid_files, SS.solid_unit, ts_vis_s,
+                    smooth_method=SS.smooth_method,
+                    smooth_window=SS.smooth_window,
+                    smooth_polyorder=SS.smooth_polyorder,
+                )
+                sdl6.download_button(
+                    "Plot — PNG (150 dpi)",
+                    data=ts_png_bytes_s,
+                    file_name="solid_state_time_series.png",
+                    mime="image/png",
+                    key="solid_ts_png_dl",
+                )
+
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AMPEROMETRY section  (only reached when mode == "Amperometry")
 # ─────────────────────────────────────────────────────────────────────────────
 T1, T2, T3, T4 = st.tabs([
@@ -2881,427 +4208,39 @@ T1, T2, T3, T4 = st.tabs([
 # TAB 1 · Import & Configure
 # ═════════════════════════════════════════════════════════════════════════════
 with T1:
-    with st.expander("Quick-start guide", expanded=False):
-        st.markdown("""
-**Typical workflow:**
-
-1. **Import & Configure** — upload your CSV/TXT file, map each column pair (time + current) to a named channel, set your concentration and current units.
-2. **Time Series** — inspect the raw current traces. Use this to identify the time windows where each concentration was applied.
-3. **Calibration Curve** — fill in the calibration table (one row per concentration step), click *Compute*, choose a fit type, and review the statistics.
-4. **Export** — download the calibration CSV, plots (PNG or interactive HTML), or the raw data.
-
-> **Tip:** Calibration windows are shown as shaded bands on the time-series chart so you can visually verify your time entries.
-
-> **Resuming previous work:** don't want to re-upload and re-map every time?
-> The sidebar's **Configuration** section can save your settings and
-> calibration table to this browser (**Save**), to a downloadable JSON file
-> (**Export / Import JSON**) to move between machines, or — if your team has
-> set it up — a full session including the raw uploaded files themselves to a
-> shared Google Drive folder (**Cloud Sessions**), so anyone with access can
-> pick up right where you left off.
-""")
-
-    _sc1, _sc2 = st.columns([1, 3])
-    if _sc1.button("Load sample data", help=(
-        "Loads two bundled example runs (2 channels each, with a "
-        "pre-filled calibration table) so you can try the app immediately "
-        "without your own data."
-    )):
-        _sample_files = _load_sample_data()
-        if _sample_files is None:
-            st.error("Sample data files are missing from this deployment.")
-        else:
-            SS.amp_files   = _sample_files
-            SS.df          = _sample_files[0]["df"]
-            SS.channels    = _sample_files[0]["channels"]
-            SS.conc_unit   = "mM"
-            SS.cur_unit    = "µA"
-            SS.ts_visible  = []
-            SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
-            SS["cal_active_file"] = _sample_files[0]["filename"]
-            SS["_files_applied_msg"] = (
-                "Sample data loaded — 2 files, 2 channels each, with a "
-                "matching calibration table already filled in. Head to the "
-                "**Time Series** or **Calibration Curve** tab to explore."
-            )
-            st.rerun()
-    _sc2.caption(
-        "Two synthetic amperometric runs (2 channels each) with a "
-        "ready-made calibration table — a quick way to see the whole "
-        "workflow before importing your own files."
-    )
-
-    st.subheader("Upload File(s)")
-    ups = st.file_uploader(
-        "Drag and drop one or more raw sensor data files here, or click to browse",
-        type=["csv", "txt", "pssession"],
-        accept_multiple_files=True,
-        help=(
-            "Supports comma-, tab-, semicolon-, or space-delimited files with a header row. "
-            "Upload multiple files to compare across runs/sensors — each file gets its own "
-            "column mapping below."
+    _render_import_tab(
+        files_key="amp_files",
+        signal_col_label="Current",
+        unit_key="cur_unit",
+        active_file_key="cal_active_file",
+        seed_cpdf_fn=_seed_cpdf_for_new_file,
+        sample_loader_fn=_load_sample_data,
+        sample_caption=(
+            "Two synthetic amperometric runs (2 channels each) with a "
+            "ready-made calibration table — a quick way to see the whole "
+            "workflow before importing your own files."
         ),
+        sample_button_help=(
+            "Loads two bundled example runs (2 channels each, with a "
+            "pre-filled calibration table) so you can try the app immediately "
+            "without your own data."
+        ),
+        sample_loaded_msg=(
+            "Sample data loaded — 2 files, 2 channels each, with a "
+            "matching calibration table already filled in. Head to the "
+            "**Time Series** or **Calibration Curve** tab to explore."
+        ),
+        sample_conc_unit="mM",
+        sample_signal_unit="\u00b5A",
+        set_legacy_alias=True,
     )
-
-    def _parse_one_file(_up, _fi: int) -> tuple[pd.DataFrame | None, list[dict]]:
-        """Parse one uploaded file, returning (df, auto_channels)."""
-        if _up.name.lower().endswith(".pssession"):
-            _df, _auto = parse_pssession(_up.read())
-            return _df, _auto
-
-        _raw_bytes = _up.read()
-        if _raw_bytes[:2] in (b"\xff\xfe", b"\xfe\xff"):
-            _raw = _raw_bytes.decode("utf-16")
-        else:
-            _raw = _raw_bytes.decode("utf-8", errors="replace")
-
-        _file_fmt = st.selectbox(
-            "File format",
-            ["Standard CSV", "Multi-channel instrument (potentiostat, etc.)"],
-            help=(
-                "Choose **Multi-channel instrument** for files exported from Bio-Logic, "
-                "CH Instruments, Autolab, or similar — they have metadata rows, "
-                "channel-label rows, and a units row above the numeric data."
-            ),
-            key=f"file_fmt_{_fi}",
-        )
-
-        _c1, _c2 = st.columns(2)
-        _delim_label = _c1.selectbox(
-            "Delimiter",
-            ["Auto-detect", "Comma  ,", "Tab  \\t", "Semicolon  ;", "Space"],
-            help="Choose the character that separates columns. Auto-detect works for most files.",
-            key=f"delim_{_fi}",
-        )
-        _skip = int(_c2.number_input(
-            "Rows to skip before header", 0, 50, 0,
-            help="Only applies to Standard CSV mode. Multi-channel mode finds the data start automatically.",
-            key=f"skip_{_fi}",
-        ))
-
-        _dmap = {
-            "Auto-detect": None,
-            "Comma  ,": ",", "Tab  \\t": "\t",
-            "Semicolon  ;": ";", "Space": r"\s+",
-        }
-        _d = _dmap[_delim_label]
-        if _d is None:
-            _lines = _raw.splitlines()
-            _sniff_line = _lines[_skip] if _skip < len(_lines) else (_lines[0] if _lines else "")
-            _d = next((c for c in [",", "\t", ";"] if c in _sniff_line), r"\s+")
-
-        _engine = "python" if _d == r"\s+" else "c"
-
-        if _file_fmt.startswith("Multi-channel"):
-            _df, _auto = parse_potentiostat_csv(_raw, _d)
-            return _df, _auto
-        _df = pd.read_csv(
-            io.StringIO(_raw), sep=_d, skiprows=_skip,
-            engine=_engine, skipinitialspace=True,
-        )
-        _df.columns = [c.lstrip("﻿").strip() for c in _df.columns]
-        return _df, []
-
-    if ups:
-        _existing_by_name = {f["filename"]: f for f in SS.amp_files}
-        _parsed_files = []
-        for _fi, _up in enumerate(ups):
-            with st.expander(f"📄 {_up.name}", expanded=(len(ups) <= 3)):
-                try:
-                    _df, _auto_channels = _parse_one_file(_up, _fi)
-                except Exception as exc:
-                    st.error(f"Parse error: {exc}")
-                    continue
-
-                m1, m2 = st.columns(2)
-                m1.metric("Rows loaded", f"{len(_df):,}")
-                m2.metric("Columns", len(_df.columns))
-                st.dataframe(_df.head(10), use_container_width=True)
-
-                st.markdown("**Map Columns to Channels**")
-                _all_cols = list(_df.columns)
-                _preset_chs = (
-                    _existing_by_name[_up.name]["channels"]
-                    if _up.name in _existing_by_name
-                    else (_auto_channels or [])
-                )
-                _auto_n = len(_preset_chs) if _preset_chs else max(1, len(_all_cols) // 2)
-                _n_ch = int(st.number_input(
-                    "Number of channels", 1, 8,
-                    value=min(8, _auto_n),
-                    help="Each channel corresponds to one electrode. Most files have pairs of (time, current) columns.",
-                    key=f"n_ch_{_fi}",
-                ))
-
-                _ha, _hb, _hc = st.columns([2, 3, 3])
-                _ha.markdown("**Channel name**")
-                _hb.markdown("**Time column**")
-                _hc.markdown("**Current column**")
-
-                def _col_idx(col: str, _cols=_all_cols) -> int:
-                    return _cols.index(col) if col in _cols else 0
-
-                _new_chs = []
-                for _i in range(_n_ch):
-                    _preset = _preset_chs[_i] if _i < len(_preset_chs) else {}
-                    _ca, _cb, _cc = st.columns([2, 3, 3])
-                    _name = _ca.text_input(
-                        "nm", _preset.get("name", f"Channel {_i + 1}"),
-                        key=f"n{_fi}_{_i}", label_visibility="collapsed",
-                    )
-                    _tc = _cb.selectbox(
-                        "tc", _all_cols,
-                        index=_col_idx(_preset.get("tc", _all_cols[min(_i * 2, len(_all_cols) - 1)])),
-                        key=f"tc{_fi}_{_i}", label_visibility="collapsed",
-                    )
-                    _ic = _cc.selectbox(
-                        "ic", _all_cols,
-                        index=_col_idx(_preset.get("ic", _all_cols[min(_i * 2 + 1, len(_all_cols) - 1)])),
-                        key=f"ic{_fi}_{_i}", label_visibility="collapsed",
-                    )
-                    _new_chs.append({"name": _name, "tc": _tc, "ic": _ic})
-
-                _preset_cpdf = (
-                    _existing_by_name[_up.name]["cpdf"]
-                    if _up.name in _existing_by_name
-                    else _seed_cpdf_for_new_file()
-                )
-                _parsed_files.append({
-                    "filename": _up.name, "df": _df, "channels": _new_chs,
-                    "cpdf": _preset_cpdf,
-                })
-
-        if _parsed_files and st.button("Apply Channel Configuration", type="primary"):
-            SS.amp_files = _parsed_files
-            # Keep SS.df/SS.channels as an alias to the first file for any
-            # legacy single-file consumers.
-            SS.df       = _parsed_files[0]["df"]
-            SS.channels = _parsed_files[0]["channels"]
-            SS.ts_visible = []
-            # Bump so any per-file calibration-table editors remount fresh
-            # rather than showing another file's cached widget state.
-            SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
-            SS["_files_applied_msg"] = (
-                f"{len(_parsed_files)} file(s), "
-                f"{sum(len(f['channels']) for f in _parsed_files)} channel(s) saved. "
-                "Head to the **Time Series** tab to inspect your traces."
-            )
-            # Rerun so the sidebar (rendered earlier in script order, so it
-            # would otherwise see last run's stale SS.amp_files) picks up
-            # the new files immediately — this is what the Save/Export/
-            # Cloud-Session buttons embed.
-            st.rerun()
-
-    if SS.get("_files_applied_msg"):
-        st.success(SS.pop("_files_applied_msg"))
-
-    if SS.amp_files:
-        st.divider()
-        st.subheader("Units")
-        st.caption("These labels appear on all plot axes and in the statistics table.")
-        u1, u2 = st.columns(2)
-        SS.conc_unit = u1.text_input("Concentration unit", SS.conc_unit,
-                                      help="e.g. mM, µM, ppm, ng/mL")
-        SS.cur_unit  = u2.text_input("Current unit", SS.cur_unit,
-                                      help="e.g. µA, nA, mA")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 2 · Time Series
 # ═════════════════════════════════════════════════════════════════════════════
-_DASHES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
-
 with T2:
-    if not SS.amp_files:
-        st.info("Complete the **Import & Configure** step first.")
-    else:
-        _multi_file = len(SS.amp_files) > 1
-
-        st.caption(
-            "Use this chart to identify the time windows for each concentration step. "
-            "Shaded bands show the averaging windows defined in the **Calibration Curve** tab — "
-            "orange for the baseline, blue for analyte steps."
-        )
-
-        with st.expander("Signal smoothing", expanded=False):
-            st.caption(
-                "Optional — smooths the trace shown below and the signal used for the "
-                "calibration averaging windows in the **Calibration Curve** tab. Off by default."
-            )
-            sm1, sm2, sm3 = st.columns(3)
-            SS.smooth_method = sm1.selectbox(
-                "Method", ["None", "Moving average", "Savitzky-Golay"],
-                index=["None", "Moving average", "Savitzky-Golay"].index(SS.smooth_method),
-            )
-            if SS.smooth_method != "None":
-                SS.smooth_window = int(sm2.number_input(
-                    "Window (samples)", min_value=3, value=int(SS.smooth_window), step=2,
-                    help="Odd number of samples in the smoothing window.",
-                ))
-                if SS.smooth_method == "Savitzky-Golay":
-                    SS.smooth_polyorder = int(sm3.number_input(
-                        "Polynomial order", min_value=1, max_value=5,
-                        value=int(SS.smooth_polyorder),
-                        help="Must be less than the window size.",
-                    ))
-
-        # All (file, channel) combos available across loaded files.
-        _combos = [
-            (fi, ci, frec["filename"], frec["df"], ch)
-            for fi, frec in enumerate(SS.amp_files)
-            for ci, ch in enumerate(frec["channels"])
-        ]
-        _all_ch_names = [_amp_label(fn, ch["name"], _multi_file) for _, _, fn, _, ch in _combos]
-        _vis_key = "ts_vis_ms"
-        # Reset multiselect state if channels have changed since last config apply
-        if _vis_key not in SS or any(c not in _all_ch_names for c in SS.get(_vis_key, [])):
-            SS[_vis_key] = _all_ch_names[:]
-
-        # Solo / isolate row (only useful with 2+ combos)
-        if len(_combos) >= 2:
-            _iso_cols = st.columns([1.4] + [1] * len(_combos))
-            _iso_cols[0].markdown("**Isolate:**", help="Click a name to show only that trace")
-            for _j, _lbl in enumerate(_all_ch_names):
-                if _iso_cols[_j + 1].button(
-                    _lbl, key=f"ts_solo_{_j}",
-                    use_container_width=True,
-                    help=f"Show only {_lbl}",
-                ):
-                    SS[_vis_key] = [_lbl]
-
-        sel = st.multiselect(
-            "Visible channels",
-            _all_ch_names,
-            key=_vis_key,
-        )
-        SS.ts_visible = sel
-
-        with st.expander("Y-axis range", expanded=False):
-            _y_auto = st.checkbox("Auto-scale", value=SS.ts_y_auto, key="ts_y_auto_cb")
-            SS.ts_y_auto = _y_auto
-            if not _y_auto:
-                _ts_all_y: list[float] = []
-                for _fi2, _ci2, _fn2, _df2, _ch2 in _combos:
-                    _lbl2 = _amp_label(_fn2, _ch2["name"], _multi_file)
-                    if _lbl2 not in sel:
-                        continue
-                    _yr2 = to_num(_df2[_ch2["ic"]]).to_numpy(dtype=float, na_value=np.nan)
-                    _ts_all_y.extend(_yr2[np.isfinite(_yr2)].tolist())
-                _dr_lo = float(np.nanmin(_ts_all_y)) if _ts_all_y else 0.0
-                _dr_hi = float(np.nanmax(_ts_all_y)) if _ts_all_y else 1.0
-                _def_min = SS.ts_y_min if SS.ts_y_min is not None else _dr_lo
-                _def_max = SS.ts_y_max if SS.ts_y_max is not None else _dr_hi
-                _yc1, _yc2 = st.columns(2)
-                _range_help = f"Full visible-channel range: {_dr_lo:.4g} – {_dr_hi:.4g}"
-                SS.ts_y_min = float(_yc1.number_input(
-                    "Y min", value=float(_def_min), format="%.6g", step=0.0001,
-                    key="ts_y_min_ni", help=_range_help,
-                ))
-                SS.ts_y_max = float(_yc2.number_input(
-                    "Y max", value=float(_def_max), format="%.6g", step=0.0001,
-                    key="ts_y_max_ni", help=_range_help,
-                ))
-
-        fig_ts = go.Figure()
-        for fi, ci, fn, df, ch in _combos:
-            lbl = _amp_label(fn, ch["name"], _multi_file)
-            if lbl not in sel:
-                continue
-            _t = to_num(df[ch["tc"]])
-            _i_raw = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
-            _i_smooth = smooth_signal(_i_raw, SS.smooth_method, SS.smooth_window, SS.smooth_polyorder)
-            _col = PAL[(fi if _multi_file else ci) % len(PAL)]
-            _dash = _DASHES[ci % len(_DASHES)] if _multi_file else "solid"
-            if SS.smooth_method != "None":
-                fig_ts.add_trace(go.Scatter(
-                    x=_t, y=_i_raw,
-                    name=f"{lbl} (raw)",
-                    mode="lines",
-                    opacity=0.35,
-                    line=dict(color=_col, width=1, dash=_dash),
-                    showlegend=False,
-                ))
-            fig_ts.add_trace(go.Scatter(
-                x=_t,
-                y=_i_smooth,
-                name=lbl,
-                mode="lines",
-                line=dict(color=_col, width=1.5, dash=_dash),
-            ))
-
-        _pt_ts = _plot_theme()
-        for _frec_sh in SS.amp_files:
-            for _, row in _frec_sh.get("cpdf", pd.DataFrame()).iterrows():
-                _ets2 = _eff_t_start(row)
-                if _ets2 is not None and pd.notna(row.get("t_end")):
-                    clr = ("rgba(255,165,0,0.22)"
-                           if row.get("Baseline") else "rgba(100,160,255,0.15)")
-                    _lbl_sh = (f"{_frec_sh['filename']}: {row['Label']}"
-                               if _multi_file else str(row["Label"]))
-                    fig_ts.add_vrect(
-                        x0=_ets2, x1=row["t_end"],
-                        fillcolor=clr, layer="below", line_width=0,
-                        annotation_text=_lbl_sh,
-                        annotation_position="top left",
-                        annotation=dict(font_size=10, font_color=_pt_ts["annot_font"]),
-                    )
-
-        fig_ts.update_layout(
-            xaxis_title="Time (s)",
-            yaxis_title=f"Current ({SS.cur_unit})",
-            hovermode="x unified",
-            height=580,
-            template=_pt_ts["template"],
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            showlegend=True,
-            legend=dict(
-                orientation="v", x=1.01, y=1,
-                xanchor="left", yanchor="top",
-                bgcolor="rgba(0,0,0,0)",
-            ),
-            hoverdistance=40,
-            xaxis=dict(
-                rangeslider=dict(visible=True, thickness=0.05,
-                                 bgcolor="rgba(255,255,255,0.05)"),
-                showspikes=True, spikemode="across", spikesnap="cursor",
-                spikecolor=_pt_ts["spike"], spikethickness=1, spikedash="dot",
-                showgrid=True, gridcolor=_pt_ts["grid"],
-                linecolor=_pt_ts["axisline"],
-            ),
-            yaxis=dict(
-                showspikes=True, spikemode="across",
-                spikecolor=_pt_ts["spike"], spikethickness=1, spikedash="dot",
-                showgrid=True, gridcolor=_pt_ts["grid"],
-                linecolor=_pt_ts["axisline"],
-                fixedrange=False,
-                **({"range": [SS.ts_y_min, SS.ts_y_max]}
-                   if not SS.ts_y_auto and SS.ts_y_min is not None and SS.ts_y_max is not None
-                   else {}),
-            ),
-        )
-        st.plotly_chart(fig_ts, use_container_width=True,
-                        config={"scrollZoom": True, "displayModeBar": True,
-                                "modeBarButtonsToRemove": ["select2d", "lasso2d"]})
-        SS.ts_fig = fig_ts
-
-        dl1, dl2 = st.columns(2)
-        dl1.download_button(
-            "Download as interactive HTML",
-            data=fig_ts.to_html(include_plotlyjs="cdn"),
-            file_name="time_series.html",
-            mime="text/html",
-        )
-        ts_png = render_ts_png(SS.amp_files, SS.cur_unit, sel,
-                               smooth_method=SS.smooth_method,
-                               smooth_window=SS.smooth_window,
-                               smooth_polyorder=SS.smooth_polyorder)
-        dl2.download_button(
-            "Download as PNG",
-            data=ts_png,
-            file_name="time_series.png",
-            mime="image/png",
-        )
+    _render_timeseries_tab(files_key="amp_files", unit_key="cur_unit", signal_axis_label="Current")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3325,103 +4264,6 @@ with T3:
             )
         _active_fi   = _file_names_cal.index(SS["cal_active_file"])
         _active_frec = SS.amp_files[_active_fi]
-
-        # ── Calibration-point editor ──────────────────────────────────────
-        st.subheader(
-            "Calibration Points"
-            + (f" — {_active_frec['filename']}" if len(_file_names_cal) > 1 else "")
-        )
-        st.caption(
-            "Add one row per concentration step. "
-            "**t start / t end** define the averaging window — read these off the "
-            "time-series chart. "
-            "Check **Baseline?** on the blank or buffer row; its average current "
-            "is subtracted from all other steps. "
-            "**Spike Vol / Stock Conc** are optional — fill them in to use the "
-            "effective concentration calculator below instead of typing "
-            "Concentration by hand. "
-            + ("Each imported file keeps its own table, so switch **Dataset** "
-               "above to edit another one." if len(_file_names_cal) > 1 else "")
-        )
-        if "cal_editor_version" not in SS:
-            SS.cal_editor_version = 0
-        _cpdf_edit = st.data_editor(
-            _active_frec["cpdf"],
-            key=f"cal_editor_{_active_fi}_{SS.cal_editor_version}",
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Label":         st.column_config.TextColumn(
-                    "Label",
-                    help="Short name shown on the plot, e.g. 'Blank', '0.5 mM'",
-                ),
-                "Concentration": st.column_config.NumberColumn(
-                    f"Concentration ({SS.conc_unit})",
-                    format="%.5g",
-                    help="Analyte concentration for this step",
-                ),
-                "Spike Vol": st.column_config.NumberColumn(
-                    f"Spike Vol ({SS.vol_unit})",
-                    format="%.5g",
-                    help="Optional: volume of stock solution spiked in at this step. "
-                         "Used by the effective concentration calculator below.",
-                ),
-                "Stock Conc": st.column_config.NumberColumn(
-                    f"Stock Conc ({SS.conc_unit})",
-                    format="%.5g",
-                    help="Optional: concentration of the stock solution used for this step's spike.",
-                ),
-                "t_start": st.column_config.NumberColumn(
-                    "t start (s)",
-                    help="Start of the averaging window (seconds)",
-                ),
-                "t_end": st.column_config.NumberColumn(
-                    "t end (s)",
-                    help="End of the averaging window (seconds)",
-                ),
-                "avg_duration": st.column_config.NumberColumn(
-                    "Avg window (s)",
-                    format="%.4g",
-                    help="If set, t start = t end − this value (overrides t start)",
-                ),
-                "Baseline": st.column_config.CheckboxColumn(
-                    "Baseline?",
-                    help="Tick for the blank / buffer step. Its current is subtracted from all other steps.",
-                ),
-            },
-        )
-        # Persist every edit immediately so any other code running later in
-        # this same pass (dataset switches, Compute Calibration, session
-        # export) always sees the latest typed values, not a stale copy.
-        _active_frec["cpdf"] = _cpdf_edit
-
-        with st.expander("Effective concentration calculator (serial dilution)"):
-            st.caption(
-                "Models a single vessel that starts at **Initial Volume** of blank "
-                "buffer. Each row's **Spike Vol** of **Stock Conc** analyte is added "
-                "in sequence (top to bottom); computing the calibration below "
-                "automatically applies this to the **Concentration** column. "
-                "**t start** is filled in from **Avg window (s)** at the same time, "
-                "for any row where that column is set. Blank Spike Vol / Stock Conc "
-                "cells are treated as 0. Use the button below to preview the result "
-                "here without running the full calibration yet."
-            )
-            v1, v2 = st.columns(2)
-            SS.initial_volume = v1.number_input(
-                "Initial volume", min_value=0.0, value=float(SS.initial_volume),
-                format="%.5g",
-                help="Volume of buffer/blank in the vessel before any spikes are added.",
-            )
-            SS.vol_unit = v2.text_input(
-                "Volume unit", SS.vol_unit, help="e.g. mL, µL, L",
-            )
-            if st.button("Preview: update Concentration & t start"):
-                _active_frec["cpdf"] = _apply_effective_concentration(_cpdf_edit, SS.initial_volume)
-                SS.cal_editor_version += 1
-                st.success("Concentration / t start updated above.")
-                st.rerun()
-
-        st.divider()
 
         # ── Analysis settings ─────────────────────────────────────────────
         st.subheader("Analysis Settings")
@@ -3477,129 +4319,274 @@ with T3:
             if len(analyze_chs) >= 2 else False
         )
 
-        def _do_compute_calibration() -> bool:
-            """Runs the full per-channel calibration compute, each channel
-            pulling its OWN dataset's current calibration table. Returns
-            True iff at least one channel produced results."""
-            results = {}
-            for ch_name in analyze_chs:
-                frec, ch = _cal_combo_lookup[ch_name]
-                cpdf = (frec["cpdf"]
-                        .dropna(subset=["t_end"])
-                        .reset_index(drop=True))
-                if cpdf.empty:
-                    st.error(f"**{ch_name}**: no valid calibration rows — fill in "
-                             f"{frec['filename']}'s table above.")
-                    continue
+        with st.expander("Quick-fill: common calibration protocols"):
+            _preset_name = st.selectbox(
+                "Preset", list(_AMP_PRESETS.keys()), key="amp_cal_preset_choice",
+            )
+            _preset = _AMP_PRESETS[_preset_name]
+            p1, p2 = st.columns(2)
+            _preset_start = p1.number_input(
+                "Start time (s)", min_value=0.0, value=float(_preset["start"]),
+                format="%.5g", key="amp_preset_start",
+                help="When the first spike's averaging window begins.",
+            )
+            _preset_interval = p2.number_input(
+                "Interval (s)", min_value=0.001, value=float(_preset["interval"]),
+                format="%.5g", key="amp_preset_interval",
+                help="Duration held at each step before the next spike.",
+            )
+            _preset_incr_str = st.text_input(
+                f"Concentration increments ({SS.conc_unit}), comma-separated — cumulative "
+                "(each spike adds to the running total). Add more to extend the series.",
+                value=", ".join(str(v) for v in _preset["increments"]),
+                key="amp_preset_increments",
+            )
+            _preset_include_blank = st.checkbox(
+                "Include Blank/baseline row (0 → start time)", value=True,
+                key="amp_preset_include_blank",
+            )
+            if st.button("Apply preset — replaces the table below", key="apply_amp_preset"):
+                try:
+                    _increments = [float(v.strip()) for v in _preset_incr_str.split(",") if v.strip()]
+                    if not _increments:
+                        raise ValueError("empty")
+                except ValueError:
+                    st.error("Couldn't parse the increments — use comma-separated numbers, "
+                             "e.g. 25, 25, 50, 50, 100, 100, 100, 100.")
+                else:
+                    _active_frec["cpdf"] = _preset_cpdf_amp(
+                        _increments, _preset_start, _preset_interval, _preset_include_blank)
+                    SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+                    st.success(f"Preset applied — {len(_increments) + int(_preset_include_blank)} "
+                               "rows. Edit any cell below, or add more rows with the grid's ➕ button.")
+                    st.rerun()
 
-                base_rows = cpdf[cpdf["Baseline"].apply(lambda b: bool(b) if pd.notna(b) else False)]
-                base_idx  = int(base_rows.index[0]) if len(base_rows) else 0
-                if len(base_rows) == 0:
-                    st.warning(f"**{ch_name}**: no baseline row marked in "
-                               f"{frec['filename']} — using the first row as baseline.")
+        # ── Calibration-point editor ──────────────────────────────────────
+        st.subheader(
+            "Calibration Points"
+            + (f" — {_active_frec['filename']}" if len(_file_names_cal) > 1 else "")
+        )
+        st.caption(
+            "Add one row per concentration step. "
+            "**t start / t end** define the averaging window — read these off the "
+            "time-series chart. "
+            "Check **Baseline?** on the blank or buffer row; its average current "
+            "is subtracted from all other steps. "
+            "**Spike Vol / Stock Conc** are optional — fill them in to use the "
+            "effective concentration calculator below instead of typing "
+            "Concentration by hand. "
+            + ("Each imported file keeps its own table, so switch **Dataset** "
+               "above to edit another one." if len(_file_names_cal) > 1 else "")
+        )
+        if "cal_editor_version" not in SS:
+            SS.cal_editor_version = 0
+        with st.form(key=f"amp_cal_form_{_active_fi}"):
+            _cpdf_edit = st.data_editor(
+                _active_frec["cpdf"],
+                key=f"cal_editor_{_active_fi}_{SS.cal_editor_version}",
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "Label":         st.column_config.TextColumn(
+                        "Label",
+                        help="Short name shown on the plot, e.g. 'Blank', '0.5 mM'",
+                    ),
+                    "Concentration": st.column_config.NumberColumn(
+                        f"Concentration ({SS.conc_unit})",
+                        format="%.5g",
+                        help="Analyte concentration for this step",
+                    ),
+                    "Spike Vol": st.column_config.NumberColumn(
+                        f"Spike Vol ({SS.vol_unit})",
+                        format="%.5g",
+                        help="Optional: volume of stock solution spiked in at this step. "
+                             "Used by the effective concentration calculator below.",
+                    ),
+                    "Stock Conc": st.column_config.NumberColumn(
+                        f"Stock Conc ({SS.conc_unit})",
+                        format="%.5g",
+                        help="Optional: concentration of the stock solution used for this step's spike.",
+                    ),
+                    "t_start": st.column_config.NumberColumn(
+                        "t start (s)",
+                        help="Start of the averaging window (seconds)",
+                    ),
+                    "t_end": st.column_config.NumberColumn(
+                        "t end (s)",
+                        help="End of the averaging window (seconds)",
+                    ),
+                    "avg_duration": st.column_config.NumberColumn(
+                        "Avg window (s)",
+                        format="%.4g",
+                        help="If set, t start = t end − this value (overrides t start)",
+                    ),
+                    "Baseline": st.column_config.CheckboxColumn(
+                        "Baseline?",
+                        help="Tick for the blank / buffer step. Its current is subtracted from all other steps.",
+                    ),
+                },
+            )
+            # Persist every edit immediately so any other code running later in
+            # this same pass (dataset switches, Compute Calibration, session
+            # export) always sees the latest typed values, not a stale copy.
+            _active_frec["cpdf"] = _cpdf_edit
 
-                df = frec["df"]
-                t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
-                i_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
-                i_arr = smooth_signal(i_arr, SS.smooth_method, SS.smooth_window, SS.smooth_polyorder)
+            with st.expander("Effective concentration calculator (serial dilution)"):
+                st.caption(
+                    "Models a single vessel that starts at **Initial Volume** of blank "
+                    "buffer. Each row's **Spike Vol** of **Stock Conc** analyte is added "
+                    "in sequence (top to bottom); computing the calibration below "
+                    "automatically applies this to the **Concentration** column. "
+                    "**t start** is filled in from **Avg window (s)** at the same time, "
+                    "for any row where that column is set. Blank Spike Vol / Stock Conc "
+                    "cells are treated as 0. Use the button below to preview the result "
+                    "here without running the full calibration yet."
+                )
+                v1, v2 = st.columns(2)
+                SS.initial_volume = v1.number_input(
+                    "Initial volume", min_value=0.0, value=float(SS.initial_volume),
+                    format="%.5g",
+                    help="Volume of buffer/blank in the vessel before any spikes are added.",
+                )
+                SS.vol_unit = v2.text_input(
+                    "Volume unit", SS.vol_unit, help="e.g. mL, µL, L",
+                )
+                if st.form_submit_button("Preview: update Concentration & t start"):
+                    _active_frec["cpdf"] = _apply_effective_concentration(_cpdf_edit, SS.initial_volume)
+                    SS.cal_editor_version += 1
+                    st.success("Concentration / t start updated above.")
+                    st.rerun()
 
-                avgs, sigs, n_pts, t_starts_used = [], [], [], []
-                for _, row in cpdf.iterrows():
-                    _ets = _eff_t_start(row)
-                    t_starts_used.append(_ets)
-                    if _ets is None:
-                        avgs.append(np.nan)
-                        sigs.append(np.nan)
-                        n_pts.append(0)
+            st.divider()
+
+            def _do_compute_calibration() -> bool:
+                """Runs the full per-channel calibration compute, each channel
+                pulling its OWN dataset's current calibration table. Returns
+                True iff at least one channel produced results."""
+                results = {}
+                for ch_name in analyze_chs:
+                    frec, ch = _cal_combo_lookup[ch_name]
+                    cpdf = (frec["cpdf"]
+                            .dropna(subset=["t_end"])
+                            .reset_index(drop=True))
+                    if cpdf.empty:
+                        st.error(f"**{ch_name}**: no valid calibration rows — fill in "
+                                 f"{frec['filename']}'s table above.")
                         continue
-                    mask = (t_arr >= _ets) & (t_arr <= row["t_end"])
-                    pts  = i_arr[mask]
-                    pts  = pts[~np.isnan(pts)]
-                    n_pts.append(int(pts.size))
-                    avgs.append(float(np.mean(pts)) if pts.size > 0  else np.nan)
-                    # ddof=1 (sample SD); NaN when < 2 points — avoids false σ=0
-                    sigs.append(float(np.std(pts, ddof=1)) if pts.size >= 2 else np.nan)
 
-                # Warn about windows with insufficient data
-                _win_issues = []
-                for _wlbl, _wavg, _wsig in zip(cpdf["Label"], avgs, sigs):
-                    if np.isnan(_wavg):
-                        _win_issues.append(f"**{_wlbl}**: no data points in window")
-                    elif np.isnan(_wsig):
-                        _win_issues.append(f"**{_wlbl}**: only 1 point — σ undefined")
-                if _win_issues:
-                    st.warning(f"{ch_name} — " + "; ".join(_win_issues)
-                               + ". Adjust t start / t end.")
+                    base_rows = cpdf[cpdf["Baseline"].apply(lambda b: bool(b) if pd.notna(b) else False)]
+                    base_idx  = int(base_rows.index[0]) if len(base_rows) else 0
+                    if len(base_rows) == 0:
+                        st.warning(f"**{ch_name}**: no baseline row marked in "
+                                   f"{frec['filename']} — using the first row as baseline.")
 
-                base_val = avgs[base_idx]
-                sigma_bl = sigs[base_idx]  # NaN if baseline window has < 2 points
-                if np.isnan(base_val):
-                    _bl_lbl = cpdf.at[base_idx, 'Label']
-                    st.error(
-                        f"**{ch_name}**: baseline window (row '{_bl_lbl}') has no data"
-                        " points — ΔI cannot be computed. "
-                        "Adjust the baseline t start / t end to overlap the signal data."
+                    df = frec["df"]
+                    t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
+                    i_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+                    i_arr = smooth_signal(i_arr, SS.smooth_method, SS.smooth_window, SS.smooth_polyorder)
+
+                    avgs, sigs, n_pts, t_starts_used = [], [], [], []
+                    for _, row in cpdf.iterrows():
+                        _ets = _eff_t_start(row)
+                        t_starts_used.append(_ets)
+                        if _ets is None:
+                            avgs.append(np.nan)
+                            sigs.append(np.nan)
+                            n_pts.append(0)
+                            continue
+                        mask = (t_arr >= _ets) & (t_arr <= row["t_end"])
+                        pts  = i_arr[mask]
+                        pts  = pts[~np.isnan(pts)]
+                        n_pts.append(int(pts.size))
+                        avgs.append(float(np.mean(pts)) if pts.size > 0  else np.nan)
+                        # ddof=1 (sample SD); NaN when < 2 points — avoids false σ=0
+                        sigs.append(float(np.std(pts, ddof=1)) if pts.size >= 2 else np.nan)
+
+                    # Warn about windows with insufficient data
+                    _win_issues = []
+                    for _wlbl, _wavg, _wsig in zip(cpdf["Label"], avgs, sigs):
+                        if np.isnan(_wavg):
+                            _win_issues.append(f"**{_wlbl}**: no data points in window")
+                        elif np.isnan(_wsig):
+                            _win_issues.append(f"**{_wlbl}**: only 1 point — σ undefined")
+                    if _win_issues:
+                        st.warning(f"{ch_name} — " + "; ".join(_win_issues)
+                                   + ". Adjust t start / t end.")
+
+                    base_val = avgs[base_idx]
+                    sigma_bl = sigs[base_idx]  # NaN if baseline window has < 2 points
+                    if np.isnan(base_val):
+                        _bl_lbl = cpdf.at[base_idx, 'Label']
+                        st.error(
+                            f"**{ch_name}**: baseline window (row '{_bl_lbl}') has no data"
+                            " points — ΔI cannot be computed. "
+                            "Adjust the baseline t start / t end to overlap the signal data."
+                        )
+                        continue
+                    delta_i  = [
+                        (v - base_val) if not np.isnan(v) else np.nan
+                        for v in avgs
+                    ]
+
+                    results[ch_name] = dict(
+                        concs          = cpdf["Concentration"].values.astype(float),
+                        labels         = cpdf["Label"].values,
+                        avgs           = avgs,
+                        sigs           = sigs,
+                        delta_i        = delta_i,
+                        sigma_bl       = float(sigma_bl),   # NaN propagates → LOD/LOQ show "—"
+                        is_average     = False,
+                        n_pts          = n_pts,
+                        t_starts_used  = t_starts_used,
+                        t_ends         = cpdf["t_end"].tolist(),
+                        baselines      = cpdf["Baseline"].tolist(),
                     )
-                    continue
-                delta_i  = [
-                    (v - base_val) if not np.isnan(v) else np.nan
-                    for v in avgs
-                ]
 
-                results[ch_name] = dict(
-                    concs          = cpdf["Concentration"].values.astype(float),
-                    labels         = cpdf["Label"].values,
-                    avgs           = avgs,
-                    sigs           = sigs,
-                    delta_i        = delta_i,
-                    sigma_bl       = float(sigma_bl),   # NaN propagates → LOD/LOQ show "—"
-                    is_average     = False,
-                    n_pts          = n_pts,
-                    t_starts_used  = t_starts_used,
-                    t_ends         = cpdf["t_end"].tolist(),
-                    baselines      = cpdf["Baseline"].tolist(),
-                )
+                # ── Channel average ───────────────────────────────────────────
+                _avg_chs = [c for c in analyze_chs if c in results]
+                if show_avg and len(_avg_chs) >= 2:
+                    all_di    = np.array([results[c]["delta_i"] for c in _avg_chs],
+                                         dtype=float)
+                    all_avgs  = np.array([results[c]["avgs"]    for c in _avg_chs],
+                                         dtype=float)
+                    all_sigma = [results[c]["sigma_bl"] for c in _avg_chs]
+                    n_ch      = len(_avg_chs)
 
-            # ── Channel average ───────────────────────────────────────────
-            _avg_chs = [c for c in analyze_chs if c in results]
-            if show_avg and len(_avg_chs) >= 2:
-                all_di    = np.array([results[c]["delta_i"] for c in _avg_chs],
-                                     dtype=float)
-                all_avgs  = np.array([results[c]["avgs"]    for c in _avg_chs],
-                                     dtype=float)
-                all_sigma = [results[c]["sigma_bl"] for c in _avg_chs]
-                n_ch      = len(_avg_chs)
+                    avg_delta_i   = np.nanmean(all_di, axis=0)
+                    std_across_ch = np.nanstd(all_di, axis=0, ddof=1)  # inter-channel spread (sample std)
+                    avg_avgs      = np.nanmean(all_avgs, axis=0)
+                    # propagated blank noise: sqrt(Σσi²) / n_ch (all channels, not just those with finite σ)
+                    _valid_s = [s for s in all_sigma if np.isfinite(s)]
+                    sigma_bl_avg = (np.sqrt(sum(s**2 for s in _valid_s)) / n_ch
+                                    if _valid_s else np.nan)
 
-                avg_delta_i   = np.nanmean(all_di, axis=0)
-                std_across_ch = np.nanstd(all_di, axis=0, ddof=1)  # inter-channel spread (sample std)
-                avg_avgs      = np.nanmean(all_avgs, axis=0)
-                # propagated blank noise: sqrt(Σσi²) / n_ch (all channels, not just those with finite σ)
-                _valid_s = [s for s in all_sigma if np.isfinite(s)]
-                sigma_bl_avg = (np.sqrt(sum(s**2 for s in _valid_s)) / n_ch
-                                if _valid_s else np.nan)
+                    results["Channel Average"] = dict(
+                        concs      = results[_avg_chs[0]]["concs"],
+                        labels     = results[_avg_chs[0]]["labels"],
+                        avgs       = avg_avgs.tolist(),
+                        sigs       = std_across_ch.tolist(),
+                        delta_i    = avg_delta_i.tolist(),
+                        sigma_bl   = float(sigma_bl_avg),
+                        is_average = True,
+                        baselines  = results[_avg_chs[0]]["baselines"],
+                    )
 
-                results["Channel Average"] = dict(
-                    concs      = results[_avg_chs[0]]["concs"],
-                    labels     = results[_avg_chs[0]]["labels"],
-                    avgs       = avg_avgs.tolist(),
-                    sigs       = std_across_ch.tolist(),
-                    delta_i    = avg_delta_i.tolist(),
-                    sigma_bl   = float(sigma_bl_avg),
-                    is_average = True,
-                    baselines  = results[_avg_chs[0]]["baselines"],
-                )
+                if not results:
+                    SS.cal_results = None
+                    return False
+                SS.cal_results = dict(results=results, fit_type=fit_type, n_seg=n_seg)
+                return True
 
-            if not results:
-                SS.cal_results = None
-                return False
-            SS.cal_results = dict(results=results, fit_type=fit_type, n_seg=n_seg)
-            return True
+            # A single, robust action: type values into the table above, click
+            # this once, and everything downstream — effective-concentration
+            # derivation, the active dataset's table display, and the
+            # calibration curve/statistics below — updates together. Wrapping
+            # the editor and this button in one st.form means the button's
+            # rerun reads each widget's live value at submit time, instead of
+            # depending on a separate blur event racing the click.
+            compute_clicked = st.form_submit_button("Compute Calibration", type="primary")
 
-        # A single, robust action: type values into the table above, click
-        # this once, and everything downstream — effective-concentration
-        # derivation, the active dataset's table display, and the
-        # calibration curve/statistics below — updates together.
-        if st.button("Compute Calibration", type="primary"):
+        if compute_clicked:
             if not analyze_chs:
                 st.error("Select at least one channel to analyse above.")
             else:
@@ -3787,6 +4774,8 @@ with T3:
                     use_container_width=True,
                     hide_index=True,
                 )
+
+                _render_ai_insights_section(res_map, ft, key_prefix="amp")
 
             dl1, dl2 = st.columns(2)
             dl1.download_button(

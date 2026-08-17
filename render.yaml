@@ -1,0 +1,53 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Everything on Render for now: frontend, backend, AND database (no
+# external signups required to get a working deploy). The tradeoff: this
+# free Postgres gets deleted after 30 days unless upgraded to a paid plan.
+# Swapping to a non-expiring free database (e.g. Neon) later is a one-line
+# change — just point DATABASE_URL at a different connection string and
+# remove the `databases:` block below; nothing else in the app cares which
+# Postgres it's talking to.
+databases:
+  - name: sensor-analysis-db
+    plan: free
+    postgresMajorVersion: "16"
+
+services:
+  # Backend API — Docker web service, built from backend/Dockerfile.
+  - type: web
+    name: sensor-analysis-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sensor-analysis-db
+          property: connectionString
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false   # set to the frontend's *.onrender.com URL once it exists (step 3 in DEPLOYMENT.md)
+      - key: INITIAL_ADMIN_EMAIL
+        sync: false   # your email — creates your admin account automatically on first boot, no terminal needed
+      - key: INITIAL_ADMIN_NAME
+        sync: false   # your name (optional, defaults to "Admin")
+
+  # Frontend — static site (Vite build), served from Render's CDN.
+  - type: web
+    name: sensor-analysis-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE
+        sync: false   # set to the backend service's *.onrender.com URL (see above)
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html   # client-side routing (React Router) on hard refresh/deep link
