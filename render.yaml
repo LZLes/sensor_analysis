@@ -1,7 +1,16 @@
 # Render Blueprint — https://render.com/docs/blueprint-spec
-# Both frontend and backend on Render (no credit card required for either),
-# database on Neon (free, no expiry — see DEPLOYMENT.md for why not Render's
-# own free Postgres, which expires after 30 days).
+# Everything on Render for now: frontend, backend, AND database (no
+# external signups required to get a working deploy). The tradeoff: this
+# free Postgres gets deleted after 30 days unless upgraded to a paid plan.
+# Swapping to a non-expiring free database (e.g. Neon) later is a one-line
+# change — just point DATABASE_URL at a different connection string and
+# remove the `databases:` block below; nothing else in the app cares which
+# Postgres it's talking to.
+databases:
+  - name: sensor-analysis-db
+    plan: free
+    postgresMajorVersion: "16"
+
 services:
   # Backend API — Docker web service, built from backend/Dockerfile.
   - type: web
@@ -12,7 +21,9 @@ services:
     plan: free
     envVars:
       - key: DATABASE_URL
-        sync: false   # paste your Neon connection string in the Render dashboard
+        fromDatabase:
+          name: sensor-analysis-db
+          property: connectionString
       - key: SESSION_SECRET
         generateValue: true
       - key: GOOGLE_OAUTH_CLIENT_ID
