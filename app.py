@@ -1306,6 +1306,74 @@ def _seed_solid_cpdf_for_new_file() -> pd.DataFrame:
     return _default_solid_cpdf()
 
 
+# Quick-fill presets for common calibration protocols. Each maps to a
+# generator below; "increments" (Amperometry) are cumulative mM added at
+# each step (serial spike), "values" (Solid-State) are the absolute
+# concentration at each standard — the two modes' tables mean different
+# things by "Concentration" (ΔI-vs-conc addition series vs. Nernstian
+# standards), so the presets aren't interchangeable.
+_AMP_PRESETS = {
+    "Serial spike: 25 mM ×2, 50 mM ×2, 100 mM ×4": {
+        "increments": [25, 25, 50, 50, 100, 100, 100, 100],
+        "start": 600.0,
+        "interval": 300.0,
+    },
+}
+_SOLID_PRESETS = {
+    "Serial standards: 10, 25, 50, 100": {
+        "values": [10, 25, 50, 100],
+        "start": 600.0,
+        "interval": 600.0,
+    },
+}
+
+
+def _preset_cpdf_amp(increments: list[float], start: float, interval: float,
+                      include_blank: bool) -> pd.DataFrame:
+    """Builds an Amperometry calibration table from a serial-spike protocol:
+    cumulative concentration steps of fixed duration (`interval`), the
+    first starting at `start`, optionally preceded by a Blank/baseline
+    row spanning 0 → start."""
+    labels, concs, t_starts, t_ends, baselines = [], [], [], [], []
+    if include_blank:
+        labels.append("Blank"); concs.append(0.0)
+        t_starts.append(0.0); t_ends.append(start); baselines.append(True)
+    cum, t = 0.0, start
+    for i, inc in enumerate(increments, start=1):
+        cum += inc
+        labels.append(f"Step {i}"); concs.append(cum)
+        t_starts.append(t); t_ends.append(t + interval); baselines.append(False)
+        t += interval
+    n = len(labels)
+    return pd.DataFrame({
+        "Label":         labels,
+        "Concentration": concs,
+        "Spike Vol":     [np.nan] * n,
+        "Stock Conc":    [np.nan] * n,
+        "t_start":       t_starts,
+        "t_end":         t_ends,
+        "avg_duration":  [np.nan] * n,
+        "Baseline":      baselines,
+    })
+
+
+def _preset_cpdf_solid(values: list[float], start: float, interval: float) -> pd.DataFrame:
+    """Builds a Solid-State calibration table from a series of absolute
+    standard concentrations, each held for `interval` seconds, the first
+    starting at `start`."""
+    n = len(values)
+    t_starts = [start + i * interval for i in range(n)]
+    t_ends   = [t + interval for t in t_starts]
+    return pd.DataFrame({
+        "Label":         [f"Std {i}" for i in range(1, n + 1)],
+        "Concentration": list(values),
+        "t_start":       t_starts,
+        "t_end":         t_ends,
+        "avg_duration":  [np.nan] * n,
+        "Reading_mV":    [np.nan] * n,
+    })
+
+
 _SAMPLE_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_data")
 
 # Ground truth used to generate sample_data/*.csv — see the calibration
@@ -3759,6 +3827,44 @@ if SS.mode == "Solid-State":
                      "dataset's calibration table above.",
             )
 
+            with st.expander("Quick-fill: common calibration protocols"):
+                _preset_name_s = st.selectbox(
+                    "Preset", list(_SOLID_PRESETS.keys()), key="solid_cal_preset_choice",
+                )
+                _preset_s = _SOLID_PRESETS[_preset_name_s]
+                ps1, ps2 = st.columns(2)
+                _preset_start_s = ps1.number_input(
+                    "Start time (s)", min_value=0.0, value=float(_preset_s["start"]),
+                    format="%.5g", key="solid_preset_start",
+                    help="When the first standard's averaging window begins.",
+                )
+                _preset_interval_s = ps2.number_input(
+                    "Interval (s)", min_value=0.001, value=float(_preset_s["interval"]),
+                    format="%.5g", key="solid_preset_interval",
+                    help="Duration held at each standard before moving to the next.",
+                )
+                _preset_values_str_s = st.text_input(
+                    f"Concentration values ({SS.conc_unit}), comma-separated — absolute, "
+                    "one per standard. Add more to extend the series.",
+                    value=", ".join(str(v) for v in _preset_s["values"]),
+                    key="solid_preset_values",
+                )
+                if st.button("Apply preset — replaces the table below", key="apply_solid_preset"):
+                    try:
+                        _values_s = [float(v.strip()) for v in _preset_values_str_s.split(",") if v.strip()]
+                        if not _values_s:
+                            raise ValueError("empty")
+                    except ValueError:
+                        st.error("Couldn't parse the concentration values — use comma-separated "
+                                 "numbers, e.g. 10, 25, 50, 100.")
+                    else:
+                        _active_frec_s["cpdf"] = _preset_cpdf_solid(
+                            _values_s, _preset_start_s, _preset_interval_s)
+                        SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+                        st.success(f"Preset applied — {len(_values_s)} rows. Edit any cell below, "
+                                   "or add more rows with the grid's ➕ button.")
+                        st.rerun()
+
             st.subheader(
                 "Calibration Points"
                 + (f" — {_active_frec_s['filename']}" if len(_file_names_solid) > 1 else "")
@@ -4212,6 +4318,48 @@ with T3:
             )
             if len(analyze_chs) >= 2 else False
         )
+
+        with st.expander("Quick-fill: common calibration protocols"):
+            _preset_name = st.selectbox(
+                "Preset", list(_AMP_PRESETS.keys()), key="amp_cal_preset_choice",
+            )
+            _preset = _AMP_PRESETS[_preset_name]
+            p1, p2 = st.columns(2)
+            _preset_start = p1.number_input(
+                "Start time (s)", min_value=0.0, value=float(_preset["start"]),
+                format="%.5g", key="amp_preset_start",
+                help="When the first spike's averaging window begins.",
+            )
+            _preset_interval = p2.number_input(
+                "Interval (s)", min_value=0.001, value=float(_preset["interval"]),
+                format="%.5g", key="amp_preset_interval",
+                help="Duration held at each step before the next spike.",
+            )
+            _preset_incr_str = st.text_input(
+                f"Concentration increments ({SS.conc_unit}), comma-separated — cumulative "
+                "(each spike adds to the running total). Add more to extend the series.",
+                value=", ".join(str(v) for v in _preset["increments"]),
+                key="amp_preset_increments",
+            )
+            _preset_include_blank = st.checkbox(
+                "Include Blank/baseline row (0 → start time)", value=True,
+                key="amp_preset_include_blank",
+            )
+            if st.button("Apply preset — replaces the table below", key="apply_amp_preset"):
+                try:
+                    _increments = [float(v.strip()) for v in _preset_incr_str.split(",") if v.strip()]
+                    if not _increments:
+                        raise ValueError("empty")
+                except ValueError:
+                    st.error("Couldn't parse the increments — use comma-separated numbers, "
+                             "e.g. 25, 25, 50, 50, 100, 100, 100, 100.")
+                else:
+                    _active_frec["cpdf"] = _preset_cpdf_amp(
+                        _increments, _preset_start, _preset_interval, _preset_include_blank)
+                    SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+                    st.success(f"Preset applied — {len(_increments) + int(_preset_include_blank)} "
+                               "rows. Edit any cell below, or add more rows with the grid's ➕ button.")
+                    st.rerun()
 
         # ── Calibration-point editor ──────────────────────────────────────
         st.subheader(
