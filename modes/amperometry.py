@@ -293,36 +293,51 @@ def _spike_vol_for_targets(targets: list[float], stock_conc: float,
     return spikes
 
 
-def _preset_cpdf_amp(increments: list[float], start: float, interval: float,
+def _preset_cpdf_amp(increments: list[float], start: float, interval: float | list[float],
                       include_blank: bool, stock_conc: float, initial_volume: float,
                       avg_window: float) -> pd.DataFrame:
     """Builds an Amperometry calibration table from a serial-spike protocol:
-    cumulative concentration steps of fixed duration (`interval`), the
-    first starting at `start`, optionally preceded by a Blank/baseline
-    row spanning 0 → start. Spike Vol is back-solved from stock_conc /
-    initial_volume so it reproduces the same cumulative Concentration via
+    cumulative concentration steps, the first starting at `start`, optionally
+    preceded by a Blank/baseline row spanning 0 → start. `interval` is either
+    a single duration applied to every step, or a list with one duration per
+    step for unevenly-spaced protocols.
+
+    Stock Conc is optional: pass 0 to skip the Spike Vol back-solve entirely
+    and just use `increments` as the Concentration column directly (the
+    common case when you already know your target concentrations and don't
+    need the dilution math). Pass a value greater than every cumulative
+    target to also back-solve Spike Vol from stock_conc / initial_volume so
+    it reproduces the same cumulative Concentration via
     _apply_effective_concentration (clicking Preview afterward is then a
-    no-op). avg_window fills Avg window (s) on every row, so averaging
-    uses the tail of each interval rather than the whole thing."""
+    no-op). avg_window fills Avg window (s) on every row, so averaging uses
+    the tail of each interval rather than the whole thing."""
+    intervals = [float(interval)] * len(increments) if np.isscalar(interval) else list(interval)
+    if len(intervals) != len(increments):
+        raise ValueError(
+            f"interval count ({len(intervals)}) must be 1 (applied to every step) or "
+            f"match the number of increments ({len(increments)})"
+        )
+
     labels, concs, t_starts, t_ends, baselines = [], [], [], [], []
     if include_blank:
         labels.append("Blank"); concs.append(0.0)
         t_starts.append(0.0); t_ends.append(start); baselines.append(True)
     cum, t = 0.0, start
-    for i, inc in enumerate(increments, start=1):
+    for i, (inc, dur) in enumerate(zip(increments, intervals), start=1):
         cum += inc
         labels.append(f"Step {i}"); concs.append(cum)
-        t_starts.append(t); t_ends.append(t + interval); baselines.append(False)
-        t += interval
+        t_starts.append(t); t_ends.append(t + dur); baselines.append(False)
+        t += dur
     n = len(labels)
 
     spike_vols  = [np.nan] * n
     stock_concs = [np.nan] * n
-    _spiked_targets = concs[1:] if include_blank else concs
-    _spikes = _spike_vol_for_targets(_spiked_targets, stock_conc, initial_volume)
-    for i, sv in enumerate(_spikes, start=(1 if include_blank else 0)):
-        spike_vols[i]  = sv
-        stock_concs[i] = stock_conc
+    if stock_conc > 0:
+        _spiked_targets = concs[1:] if include_blank else concs
+        _spikes = _spike_vol_for_targets(_spiked_targets, stock_conc, initial_volume)
+        for i, sv in enumerate(_spikes, start=(1 if include_blank else 0)):
+            spike_vols[i]  = sv
+            stock_concs[i] = stock_conc
 
     return pd.DataFrame({
         "Label":         labels,
@@ -512,10 +527,13 @@ def render() -> None:
                     format="%.5g", key="amp_preset_start",
                     help="When the first spike's averaging window begins.",
                 )
-                _preset_interval = p2.number_input(
-                    "Interval (s)", min_value=0.001, value=float(_preset["interval"]),
-                    format="%.5g", key="amp_preset_interval",
-                    help="Duration held at each step before the next spike.",
+                _preset_interval_str = p2.text_input(
+                    "Interval (s)", value=str(_preset["interval"]),
+                    key="amp_preset_interval",
+                    help="Duration held at each step before the next spike. Enter one "
+                         "number to apply it to every step, or comma-separate a value "
+                         "per step (must match the number of increments below) for "
+                         "unevenly-spaced steps, e.g. 300, 300, 600, 900.",
                 )
                 _preset_avg_window = p3.number_input(
                     "Avg window (s)", min_value=0.001, value=60.0,
@@ -531,17 +549,20 @@ def render() -> None:
                 )
                 p4, p5 = st.columns(2)
                 _preset_stock_conc = p4.number_input(
-                    f"Stock Conc ({SS.conc_unit})", min_value=0.0, value=1000.0,
+                    f"Stock Conc ({SS.conc_unit})", min_value=0.0, value=0.0,
                     format="%.5g", key="amp_preset_stock_conc",
-                    help="Concentration of the stock solution used for every spike — must "
-                         "exceed the largest cumulative target below. Set this to what you "
-                         "actually use; Spike Vol is back-solved from it.",
+                    help="Optional — only needed if you also want Spike Vol back-filled "
+                         "for you. Leave at 0 to skip: the concentration increments above "
+                         "are used directly as the Concentration column. Set this above "
+                         "the largest cumulative target to also back-solve Spike Vol from "
+                         "this stock concentration and Initial Volume.",
                 )
                 _preset_initial_volume = p5.number_input(
                     f"Initial Volume ({SS.vol_unit})", min_value=0.0, value=float(SS.initial_volume),
                     format="%.5g", key="amp_preset_initial_volume",
                     help="Volume of buffer/blank in the vessel before any spikes — same "
-                         "value as Initial volume below; changing it here updates that too.",
+                         "value as Initial volume below; changing it here updates that too. "
+                         "Only used if Stock Conc above is set.",
                 )
                 _preset_include_blank = st.checkbox(
                     "Include Blank/baseline row (0 → start time)", value=True,
@@ -551,18 +572,32 @@ def render() -> None:
                     try:
                         _increments = [float(v.strip()) for v in _preset_incr_str.split(",") if v.strip()]
                         if not _increments:
-                            raise ValueError("empty")
-                    except ValueError:
-                        st.error("Couldn't parse the increments — use comma-separated numbers, "
-                                 "e.g. 25, 25, 50, 50, 100, 100, 100, 100.")
+                            raise ValueError("no concentration increments given")
+                        _interval_parts = [float(v.strip()) for v in _preset_interval_str.split(",") if v.strip()]
+                        if not _interval_parts:
+                            raise ValueError("no interval given")
+                        if len(_interval_parts) == 1:
+                            _intervals = _interval_parts * len(_increments)
+                        elif len(_interval_parts) == len(_increments):
+                            _intervals = _interval_parts
+                        else:
+                            raise ValueError(
+                                f"interval count ({len(_interval_parts)}) must be 1 (applied to "
+                                f"every step) or match the number of increments ({len(_increments)})"
+                            )
+                    except ValueError as e:
+                        st.error(f"Couldn't parse increments/interval — {e}. Use comma-separated "
+                                 "numbers, e.g. 25, 25, 50, 50 for increments and either one "
+                                 "interval for all steps or one per step, e.g. 300, 300, 600, 600.")
                     else:
                         try:
                             _active_frec["cpdf"] = _preset_cpdf_amp(
-                                _increments, _preset_start, _preset_interval, _preset_include_blank,
+                                _increments, _preset_start, _intervals, _preset_include_blank,
                                 _preset_stock_conc, _preset_initial_volume, _preset_avg_window)
                         except ValueError as e:
                             st.error(f"Couldn't back-solve Spike Vol: {e} (largest target here is "
-                                     f"{sum(_increments):.5g} {SS.conc_unit}).")
+                                     f"{sum(_increments):.5g} {SS.conc_unit}). Set Stock Conc to 0 "
+                                     "to skip the back-solve and use the concentrations as-is.")
                         else:
                             SS.initial_volume = _preset_initial_volume
                             SS.amp_files_cal_editor_version = SS.get("amp_files_cal_editor_version", 0) + 1

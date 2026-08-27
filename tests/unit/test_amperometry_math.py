@@ -146,3 +146,35 @@ def test_preset_cpdf_amp_without_blank():
     )
     assert df["Label"].tolist() == ["Step 1"]
     assert df["Baseline"].tolist() == [False]
+
+
+def test_preset_cpdf_amp_zero_stock_conc_skips_backsolve():
+    # Stock Conc of 0 means "don't back-solve Spike Vol" — Concentration
+    # still comes straight from increments, but Spike Vol/Stock Conc stay NaN.
+    df = _preset_cpdf_amp(
+        increments=[1.0, 1.0, 2.0], start=100.0, interval=50.0,
+        include_blank=True, stock_conc=0.0, initial_volume=1.0,
+        avg_window=10.0,
+    )
+    assert df["Concentration"].tolist() == [0.0, 1.0, 2.0, 4.0]
+    assert df["Spike Vol"].isna().all()
+    assert df["Stock Conc"].isna().all()
+
+
+def test_preset_cpdf_amp_per_step_intervals():
+    df = _preset_cpdf_amp(
+        increments=[1.0, 1.0, 2.0], start=100.0, interval=[50.0, 100.0, 25.0],
+        include_blank=False, stock_conc=0.0, initial_volume=1.0,
+        avg_window=10.0,
+    )
+    assert df["t_start"].tolist() == [100.0, 150.0, 250.0]
+    assert df["t_end"].tolist() == [150.0, 250.0, 275.0]
+
+
+def test_preset_cpdf_amp_interval_count_mismatch_raises():
+    with pytest.raises(ValueError):
+        _preset_cpdf_amp(
+            increments=[1.0, 1.0, 2.0], start=100.0, interval=[50.0, 100.0],
+            include_blank=False, stock_conc=0.0, initial_volume=1.0,
+            avg_window=10.0,
+        )
