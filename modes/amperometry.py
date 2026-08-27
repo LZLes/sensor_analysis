@@ -162,23 +162,12 @@ def piecewise_fit(x_in, y_in, n_seg: int) -> dict:
     return {"segments": segs, "breakpoints": breakpoints}
 
 
-def _apply_effective_concentration(cpdf: pd.DataFrame, initial_volume: float) -> pd.DataFrame:
-    """Returns a copy of a calibration table with Concentration derived from
-    cumulative, dilution-corrected Spike Vol / Stock Conc additions (if any
-    are filled in), and t_start derived from avg_duration (if set). A no-op
-    copy when neither is used, so it's safe to call unconditionally."""
+def _apply_avg_window(cpdf: pd.DataFrame) -> pd.DataFrame:
+    """Returns a copy of a calibration table with t_start derived from
+    avg_duration (if set), so averaging uses the tail of each interval
+    rather than the whole thing. A no-op copy when avg_duration isn't used,
+    so it's safe to call unconditionally."""
     _calc_df = cpdf.copy()
-    if _calc_df[["Spike Vol", "Stock Conc"]].notna().any().any():
-        _vol, _mass, _eff = float(initial_volume), 0.0, []
-        for _, _row in _calc_df.iterrows():
-            _sv = _row.get("Spike Vol", 0.0)
-            _sc = _row.get("Stock Conc", 0.0)
-            _sv = 0.0 if pd.isna(_sv) else float(_sv)
-            _sc = 0.0 if pd.isna(_sc) else float(_sc)
-            _vol  += _sv
-            _mass += _sv * _sc
-            _eff.append(_mass / _vol if _vol > 0 else np.nan)
-        _calc_df["Concentration"] = _eff
     for _ti, _trow in _calc_df.iterrows():
         if pd.notna(_trow.get("avg_duration")) and pd.notna(_trow.get("t_end")):
             _calc_df.at[_ti, "t_start"] = _eff_t_start(_trow)
@@ -276,12 +265,12 @@ _AMP_PRESETS = {
 
 def _spike_vol_for_targets(targets: list[float], stock_conc: float,
                             initial_volume: float) -> list[float]:
-    """Inverse of the serial-dilution mass balance in
-    _apply_effective_concentration: given a (constant) stock concentration
-    and initial vessel volume, solves for the Spike Vol at each step that
-    hits the corresponding target cumulative concentration exactly.
-    Requires stock_conc > every target (a stock can't be weaker than the
-    concentration it's diluting into) — raises ValueError otherwise."""
+    """Inverse of a serial-dilution mass balance: given a (constant) stock
+    concentration and initial vessel volume, solves for the Spike Vol at
+    each step that hits the corresponding target cumulative concentration
+    exactly. Requires stock_conc > every target (a stock can't be weaker
+    than the concentration it's diluting into) — raises ValueError
+    otherwise."""
     if stock_conc <= max(targets):
         raise ValueError("Stock Conc must be greater than every target concentration.")
     vol, mass, spikes = initial_volume, 0.0, []
@@ -306,11 +295,10 @@ def _preset_cpdf_amp(increments: list[float], start: float, interval: float | li
     and just use `increments` as the Concentration column directly (the
     common case when you already know your target concentrations and don't
     need the dilution math). Pass a value greater than every cumulative
-    target to also back-solve Spike Vol from stock_conc / initial_volume so
-    it reproduces the same cumulative Concentration via
-    _apply_effective_concentration (clicking Preview afterward is then a
-    no-op). avg_window fills Avg window (s) on every row, so averaging uses
-    the tail of each interval rather than the whole thing."""
+    target to also back-solve Spike Vol from stock_conc / initial_volume,
+    purely for record-keeping — it doesn't feed back into Concentration.
+    avg_window fills Avg window (s) on every row, so averaging uses the
+    tail of each interval rather than the whole thing."""
     intervals = [float(interval)] * len(increments) if np.isscalar(interval) else list(interval)
     if len(intervals) != len(increments):
         raise ValueError(
@@ -560,9 +548,12 @@ def render() -> None:
                 _preset_initial_volume = p5.number_input(
                     f"Initial Volume ({SS.vol_unit})", min_value=0.0, value=float(SS.initial_volume),
                     format="%.5g", key="amp_preset_initial_volume",
-                    help="Volume of buffer/blank in the vessel before any spikes — same "
-                         "value as Initial volume below; changing it here updates that too. "
+                    help="Volume of buffer/blank in the vessel before any spikes. "
                          "Only used if Stock Conc above is set.",
+                )
+                SS.vol_unit = st.text_input(
+                    "Volume unit", SS.vol_unit, help="e.g. mL, µL, L — used for the "
+                    "Spike Vol / Initial Volume labels above.",
                 )
                 _preset_include_blank = st.checkbox(
                     "Include Blank/baseline row (0 → start time)", value=True,
@@ -624,9 +615,9 @@ def render() -> None:
                 "time-series chart. "
                 "Check **Baseline?** on the blank or buffer row; its average current "
                 "is subtracted from all other steps. "
-                "**Spike Vol / Stock Conc** are optional — fill them in to use the "
-                "effective concentration calculator below instead of typing "
-                "Concentration by hand. "
+                "**Spike Vol / Stock Conc** are optional record-keeping fields "
+                "(e.g. filled in by the Quick-fill preset above); they don't affect "
+                "the Concentration column. "
                 + ("Each imported file keeps its own table, so switch **Dataset** "
                    "above to edit another one." if len(_file_names_cal) > 1 else "")
             )
@@ -652,7 +643,7 @@ def render() -> None:
                             f"Spike Vol ({SS.vol_unit})",
                             format="%.5g",
                             help="Optional: volume of stock solution spiked in at this step. "
-                                 "Used by the effective concentration calculator below.",
+                                 "Record-keeping only — doesn't affect Concentration.",
                         ),
                         "Stock Conc": st.column_config.NumberColumn(
                             f"Stock Conc ({SS.conc_unit})",
@@ -682,33 +673,7 @@ def render() -> None:
                 # this same pass (dataset switches, Compute Calibration, session
                 # export) always sees the latest typed values, not a stale copy.
                 _active_frec["cpdf"] = _cpdf_edit
-    
-                with st.expander("Effective concentration calculator (serial dilution)"):
-                    st.caption(
-                        "Models a single vessel that starts at **Initial Volume** of blank "
-                        "buffer. Each row's **Spike Vol** of **Stock Conc** analyte is added "
-                        "in sequence (top to bottom); computing the calibration below "
-                        "automatically applies this to the **Concentration** column. "
-                        "**t start** is filled in from **Avg window (s)** at the same time, "
-                        "for any row where that column is set. Blank Spike Vol / Stock Conc "
-                        "cells are treated as 0. Use the button below to preview the result "
-                        "here without running the full calibration yet."
-                    )
-                    v1, v2 = st.columns(2)
-                    SS.initial_volume = v1.number_input(
-                        "Initial volume", min_value=0.0, value=float(SS.initial_volume),
-                        format="%.5g",
-                        help="Volume of buffer/blank in the vessel before any spikes are added.",
-                    )
-                    SS.vol_unit = v2.text_input(
-                        "Volume unit", SS.vol_unit, help="e.g. mL, µL, L",
-                    )
-                    if st.form_submit_button("Preview: update Concentration & t start"):
-                        _active_frec["cpdf"] = _apply_effective_concentration(_cpdf_edit, SS.initial_volume)
-                        SS.amp_files_cal_editor_version += 1
-                        st.success("Concentration / t start updated above.")
-                        st.rerun()
-    
+
                 st.divider()
     
                 def _do_compute_calibration() -> bool:
@@ -830,25 +795,25 @@ def render() -> None:
                     return True
     
                 # A single, robust action: type values into the table above, click
-                # this once, and everything downstream — effective-concentration
-                # derivation, the active dataset's table display, and the
-                # calibration curve/statistics below — updates together. Wrapping
-                # the editor and this button in one st.form means the button's
-                # rerun reads each widget's live value at submit time, instead of
-                # depending on a separate blur event racing the click.
+                # this once, and everything downstream — avg-window derivation,
+                # the active dataset's table display, and the calibration
+                # curve/statistics below — updates together. Wrapping the editor
+                # and this button in one st.form means the button's rerun reads
+                # each widget's live value at submit time, instead of depending
+                # on a separate blur event racing the click.
                 compute_clicked = st.form_submit_button("Compute Calibration", type="primary")
-    
+
             if compute_clicked:
                 if not analyze_chs:
                     st.error("Select at least one channel to analyse above.")
                 else:
-                    _calc_df = _apply_effective_concentration(_cpdf_edit, SS.initial_volume)
+                    _calc_df = _apply_avg_window(_cpdf_edit)
                     _active_frec["cpdf"] = _calc_df
                     if not _calc_df.equals(_cpdf_edit):
-                        # Table content changed (e.g. Spike Vol/Stock Conc derived
-                        # new Concentration values) — bump + rerun so the editor
-                        # widget itself refreshes to show them, then finish the
-                        # compute automatically on the very next pass.
+                        # Table content changed (avg_duration derived a new
+                        # t_start) — bump + rerun so the editor widget itself
+                        # refreshes to show them, then finish the compute
+                        # automatically on the very next pass.
                         SS.amp_files_cal_editor_version += 1
                         SS["_cal_pending_compute"] = True
                         st.rerun()

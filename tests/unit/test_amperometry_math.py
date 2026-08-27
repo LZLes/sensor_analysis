@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from modes.amperometry import (
-    piecewise_fit, _hinge_fit, _apply_effective_concentration,
+    piecewise_fit, _hinge_fit, _apply_avg_window,
     _spike_vol_for_targets, _preset_cpdf_amp,
 )
 
@@ -57,7 +57,7 @@ def test_hinge_fit_mismatched_lengths_returns_none_and_sentinel_ssr():
     assert ssr == 1e18
 
 
-def test_apply_effective_concentration_noop_without_spike_vol():
+def test_apply_avg_window_noop_without_avg_duration():
     cpdf = pd.DataFrame({
         "Label": ["Blank", "Step 1"],
         "Concentration": [0.0, 5.0],
@@ -68,31 +68,11 @@ def test_apply_effective_concentration_noop_without_spike_vol():
         "avg_duration": [np.nan, np.nan],
         "Baseline": [True, False],
     })
-    out = _apply_effective_concentration(cpdf, initial_volume=1.0)
-    assert out["Concentration"].tolist() == [0.0, 5.0]
+    out = _apply_avg_window(cpdf)
+    assert out["t_start"].tolist() == [0.0, 10.0]
 
 
-def test_apply_effective_concentration_serial_dilution_matches_spike_solver():
-    targets = [0.5, 1.0, 2.0]
-    stock = 100.0
-    vol = 1.0
-    spikes = _spike_vol_for_targets(targets, stock, vol)
-    cpdf = pd.DataFrame({
-        "Label": ["Step 1", "Step 2", "Step 3"],
-        "Concentration": [np.nan] * 3,
-        "Spike Vol": spikes,
-        "Stock Conc": [stock] * 3,
-        "t_start": [0.0, 10.0, 20.0],
-        "t_end": [10.0, 20.0, 30.0],
-        "avg_duration": [np.nan] * 3,
-        "Baseline": [False] * 3,
-    })
-    out = _apply_effective_concentration(cpdf, initial_volume=vol)
-    for got, want in zip(out["Concentration"].tolist(), targets):
-        assert got == pytest.approx(want, rel=1e-6)
-
-
-def test_apply_effective_concentration_avg_duration_overrides_t_start():
+def test_apply_avg_window_overrides_t_start():
     cpdf = pd.DataFrame({
         "Label": ["Step 1"],
         "Concentration": [1.0],
@@ -103,7 +83,7 @@ def test_apply_effective_concentration_avg_duration_overrides_t_start():
         "avg_duration": [20.0],
         "Baseline": [False],
     })
-    out = _apply_effective_concentration(cpdf, initial_volume=1.0)
+    out = _apply_avg_window(cpdf)
     assert out["t_start"].iloc[0] == pytest.approx(80.0)
 
 
