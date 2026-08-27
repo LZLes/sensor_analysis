@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from core.ai_insights import _render_ai_insights_section
+from core.calibration_table import _default_solid_cpdf
 from core.constants import PAL, _SAMPLE_DATA_DIR, _plot_theme, fmt
 from core.numeric import lin_reg, to_num, _eff_t_start
 from core.plotting import _ORIGIN_RC, _MINIMAL_RC, _apply_spine_style
@@ -50,6 +51,27 @@ def nernst_ideal_slope_mv(temp_c: float = 25.0, z: int = 1) -> float:
     temp_k = temp_c + 273.15
     slope_v = (_GAS_CONSTANT_R * temp_k * np.log(10)) / (abs(z) * _FARADAY_F)
     return float(slope_v * 1000.0)
+
+
+# Recognized voltage-unit spellings, in mV per 1 configured unit — lets the
+# "% of ideal" comparison stay correct even when solid_unit (free text) is
+# something other than mV, instead of silently comparing mismatched units.
+_MV_PER_SIGNAL_UNIT = {
+    "mv": 1.0, "millivolt": 1.0, "millivolts": 1.0,
+    "v": 1000.0, "volt": 1000.0, "volts": 1000.0,
+    "uv": 0.001, "µv": 0.001, "microvolt": 0.001, "microvolts": 0.001,
+}
+
+
+def ideal_slope_in_signal_unit(temp_c: float, z: int, signal_unit: str) -> float | None:
+    """nernst_ideal_slope_mv() converted into signal_unit, so it can be
+    compared directly against a slope fitted from data in that unit. None
+    if signal_unit isn't a recognized voltage unit — callers should show
+    "unit not recognized" rather than silently comparing mismatched units."""
+    factor = _MV_PER_SIGNAL_UNIT.get(str(signal_unit).strip().lower())
+    if factor is None:
+        return None
+    return nernst_ideal_slope_mv(temp_c, z) / factor
 
 
 def nernstian_lod_fit(log_conc: np.ndarray, potential_mv: np.ndarray) -> dict:
@@ -221,22 +243,6 @@ def render_solid_cal_png(res_map: dict, conc_unit: str, signal_unit: str,
     return buf.getvalue()
 
 
-def _default_solid_cpdf() -> pd.DataFrame:
-    """Starter calibration table for solid-state (potentiometric) sensors.
-    No Baseline/Spike Vol/Stock Conc — Nernstian fits use raw potential
-    directly, and there's no dilution-calculator support here. Reading_mV
-    is a nullable direct-entry column: fill it in to skip windowed
-    averaging from an imported trace entirely."""
-    return pd.DataFrame({
-        "Label":         ["Std 1", "Std 2", "Std 3", "Std 4"],
-        "Concentration": [0.1, 1.0, 10.0, 100.0],
-        "t_start":       [0.0, 120.0, 240.0, 360.0],
-        "t_end":         [60.0, 180.0, 300.0, 420.0],
-        "avg_duration":  [np.nan, np.nan, np.nan, np.nan],
-        "Reading_mV":    [np.nan, np.nan, np.nan, np.nan],
-    })
-
-
 def _seed_solid_cpdf_for_new_file() -> pd.DataFrame:
     """Starter calibration table for a newly-imported solid-state file."""
     return _default_solid_cpdf()
@@ -321,6 +327,7 @@ def render() -> None:
                 unit_key="solid_unit",
                 active_file_key="solid_active_file",
                 seed_cpdf_fn=_seed_solid_cpdf_for_new_file,
+                conc_unit_key="solid_conc_unit",
                 sample_loader_fn=_load_solid_sample_data,
                 sample_caption=(
                     "A synthetic potentiometric (ISE-style) run with a two-regime "
@@ -389,6 +396,20 @@ def render() -> None:
                          "loaded, file·channel pairs). Each uses its own "
                          "dataset's calibration table above.",
                 )
+                _nz1, _nz2 = st.columns(2)
+                _ion_charge = int(_nz1.number_input(
+                    "Ion charge |z|", min_value=1, max_value=4, value=1, step=1,
+                    key="solid_ion_charge",
+                    help="Charge of the analyte ion — 1 for Na+/K+/Cl-, 2 for "
+                         "Ca2+/Mg2+, etc. Used only for the ideal-Nernstian-slope "
+                         "comparison below (does not affect the fit itself).",
+                ))
+                _lab_temp_c = float(_nz2.number_input(
+                    "Lab temperature (°C)", min_value=-20.0, max_value=100.0,
+                    value=25.0, step=0.5, key="solid_lab_temp_c",
+                    help="Ideal Nernstian slope depends on temperature — set this "
+                         "to the actual temperature the run was measured at.",
+                ))
     
                 with st.expander("Quick-fill: common calibration protocols"):
                     _preset_name_s = st.selectbox(
@@ -413,7 +434,7 @@ def render() -> None:
                              "transient right after moving to a new standard).",
                     )
                     _preset_values_str_s = st.text_input(
-                        f"Concentration values ({SS.conc_unit}), comma-separated — absolute, "
+                        f"Concentration values ({SS.solid_conc_unit}), comma-separated — absolute, "
                         "one per standard. Add more to extend the series.",
                         value=", ".join(str(v) for v in _preset_s["values"]),
                         key="solid_preset_values",
@@ -429,7 +450,7 @@ def render() -> None:
                         else:
                             _active_frec_s["cpdf"] = _preset_cpdf_solid(
                                 _values_s, _preset_start_s, _preset_interval_s, _preset_avg_window_s)
-                            SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+                            SS.solid_files_cal_editor_version = SS.get("solid_files_cal_editor_version", 0) + 1
                             st.success(f"Preset applied — {len(_values_s)} rows. Edit any cell below, "
                                        "or add more rows with the grid's ➕ button.")
                             st.rerun()
@@ -455,8 +476,8 @@ def render() -> None:
                     + ("Each imported file keeps its own table, so switch **Dataset** "
                        "above to edit another one." if len(_file_names_solid) > 1 else "")
                 )
-                if "cal_editor_version" not in SS:
-                    SS.cal_editor_version = 0
+                if "solid_files_cal_editor_version" not in SS:
+                    SS.solid_files_cal_editor_version = 0
     
                 # Only the editor + Compute button share the form now — so the
                 # button's rerun reads the grid's live value at submit time,
@@ -465,7 +486,7 @@ def render() -> None:
                 with st.form(key=f"solid_cal_form_{_active_fi_s}"):
                     _scpdf_edit = st.data_editor(
                         _active_frec_s["cpdf"],
-                        key=f"solid_cal_editor_{_active_fi_s}_{SS.cal_editor_version}",
+                        key=f"solid_cal_editor_{_active_fi_s}_{SS.solid_files_cal_editor_version}",
                         num_rows="dynamic",
                         use_container_width=True,
                         column_config={
@@ -474,7 +495,7 @@ def render() -> None:
                                 help="Short name shown on the plot, e.g. 'Std 1'",
                             ),
                             "Concentration": st.column_config.NumberColumn(
-                                f"Concentration ({SS.conc_unit})",
+                                f"Concentration ({SS.solid_conc_unit})",
                                 format="%.5g",
                                 help="Must be > 0 — used as log10(Concentration) in the fit.",
                             ),
@@ -517,8 +538,13 @@ def render() -> None:
                         frec, ch = _solid_combo_lookup[ch_name]
                         cpdf = frec["cpdf"].copy()
                         if cpdf.empty:
+                            st.warning(f"**{ch_name}**: calibration table is empty — "
+                                       f"add rows in {frec['filename']}'s table above.")
                             continue
-                        _rejected = cpdf["Concentration"].astype(float) <= 0
+                        # ~(x > 0) catches both x <= 0 AND NaN (NaN > 0 is False),
+                        # matching the caption's "must be > 0" promise — a plain
+                        # `<= 0` comparison would let a blank/NaN cell slip through.
+                        _rejected = ~(cpdf["Concentration"].astype(float) > 0)
                         if _rejected.any():
                             st.warning(
                                 f"**{ch_name}**: {int(_rejected.sum())} row(s) with "
@@ -559,11 +585,17 @@ def render() -> None:
     
                         lod_fit = nernstian_lod_fit(log_conc[valid], potential[valid])
                         nernst_seg = lod_fit["nernstian_segment"]
-                        ideal = nernst_ideal_slope_mv()
-    
+                        # Ideal slope converted into the ACTUAL configured signal
+                        # unit — nernst_ideal_slope_mv() alone is always in mV,
+                        # but the fitted slope is in whatever solid_unit the user
+                        # set (e.g. "V"), so comparing raw mV to raw fitted slope
+                        # silently corrupts "% of ideal" if unit != mV.
+                        ideal = ideal_slope_in_signal_unit(_lab_temp_c, _ion_charge, SS.solid_unit)
+
                         results[ch_name] = dict(
                             concs             = cpdf["Concentration"].astype(float).tolist(),
                             labels            = cpdf["Label"].tolist(),
+                            valid_mask        = valid.tolist(),
                             log_conc          = log_conc[valid].tolist(),
                             potential_mv      = potential[valid].tolist(),
                             low_segment       = lod_fit["low_segment"],
@@ -572,9 +604,11 @@ def render() -> None:
                             lod_conc          = lod_fit["lod_conc"],
                             sensitivity_mv_per_decade = nernst_seg["slope"] if nernst_seg else None,
                             pct_of_ideal_nernstian    = (
-                                100.0 * abs(nernst_seg["slope"]) / ideal if nernst_seg else None
+                                100.0 * abs(nernst_seg["slope"]) / ideal
+                                if (nernst_seg and ideal) else None
                             ),
                             ideal_slope_mv_per_decade = ideal,
+                            signal_unit = SS.solid_unit,
                             is_average = False,
                         )
                     if not results:
@@ -604,7 +638,12 @@ def render() -> None:
                         col = PAL[j % len(PAL)]
                         x = np.asarray(res["log_conc"], dtype=float)
                         y = np.asarray(res["potential_mv"], dtype=float)
-                        labels_plot = res["labels"][:len(x)]
+                        # Index labels by the same valid_mask used to filter
+                        # log_conc/potential_mv above — a plain length-based
+                        # truncation would mislabel every point after the first
+                        # invalid (NaN-reading) row with the wrong standard's name.
+                        _vmask = res.get("valid_mask", [True] * len(res["labels"]))
+                        labels_plot = np.asarray(res["labels"], dtype=object)[_vmask]
     
                         fig_solid.add_trace(go.Scatter(
                             x=x, y=y, name=ch_name, mode="markers+text",
@@ -644,23 +683,25 @@ def render() -> None:
                             )
     
                         ideal = res.get("ideal_slope_mv_per_decade")
+                        _sunit = res.get("signal_unit", SS.solid_unit)
                         stat_rows_s.append({
                             "Channel": ch_name,
-                            "Sensitivity (mV/decade)": fmt(res.get("sensitivity_mv_per_decade")),
+                            f"Sensitivity ({_sunit}/decade)": fmt(res.get("sensitivity_mv_per_decade")),
                             "% of ideal Nernstian": (
                                 f"{res['pct_of_ideal_nernstian']:.1f}%"
-                                if res.get("pct_of_ideal_nernstian") is not None else "—"
+                                if res.get("pct_of_ideal_nernstian") is not None
+                                else ("—" if ideal is not None else "unit not recognized")
                             ),
-                            "Ideal (mV/decade)": fmt(ideal),
+                            f"Ideal ({_sunit}/decade)": fmt(ideal),
                             "R² (Nernstian)": (f"{_nern['r2']:.4f}" if _nern else "—"),
                             "R² (low)": (f"{_low['r2']:.4f}" if _low else "—"),
-                            f"LOD ({SS.conc_unit})": fmt(res.get("lod_conc")),
+                            f"LOD ({SS.solid_conc_unit})": fmt(res.get("lod_conc")),
                             "LOD (log₁₀)": fmt(res.get("lod_log10")),
                         })
     
                     _pt_s = _plot_theme()
                     fig_solid.update_layout(
-                        xaxis_title=f"log₁₀(Concentration [{SS.conc_unit}])",
+                        xaxis_title=f"log₁₀(Concentration [{SS.solid_conc_unit}])",
                         yaxis_title=f"Potential ({SS.solid_unit})",
                         hovermode="closest",
                         height=560,
@@ -671,7 +712,7 @@ def render() -> None:
                         legend=dict(orientation="v", x=1.01, y=1, xanchor="left",
                                     yanchor="top", bgcolor="rgba(0,0,0,0)"),
                     )
-                    st.plotly_chart(fig_solid, use_container_width=True,
+                    st.plotly_chart(fig_solid, use_container_width=True, key="solid_cal_chart",
                                     config={"displayModeBar": True,
                                             "modeBarButtonsToRemove": ["select2d", "lasso2d"]})
                     SS.solid_cal_fig = fig_solid
@@ -697,7 +738,7 @@ def render() -> None:
                         rows_out_s.append({
                             "Channel": ch_name,
                             "Label": lbl,
-                            f"Concentration ({SS.conc_unit})": conc,
+                            f"Concentration ({SS.solid_conc_unit})": conc,
                         })
                 export_df_s = pd.DataFrame(rows_out_s)
                 st.dataframe(export_df_s, use_container_width=True, hide_index=True)
@@ -718,7 +759,7 @@ def render() -> None:
                         mime="text/html",
                     )
                     solid_cal_png_bytes = render_solid_cal_png(
-                        dict(cal_res_s), SS.conc_unit, SS.solid_unit,
+                        dict(cal_res_s), SS.solid_conc_unit, SS.solid_unit,
                     )
                     sdl3.download_button(
                         "Plot — PNG (150 dpi)",
@@ -748,15 +789,16 @@ def render() -> None:
                     _amp_label(f["filename"], c["name"], len(SS.solid_files) > 1)
                     for f in SS.solid_files for c in f["channels"]
                 ]
-                if SS.ts_fig is not None:
+                _solid_ts_fig = SS.get("solid_files_ts_fig")
+                if _solid_ts_fig is not None:
                     sdl5.download_button(
                         "Plot — interactive HTML",
-                        data=SS.ts_fig.to_html(include_plotlyjs="cdn"),
+                        data=_solid_ts_fig.to_html(include_plotlyjs="cdn"),
                         file_name="solid_state_time_series.html",
                         mime="text/html",
                         key="solid_ts_html_dl",
                     )
-                    ts_vis_s = SS.ts_visible if SS.ts_visible else all_ch_names_export_s
+                    ts_vis_s = SS.get("solid_files_ts_vis_ms") or all_ch_names_export_s
                     ts_png_bytes_s = render_ts_png(
                         SS.solid_files, SS.solid_unit, ts_vis_s,
                         smooth_method=SS.smooth_method,

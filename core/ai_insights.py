@@ -36,7 +36,8 @@ def _build_insights_prompt(results: dict, fit_type: str) -> str:
         lines.append(f"Channel: {ch_name}")
         if fit_type == "Nernstian":
             seg = res.get("nernstian_segment") or {}
-            lines.append(f"  Nernstian slope: {seg.get('slope')} mV/decade "
+            _unit = res.get("signal_unit", "mV")   # actual configured unit, not always mV
+            lines.append(f"  Nernstian slope: {seg.get('slope')} {_unit}/decade "
                          f"(ideal: {res.get('ideal_slope_mv_per_decade')})")
             lines.append(f"  % of ideal: {res.get('pct_of_ideal_nernstian')}")
             lines.append(f"  R²: {seg.get('r2')}")

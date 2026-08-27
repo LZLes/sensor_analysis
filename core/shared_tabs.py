@@ -81,6 +81,7 @@ def _render_import_tab(
     unit_key: str,
     active_file_key: str,
     seed_cpdf_fn,
+    conc_unit_key: str = "conc_unit",
     sample_loader_fn=None,
     sample_caption: str = "",
     sample_button_help: str = (
@@ -100,7 +101,9 @@ def _render_import_tab(
     and Solid-State (files_key='solid_files', signal_col_label='Potential',
     unit_key='solid_unit'). Upload, per-file channel mapping, and units are
     identical in shape between the two modes — only the starter calibration
-    table (seed_cpdf_fn) and sample-data source differ."""
+    table (seed_cpdf_fn), sample-data source, and concentration-unit key
+    (conc_unit_key — kept separate per mode so setting one mode's
+    concentration unit doesn't silently change the other's) differ."""
     with st.expander("Quick-start guide", expanded=False):
         st.markdown(f"""
 **Typical workflow:**
@@ -133,11 +136,11 @@ def _render_import_tab(
                     SS.df       = _sample_files[0]["df"]
                     SS.channels = _sample_files[0]["channels"]
                 if sample_conc_unit is not None:
-                    SS.conc_unit = sample_conc_unit
+                    SS[conc_unit_key] = sample_conc_unit
                 if sample_signal_unit is not None:
                     SS[unit_key] = sample_signal_unit
-                SS.ts_visible = []
-                SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+                SS[f"{files_key}_ts_vis_ms"] = []
+                SS[f"{files_key}_cal_editor_version"] = SS.get(f"{files_key}_cal_editor_version", 0) + 1
                 SS[active_file_key] = _sample_files[0]["filename"]
                 SS["_files_applied_msg"] = sample_loaded_msg
                 st.rerun()
@@ -230,8 +233,8 @@ def _render_import_tab(
             if set_legacy_alias:
                 SS.df       = _parsed_files[0]["df"]
                 SS.channels = _parsed_files[0]["channels"]
-            SS.ts_visible = []
-            SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+            SS[f"{files_key}_ts_vis_ms"] = []
+            SS[f"{files_key}_cal_editor_version"] = SS.get(f"{files_key}_cal_editor_version", 0) + 1
             SS["_files_applied_msg"] = (
                 f"{len(_parsed_files)} file(s), "
                 f"{sum(len(f['channels']) for f in _parsed_files)} channel(s) saved. "
@@ -247,9 +250,9 @@ def _render_import_tab(
         st.subheader("Units")
         st.caption("These labels appear on all plot axes and in the statistics table.")
         u1, u2 = st.columns(2)
-        SS.conc_unit = u1.text_input("Concentration unit", SS.conc_unit,
+        SS[conc_unit_key] = u1.text_input("Concentration unit", SS[conc_unit_key],
                                       help="e.g. mM, µM, ppm, ng/mL",
-                                      key="conc_unit_input")
+                                      key=f"{files_key}_conc_unit_input")
         SS[unit_key] = u2.text_input(f"{signal_col_label} unit", SS[unit_key],
                                       help="Shown on plot axes and in the statistics table",
                                       key=f"{files_key}_signal_unit_input")
@@ -322,7 +325,9 @@ def _render_timeseries_tab(files_key: str, unit_key: str, signal_axis_label: str
                 SS[_vis_key] = [_lbl]
 
     sel = st.multiselect("Visible channels", _all_ch_names, key=_vis_key)
-    SS.ts_visible = sel
+    # No separate SS.ts_visible alias — SS[_vis_key] (already bound to this
+    # widget) IS the per-mode visible-channel selection; a flat shared alias
+    # here previously leaked one mode's selection into the other's Export tab.
 
     with st.expander("Y-axis range", expanded=False):
         _y_auto = st.checkbox("Auto-scale", value=SS.ts_y_auto, key=f"{files_key}_ts_y_auto_cb")
@@ -445,7 +450,7 @@ def _render_timeseries_tab(files_key: str, unit_key: str, signal_axis_label: str
                     config={"scrollZoom": True, "displayModeBar": True,
                             "modeBarButtonsToRemove": ["select2d", "lasso2d"]},
                     key=f"{files_key}_ts_chart")
-    SS.ts_fig = fig_ts
+    SS[f"{files_key}_ts_fig"] = fig_ts
 
     dl1, dl2 = st.columns(2)
     dl1.download_button(
@@ -572,6 +577,6 @@ def _render_autodetect_expander(
                 trace_end = float(np.nanmax(t_arr)) if t_arr.size else 0.0
                 windows = edges_to_windows(edges, trace_end, include_baseline)
                 active_frec["cpdf"] = build_cpdf_fn(windows)
-                SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+                SS[f"{files_key}_cal_editor_version"] = SS.get(f"{files_key}_cal_editor_version", 0) + 1
                 st.success(f"Applied {len(windows)} row(s) from detected edges.")
                 st.rerun()

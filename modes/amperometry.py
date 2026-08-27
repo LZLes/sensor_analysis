@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from core.ai_insights import _render_ai_insights_section
-from core.calibration_table import _default_cpdf
+from core.calibration_table import _default_cpdf, _baseline_keep_mask
 from core.constants import PAL, AVG_COLOR, _MIME, _SAMPLE_DATA_DIR, _plot_theme, fmt
 from core.numeric import to_num, smooth_signal, lin_reg, _eff_t_start
 from core.plotting import _ORIGIN_RC, _MINIMAL_RC, _apply_spine_style
@@ -198,9 +198,9 @@ def render_cal_png(res_map: dict, ft: str, ns: int,
         _annot_blocks = []
         for j, (ch_name, res) in enumerate(res_map.items()):
             col  = AVG_COLOR if res.get("is_average") else PAL[j % len(PAL)]
-            # Same blank-exclusion as the in-app Plotly chart, kept in sync.
-            _keep = [not (bool(b) if pd.notna(b) else False) for b in
-                     res.get("baselines", [False] * len(res["concs"]))]
+            # Same blank-exclusion as the in-app Plotly chart, kept in sync
+            # via the shared _baseline_keep_mask helper.
+            _keep = _baseline_keep_mask(res.get("baselines", [False] * len(res["concs"])))
             x    = np.asarray(res["concs"], dtype=float)[_keep]
             y    = np.array(res["delta_i"], float)[_keep]
             errs = [float(s) if (s and not np.isnan(s)) else 0.0
@@ -565,7 +565,7 @@ def render() -> None:
                                      f"{sum(_increments):.5g} {SS.conc_unit}).")
                         else:
                             SS.initial_volume = _preset_initial_volume
-                            SS.cal_editor_version = SS.get("cal_editor_version", 0) + 1
+                            SS.amp_files_cal_editor_version = SS.get("amp_files_cal_editor_version", 0) + 1
                             st.success(f"Preset applied — {len(_increments) + int(_preset_include_blank)} "
                                        "rows. Edit any cell below, or add more rows with the grid's ➕ button.")
                             st.rerun()
@@ -595,12 +595,12 @@ def render() -> None:
                 + ("Each imported file keeps its own table, so switch **Dataset** "
                    "above to edit another one." if len(_file_names_cal) > 1 else "")
             )
-            if "cal_editor_version" not in SS:
-                SS.cal_editor_version = 0
+            if "amp_files_cal_editor_version" not in SS:
+                SS.amp_files_cal_editor_version = 0
             with st.form(key=f"amp_cal_form_{_active_fi}"):
                 _cpdf_edit = st.data_editor(
                     _active_frec["cpdf"],
-                    key=f"cal_editor_{_active_fi}_{SS.cal_editor_version}",
+                    key=f"cal_editor_{_active_fi}_{SS.amp_files_cal_editor_version}",
                     num_rows="dynamic",
                     use_container_width=True,
                     column_config={
@@ -670,7 +670,7 @@ def render() -> None:
                     )
                     if st.form_submit_button("Preview: update Concentration & t start"):
                         _active_frec["cpdf"] = _apply_effective_concentration(_cpdf_edit, SS.initial_volume)
-                        SS.cal_editor_version += 1
+                        SS.amp_files_cal_editor_version += 1
                         st.success("Concentration / t start updated above.")
                         st.rerun()
     
@@ -814,7 +814,7 @@ def render() -> None:
                         # new Concentration values) — bump + rerun so the editor
                         # widget itself refreshes to show them, then finish the
                         # compute automatically on the very next pass.
-                        SS.cal_editor_version += 1
+                        SS.amp_files_cal_editor_version += 1
                         SS["_cal_pending_compute"] = True
                         st.rerun()
                     else:
@@ -873,8 +873,7 @@ def render() -> None:
                     # Exclude the blank/baseline point from the plotted curve and
                     # the fit — it's ΔI = 0 by construction and isn't a real
                     # calibration step. Still shown in "Averaging window details".
-                    _keep  = [not bool(b) for b in
-                              res.get("baselines", [False] * len(res["concs"]))]
+                    _keep  = _baseline_keep_mask(res.get("baselines", [False] * len(res["concs"])))
                     x      = np.asarray(res["concs"], dtype=float)[_keep]
                     y      = np.array(res["delta_i"], float)[_keep]
                     labels_plot = np.asarray(res["labels"], dtype=object)[_keep]
@@ -968,7 +967,7 @@ def render() -> None:
                         zeroline=True, zerolinecolor=_pt_cal["axisline"],
                     ),
                 )
-                st.plotly_chart(fig_cal, use_container_width=True,
+                st.plotly_chart(fig_cal, use_container_width=True, key="amp_cal_chart",
                                 config={"scrollZoom": True, "displayModeBar": True,
                                         "modeBarButtonsToRemove": ["select2d", "lasso2d"]})
                 SS.cal_fig = fig_cal
@@ -1090,14 +1089,15 @@ def render() -> None:
                 _amp_label(f["filename"], c["name"], len(SS.amp_files) > 1)
                 for f in SS.amp_files for c in f["channels"]
             ]
-            if SS.ts_fig is not None:
+            _amp_ts_fig = SS.get("amp_files_ts_fig")
+            if _amp_ts_fig is not None:
                 dl5.download_button(
                     "Plot — interactive HTML",
-                    data=SS.ts_fig.to_html(include_plotlyjs="cdn"),
+                    data=_amp_ts_fig.to_html(include_plotlyjs="cdn"),
                     file_name="time_series.html",
                     mime="text/html",
                 )
-                ts_vis = SS.ts_visible if SS.ts_visible else all_ch_names_export
+                ts_vis = SS.get("amp_files_ts_vis_ms") or all_ch_names_export
                 ts_png_bytes = render_ts_png(
                     SS.amp_files, SS.cur_unit, ts_vis,
                     smooth_method=SS.smooth_method,
@@ -1126,7 +1126,7 @@ def render() -> None:
                     help="SVG/PDF are vector — infinitely scalable and editable in Illustrator / Inkscape.",
                 )
                 _pdpi = _pc3.segmented_control(
-                    "DPI", options=[150, 300, 600], default=300, required=True, key="pub_dpi",
+                    "DPI", options=[150, 300, 600], default=300, key="pub_dpi",
                     disabled=_pfmt in ["SVG", "PDF"],
                     help="Ignored for SVG/PDF.",
                 )
@@ -1141,13 +1141,16 @@ def render() -> None:
                 "Full (6.5\")":   (6.5, 4.5),
             }
             _pfs      = _psize_map[_psize_label]
-            _pdpi_val = int(_pdpi) if _pfmt not in ["SVG", "PDF"] else 300
+            # segmented_control can be clicked off to None (no `required` kwarg
+            # in current Streamlit to prevent that) — fall back to the same
+            # 300 default used elsewhere rather than crashing on int(None).
+            _pdpi_val = int(_pdpi) if (_pdpi is not None and _pfmt not in ["SVG", "PDF"]) else 300
             _pfmt_l   = _pfmt.lower()
             _pstyle_l = _pstyle.lower()
     
             _pa, _pb = st.columns(2)
             if SS.amp_files:
-                _ts_vis  = SS.ts_visible or [
+                _ts_vis  = SS.get("amp_files_ts_vis_ms") or [
                     _amp_label(f["filename"], c["name"], len(SS.amp_files) > 1)
                     for f in SS.amp_files for c in f["channels"]
                 ]
