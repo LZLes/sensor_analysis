@@ -23,7 +23,8 @@ def find_cv_peaks(voltage: np.ndarray, current: np.ndarray,
                   height: float | None = None) -> dict:
     """
     Detect anodic (local maxima) and cathodic (local minima) peaks in a CV trace.
-    prominence : min height relative to surrounding baseline
+    prominence : min height relative to surrounding baseline (0 = no filter,
+                 same convention as width/height below)
     distance   : min data-points between peaks
     width      : min peak width in data-points (None = no filter)
     height     : min absolute |Ip| (applied to both anodic and cathodic; None = no filter)
@@ -34,7 +35,8 @@ def find_cv_peaks(voltage: np.ndarray, current: np.ndarray,
     v, i = voltage[mask], current[mask]
     if len(v) < 5:
         return {"anodic": [], "cathodic": []}
-    _kw: dict = dict(prominence=prominence, distance=max(1, distance))
+    _kw: dict = dict(distance=max(1, distance))
+    if prominence > 0:                     _kw["prominence"] = prominence
     if width  is not None and width  > 0:  _kw["width"]  = width
     if height is not None and height > 0:  _kw["height"] = height
     anodic_idx,   _ = scipy.signal.find_peaks(i,  **_kw)
@@ -44,46 +46,6 @@ def find_cv_peaks(voltage: np.ndarray, current: np.ndarray,
         "cathodic": [{"Ep": float(v[k]), "Ip": float(i[k])} for k in cathodic_idx],
     }
 
-
-# NOTE: unused — CV renders via the inline _render_cv_plot below instead.
-# Left in place; not part of the app.py-split's scope.
-def render_cv_png(cv_df: pd.DataFrame, cv_channels: list[dict],
-                  visible: list[str], volt_unit: str, cur_unit: str,
-                  peaks_map: dict | None = None,
-                  dpi: int = 150, fmt: str = "png",
-                  figsize: tuple | None = None, style: str = "default") -> bytes:
-    _rc  = {"origin": _ORIGIN_RC, "minimal": _MINIMAL_RC}.get(style, {})
-    _lfs = 9 if style == "minimal" else 11
-    _lgfs = 7 if style == "minimal" else 8
-    with matplotlib.rc_context(_rc):
-        fig, ax = plt.subplots(figsize=figsize or (9, 6))
-        for j, ch in enumerate(cv_channels):
-            if ch["name"] not in visible:
-                continue
-            v   = to_num(cv_df[ch["vc"]]).to_numpy(dtype=float, na_value=np.nan)
-            i   = to_num(cv_df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
-            col = PAL[j % len(PAL)]
-            ax.plot(v, i, color=col, label=ch["name"], linewidth=1.4)
-            if peaks_map and ch["name"] in peaks_map:
-                pk = peaks_map[ch["name"]]
-                for p in pk.get("anodic", []):
-                    ax.plot(p["Ep"], p["Ip"], "^", color=col, markersize=10, zorder=5,
-                            label=f"{ch['name']} Ep,a={p['Ep']:.3g} {volt_unit}")
-                for p in pk.get("cathodic", []):
-                    ax.plot(p["Ep"], p["Ip"], "v", color=col, markersize=10, zorder=5,
-                            label=f"{ch['name']} Ep,c={p['Ep']:.3g} {volt_unit}")
-        ax.axhline(0, color="#bbbbbb", linewidth=0.8, linestyle="--")
-        ax.set_xlabel(f"Potential ({volt_unit})", fontsize=_lfs)
-        ax.set_ylabel(f"Current ({cur_unit})", fontsize=_lfs)
-        ax.legend(fontsize=_lgfs, loc="upper left",
-                  bbox_to_anchor=(1.02, 1), borderaxespad=0)
-        _apply_spine_style(ax, style)
-        fig.tight_layout()
-        buf = io.BytesIO()
-        fig.savefig(buf, format=fmt, dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
 
 
 def render() -> None:
@@ -128,6 +90,15 @@ def render() -> None:
                                  linestyle=["-", "--", ":", "-."][_ci % 4],
                                  linewidth=1.4,
                                  label=_rn["label"] if _ci == 0 else None)
+                        # Detected peaks — matches the interactive chart (CV3)
+                        # so the exported figure isn't missing them.
+                        _pk = _rn.get("peaks", {}).get(_ch["name"], {})
+                        for _p in _pk.get("anodic", []):
+                            _ax.plot(_p["Ep"], _p["Ip"], "^", color=_cl,
+                                      markersize=8, zorder=5)
+                        for _p in _pk.get("cathodic", []):
+                            _ax.plot(_p["Ep"], _p["Ip"], "v", color=_cl,
+                                      markersize=8, zorder=5)
                 _ax.axhline(0, color="#bbbbbb", linewidth=0.8, linestyle="--")
                 _ax.set_xlabel(f"Potential ({SS.volt_unit})")
                 _ax.set_ylabel(f"Current ({SS.cv_cur_unit})")
@@ -210,7 +181,6 @@ def render() -> None:
                 _fmt = _c2.selectbox("Format", ["SVG", "PNG", "PDF", "TIFF"],
                                       key=f"{key_prefix}_fmt")
                 _dpi = _c3.segmented_control("DPI", [150, 300, 600], default=300,
-                                              required=True,
                                               key=f"{key_prefix}_dpi",
                                               disabled=_fmt in ["SVG", "PDF"])
                 _sz  = _c4.selectbox(
@@ -223,7 +193,9 @@ def render() -> None:
             return (
                 _sty.lower(),
                 _fmt.lower(),
-                int(_dpi) if _fmt not in ["SVG", "PDF"] else 300,
+                # segmented_control can be clicked off to None (no `required`
+                # kwarg in current Streamlit) — fall back to the 300 default.
+                int(_dpi) if (_dpi is not None and _fmt not in ["SVG", "PDF"]) else 300,
                 _fsm[_sz],
                 {"origin": _ORIGIN_RC, "minimal": _MINIMAL_RC}.get(_sty.lower(), {}),
             )
@@ -248,6 +220,11 @@ def render() -> None:
     
             if _up_files:
                 st.markdown("**Assign a scan rate to each file:**")
+                st.caption(
+                    "Pre-filled from the last number found in each filename — "
+                    "double-check it (a date or other number in the filename "
+                    "can be picked up by mistake) and correct before loading."
+                )
                 _sr_vals = {}
                 for _f in _up_files:
                     _nums = _re.findall(r"\d+\.?\d*", _f.name.rsplit(".", 1)[0])
@@ -369,6 +346,13 @@ def render() -> None:
     
                     if st.button("Load All Files", type="primary"):
                         _runs_new, _errs_new = [], []
+                        # Keyed by (filename, scan_rate) so re-loading the same
+                        # file at the same assigned scan rate doesn't silently
+                        # wipe previously-computed peak analysis.
+                        _existing_peaks = {
+                            (_r["filename"], _r["scan_rate"]): _r["peaks"]
+                            for _r in SS.cv_runs
+                        }
                         for _fup in _up_files:
                             try:
                                 _bytes_fup = _fup.read()
@@ -424,12 +408,24 @@ def render() -> None:
                                     "filename":  _fup.name,
                                     "df":        _df_run,
                                     "channels":  _channels,
-                                    "peaks":     {},
+                                    "peaks":     _existing_peaks.get((_fup.name, _sr_val), {}),
                                 })
                             except Exception as _exc_fup:
                                 _errs_new.append(f"{_fup.name}: {_exc_fup}")
                         for _e in _errs_new:
                             st.error(_e)
+                        _sr_counts = {r["scan_rate"]: 0 for r in _runs_new}
+                        for _r in _runs_new:
+                            _sr_counts[_r["scan_rate"]] += 1
+                        _dupe_srs = sorted(sr for sr, n in _sr_counts.items() if n > 1)
+                        if _dupe_srs:
+                            st.warning(
+                                "Duplicate scan rate(s) assigned: "
+                                + ", ".join(f"{sr:g} {SS.cv_sr_unit}" for sr in _dupe_srs)
+                                + " — Scan Rate Analysis will plot/fit these as separate "
+                                  "points at the same x-value. Assign unique rates above "
+                                  "if that's not intended."
+                            )
                         _runs_new.sort(key=lambda r: r["scan_rate"])
                         SS.cv_runs = _runs_new
                         st.success(f"Loaded {len(_runs_new)} file(s).")
@@ -540,7 +536,7 @@ def render() -> None:
                     yaxis=dict(showgrid=True, gridcolor=_pt["grid"],
                                linecolor=_pt["axisline"]),
                 )
-                st.plotly_chart(_fig_cvp, use_container_width=True,
+                st.plotly_chart(_fig_cvp, use_container_width=True, key="cv2_plot_chart",
                                 config={"scrollZoom": True, "displayModeBar": True,
                                         "modeBarButtonsToRemove": ["select2d","lasso2d"]})
                 st.caption(
@@ -587,6 +583,7 @@ def render() -> None:
                     value=round(_auto_prom3, 4), format="%.4g", key="cv3_prom",
                     help=(
                         f"Minimum peak height relative to its surrounding baseline. "
+                        f"0 = no minimum prominence filter. "
                         f"Auto = 5 % of current range ({_auto_prom3:.3g} {SS.cv_cur_unit})."
                     ),
                 )
@@ -643,15 +640,26 @@ def render() -> None:
                             _psumm3.append({
                                 f"Scan rate ({SS.cv_sr_unit})": _r3["scan_rate"],
                                 "Channel":                       _ch3n,
-                                "Anodic peaks":                  len(_na3),
+                                # ⚠ flags runs with >1 candidate peak, where the
+                                # "largest |Ip|" heuristic below can silently pick
+                                # a noise spike instead of the intended peak —
+                                # worth a visual double-check on the CV Plot tab.
+                                "Anodic peaks":                  (f"⚠ {len(_na3)}" if len(_na3) > 1 else len(_na3)),
                                 f"Main Ep,a ({SS.volt_unit})":   fmt(_pa3["Ep"]) if _pa3 else "—",
                                 f"Main Ip,a ({SS.cv_cur_unit})": fmt(_pa3["Ip"]) if _pa3 else "—",
-                                "Cathodic peaks":                len(_nc3),
+                                "Cathodic peaks":                (f"⚠ {len(_nc3)}" if len(_nc3) > 1 else len(_nc3)),
                                 f"Main Ep,c ({SS.volt_unit})":   fmt(_pc3["Ep"]) if _pc3 else "—",
                                 f"Main Ip,c ({SS.cv_cur_unit})": fmt(_pc3["Ip"]) if _pc3 else "—",
                             })
                     if _psumm3:
                         with st.expander("Peak count summary", expanded=True):
+                            st.caption(
+                                "⚠ marks a run with more than one candidate peak, "
+                                "where \"Main Ep/Ip\" (the largest |Ip|) can pick a "
+                                "noise spike instead of the intended peak — verify "
+                                "visually on the **CV Plot** tab or raise Prominence/"
+                                "Min distance above."
+                            )
                             st.dataframe(pd.DataFrame(_psumm3), use_container_width=True, hide_index=True)
     
                     # ── Full peak list ─────────────────────────────────────────
@@ -864,6 +872,7 @@ def render() -> None:
                         "irreversible electron transfer kinetics."
                     )
                     _fig_dep_nu = go.Figure()
+                    _any_dep4 = False
                     for _ci4, _chn4 in enumerate(_sel_chs4):
                         _col4 = PAL[_ci4 % len(PAL)]
                         _d4   = _ch4_data[_chn4]
@@ -872,6 +881,7 @@ def render() -> None:
                         _vdep = np.isfinite(_dep4)
                         if not _vdep.any():
                             continue
+                        _any_dep4 = True
                         _fig_dep_nu.add_trace(go.Scatter(
                             x=_nu4[_vdep], y=_dep4[_vdep],
                             name=_chn4, mode="markers+lines",
@@ -879,15 +889,24 @@ def render() -> None:
                                         line=dict(width=1, color="white")),
                             line=dict(color=_col4),
                         ))
-                    _fig_dep_nu.update_layout(**_dl4,
-                        xaxis_title=f"Scan rate ν ({SS.cv_sr_unit})",
-                        yaxis_title=f"ΔEp ({SS.volt_unit})")
-                    st.plotly_chart(_fig_dep_nu, use_container_width=True, key="cv4_dep_nu")
-                    st.download_button(
-                        "Download ΔEp vs ν — HTML",
-                        data=_fig_dep_nu.to_html(include_plotlyjs="cdn"),
-                        file_name="dep_vs_nu.html", mime="text/html", key="cv4_dep_nu_html",
-                    )
+                    if not _any_dep4:
+                        st.info(
+                            "No ΔEp/E½ to plot — every selected channel is missing "
+                            "either an anodic or a cathodic peak at every scan rate "
+                            "(expected for an irreversible couple, which has only "
+                            "one). Check the **Peak Analysis** peak counts if this "
+                            "wasn't expected."
+                        )
+                    else:
+                        _fig_dep_nu.update_layout(**_dl4,
+                            xaxis_title=f"Scan rate ν ({SS.cv_sr_unit})",
+                            yaxis_title=f"ΔEp ({SS.volt_unit})")
+                        st.plotly_chart(_fig_dep_nu, use_container_width=True, key="cv4_dep_nu")
+                        st.download_button(
+                            "Download ΔEp vs ν — HTML",
+                            data=_fig_dep_nu.to_html(include_plotlyjs="cdn"),
+                            file_name="dep_vs_nu.html", mime="text/html", key="cv4_dep_nu_html",
+                        )
     
                     # ── Export ────────────────────────────────────────────────────
                     st.divider()

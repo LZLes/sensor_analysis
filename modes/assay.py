@@ -41,17 +41,35 @@ def _plate_get(plate_df: pd.DataFrame | None, well: str) -> float:
         return np.nan
 
 
+def _is_plate_num(s: str) -> bool:
+    try:
+        float(s.strip().replace(",", "."))
+        return True
+    except ValueError:
+        return False
+
+
 def parse_plate_csv(raw: str) -> pd.DataFrame:
     """
     Parse a microplate reader export into an 8×12 DataFrame (index A–H, cols 1–12).
     Handles TECAN/Synergy/generic grid formats (tab, comma, semicolon delimited).
+    Only 96-well plates are supported — raises rather than silently returning
+    a truncated subset if the file looks like a larger (e.g. 384-well) plate.
     """
     import re as _re
-    row_re = _re.compile(r'^\s*([A-Ha-h])(?:[,;\t]|\s)')
+    row_re      = _re.compile(r'^\s*([A-Ha-h])(?:[,;\t]|\s)')
+    oversize_re = _re.compile(r'^\s*([I-Pi-p])(?:[,;\t]|\s)')
     grid: dict[str, list[float]] = {}
+    oversize_rows: set[str] = set()
     for line in raw.splitlines():
         m = row_re.match(line)
         if not m:
+            om = oversize_re.match(line)
+            if om:
+                parts_o = _re.split(r'[,;\t]+', line.strip())
+                nums_o  = sum(1 for p in parts_o[1:] if _is_plate_num(p))
+                if nums_o >= 3:   # looks like a real data row, not a stray label
+                    oversize_rows.add(om.group(1).upper())
             continue
         letter = m.group(1).upper()
         parts  = _re.split(r'[,;\t]+', line.strip())
@@ -64,7 +82,19 @@ def parse_plate_csv(raw: str) -> pd.DataFrame:
             except ValueError:
                 continue
         if nums:
-            grid[letter] = nums[:12]
+            if len(nums) > 12:
+                raise ValueError(
+                    f"Row {letter} has {len(nums)} numeric columns — this parser "
+                    "only supports 96-well plates (columns 1-12). 384-well "
+                    "plates aren't supported yet."
+                )
+            grid[letter] = nums
+    if oversize_rows:
+        raise ValueError(
+            f"Found row(s) beyond H ({', '.join(sorted(oversize_rows))}) — this "
+            "parser only supports 96-well plates (rows A-H). 384-well plates "
+            "aren't supported yet."
+        )
     if not grid:
         raise ValueError(
             "No plate rows found — expected rows labeled A–H. "
@@ -285,11 +315,19 @@ def render() -> None:
                 type=["csv", "txt"], key="assay_up",
                 help="Grid format with rows A–H. TECAN, Synergy, and generic tab/comma files are supported.",
             )
-            if _a1_up is not None:
+            if _a1_up is not None and _a1_up.file_id != SS.get("_assay_up_last_id"):
+                # file_id changes only when a genuinely new file is chosen —
+                # st.file_uploader otherwise keeps returning the same
+                # UploadedFile on every rerun, so without this guard any later
+                # interaction anywhere in the app (switching tabs, editing
+                # Standards, clicking Compute) would silently re-parse and
+                # revert any manual grid edits made after the upload.
+                SS["_assay_up_last_id"] = _a1_up.file_id
                 try:
                     SS["assay_plate"] = parse_plate_csv(
                         _a1_up.read().decode("utf-8", errors="replace")
                     )
+                    SS["assay_std_res"] = None   # stale fit — invalidate on new data
                     st.success(f"Loaded — {int(SS['assay_plate'].notna().sum().sum())} wells with data.")
                 except Exception as _exc_a1:
                     st.error(f"Parse error: {_exc_a1}")
@@ -320,6 +358,7 @@ def render() -> None:
                 _mdf.index   = pd.Index(_PLATE_ROWS[:len(_mdf)], name="Row")
                 _mdf.columns = pd.Index(range(1, len(_mdf.columns) + 1), name="Col")
                 SS["assay_plate"] = _mdf.apply(pd.to_numeric, errors="coerce")
+                SS["assay_std_res"] = None   # stale fit — invalidate on edited data
                 st.success("Plate values updated.")
     
             if SS["assay_plate"] is not None:
@@ -329,6 +368,7 @@ def render() -> None:
                     _plate_fig(SS["assay_plate"], _build_std_wells_map(), _build_sample_map(),
                                SS["assay_conc_unit"], SS["assay_sig_unit"]),
                     use_container_width=True, config={"displayModeBar": False},
+                    key="as1_plate_map",
                 )
     
         # ── AS2 · Standards ───────────────────────────────────────────────────────
@@ -396,6 +436,7 @@ def render() -> None:
                     _plate_fig(SS["assay_plate"], _build_std_wells_map(), _build_sample_map(),
                                SS["assay_conc_unit"], SS["assay_sig_unit"]),
                     use_container_width=True, config={"displayModeBar": False},
+                    key="as2_layout_preview",
                 )
     
         # ── AS3 · Standard Curve ──────────────────────────────────────────────────
@@ -419,20 +460,36 @@ def render() -> None:
                 )
     
                 if st.button("Compute standard curve", type="primary", key="assay_compute"):
-                    _a3_sdf  = SS["assay_std_df"].dropna(subset=["Conc"]).reset_index(drop=True)
-                    _a3_pl   = SS["assay_plate"]
-                    if len(_a3_sdf) < 2:
-                        st.error("Need at least 2 concentration levels (including blank).")
+                    _a3_std_raw = SS["assay_std_df"]
+                    # The blank is defined as the literal first row (matching the
+                    # Standards-tab caption and the plate-map's blank highlighting
+                    # in _build_std_wells_map, which also uses row 0) — NOT
+                    # argmin(Conc), which can point at a different row if the
+                    # table isn't sorted ascending. Check this before dropna()
+                    # below, since dropping the blank row (if its Conc is blank)
+                    # would otherwise silently make some other row "row 0".
+                    if len(_a3_std_raw) == 0 or pd.isna(_a3_std_raw["Conc"].iloc[0]):
+                        st.error("The first row (the Blank) needs a Concentration "
+                                 "value filled in on the **Standards** tab.")
                         st.stop()
-    
+
+                    _a3_sdf  = _a3_std_raw.dropna(subset=["Conc"]).reset_index(drop=True)
+                    _a3_pl   = SS["assay_plate"]
+                    if len(_a3_sdf) < 3:
+                        # The blank is excluded from the fit itself (see _ok
+                        # below), so fitting needs at least 2 NON-blank levels.
+                        st.error("Need the blank plus at least 2 non-blank "
+                                 "concentration levels to fit a curve.")
+                        st.stop()
+
                     # Collect raw signal values: shape (n_levels, 3)
                     _a3_raw = np.array([
                         [_plate_get(_a3_pl, str(_r.get(sc, "")).strip().upper())
                          for sc in ["S1", "S2", "S3"]]
                         for _, _r in _a3_sdf.iterrows()
                     ], dtype=float)
-    
-                    _a3_blank_pos = int(np.argmin(_a3_sdf["Conc"].values))
+
+                    _a3_blank_pos = 0
                     _a3_blank = float(np.nanmean(_a3_raw[_a3_blank_pos]))
                     if not np.isfinite(_a3_blank):
                         st.error("Blank row has no valid signal. Check well addresses in **Standards**.")
@@ -444,7 +501,14 @@ def render() -> None:
                     _a3_concs = _a3_sdf["Conc"].values.astype(float)
                     _a3_lbls  = _a3_sdf["Label"].values
                     _ok       = np.isfinite(_a3_concs) & np.isfinite(_a3_means)
-    
+                    # Exclude the blank from the fit itself — ΔSignal = 0 there
+                    # by construction (it's the value everything else was
+                    # subtracted against), not an independent measurement of
+                    # the concentration-response relationship. Matches
+                    # Amperometry's baseline-point exclusion from its fit.
+                    # Still shown in the plot/tables below.
+                    _ok[_a3_blank_pos] = False
+
                     _a3_fit: dict | None = None
                     if _a3_fit_lbl == "Linear":
                         _lr = lin_reg(_a3_concs[_ok], _a3_means[_ok])
@@ -561,7 +625,7 @@ def render() -> None:
                             borderwidth=1, borderpad=6,
                         )],
                     )
-                    st.plotly_chart(_fig_sc, use_container_width=True,
+                    st.plotly_chart(_fig_sc, use_container_width=True, key="as3_std_curve",
                                     config={"scrollZoom": True, "displayModeBar": True,
                                             "modeBarButtonsToRemove": ["select2d","lasso2d"]})
                     st.download_button(
@@ -583,10 +647,21 @@ def render() -> None:
                             f"**mean = {_r3['blank_mean']:.5g}** {SS['assay_sig_unit']}"
                         )
     
+                        def _sd_cell(_sd_val, _n_reps: int) -> str:
+                            # SD/CV are NaN both when a level is genuinely
+                            # missing all data AND when it has exactly one
+                            # replicate (ddof=1 std of 1 point is undefined) —
+                            # "n=1" tells those two cases apart instead of a
+                            # bare "—" for both.
+                            if np.isfinite(_sd_val):
+                                return fmt(_sd_val)
+                            return "n=1" if _n_reps == 1 else "—"
+
                         _a3_tbl_mid = []
                         for _ki3 in range(len(_cx3)):
                             _raw3  = np.array(_r3["raw_arr"][_ki3],   float)
                             _del3  = np.array(_r3["delta_arr"][_ki3], float)
+                            _nrep3 = int(np.isfinite(_del3).sum())
                             _a3_tbl_mid.append({
                                 "Label": _lb3[_ki3],
                                 f"Conc ({SS['assay_conc_unit']})":      f"{_cx3[_ki3]:.5g}",
@@ -597,18 +672,19 @@ def render() -> None:
                                 f"S2 Δ ({SS['assay_sig_unit']})":       fmt(_del3[1]),
                                 f"S3 Δ ({SS['assay_sig_unit']})":       fmt(_del3[2]),
                                 f"Mean Δ ({SS['assay_sig_unit']})":     fmt(_my3[_ki3]),
-                                f"SD ({SS['assay_sig_unit']})":         fmt(_sy3[_ki3]),
+                                f"SD ({SS['assay_sig_unit']})":         _sd_cell(_sy3[_ki3], _nrep3),
                                 "CV (%)": fmt(abs(_sy3[_ki3] / _my3[_ki3]) * 100
                                               if np.isfinite(_my3[_ki3]) and _my3[_ki3] != 0 else np.nan, 2),
                             })
                         st.dataframe(pd.DataFrame(_a3_tbl_mid),
                                      use_container_width=True, hide_index=True)
-    
+
                     # Summary table
                     st.subheader("Standard summary")
                     _a3_tbl = []
                     for _ki3 in range(len(_cx3)):
                         _raw3 = np.array(_r3["raw_arr"][_ki3], float)
+                        _nrep3s = int(np.isfinite(_raw3).sum())
                         _a3_tbl.append({
                             "Label": _lb3[_ki3],
                             f"Conc ({SS['assay_conc_unit']})": f"{_cx3[_ki3]:.5g}",
@@ -616,7 +692,8 @@ def render() -> None:
                             f"Set 2 ({SS['assay_sig_unit']})": fmt(_raw3[1]),
                             f"Set 3 ({SS['assay_sig_unit']})": fmt(_raw3[2]),
                             f"Mean Δ ({SS['assay_sig_unit']})": fmt(_my3[_ki3]),
-                            f"SD ({SS['assay_sig_unit']})": fmt(_sy3[_ki3]),
+                            f"SD ({SS['assay_sig_unit']})": (fmt(_sy3[_ki3]) if np.isfinite(_sy3[_ki3])
+                                                              else ("n=1" if _nrep3s == 1 else "—")),
                             "CV (%)": fmt(abs(_sy3[_ki3] / _my3[_ki3]) * 100
                                           if np.isfinite(_my3[_ki3]) and _my3[_ki3] != 0 else np.nan, 2),
                         })
@@ -630,7 +707,6 @@ def render() -> None:
                         _a3_sty = _a3p1.selectbox("Style", ["Origin","Minimal"], key="as3_sty")
                         _a3_fmt = _a3p2.selectbox("Format", ["SVG","PNG","PDF","TIFF"], key="as3_fmt")
                         _a3_dpi = _a3p3.segmented_control("DPI", [150,300,600], default=300,
-                                                            required=True,
                                                             key="as3_dpi", disabled=_a3_fmt in ["SVG","PDF"])
                         _a3_sz  = _a3p4.selectbox(
                             "Width",
@@ -640,7 +716,9 @@ def render() -> None:
                     _a3_fsm = {"Single (3.5\")": (3.5, 2.625), "1.5-col (5\")": (5.0, 3.75),
                                "Double (7\")": (7.0, 5.0), "Full (6.5\")": (6.5, 4.5)}
                     _a3_pfs   = _a3_fsm[_a3_sz]
-                    _a3_pdpi  = int(_a3_dpi) if _a3_fmt not in ["SVG","PDF"] else 300
+                    # segmented_control can be clicked off to None (no `required`
+                    # kwarg in current Streamlit) — fall back to the 300 default.
+                    _a3_pdpi  = int(_a3_dpi) if (_a3_dpi is not None and _a3_fmt not in ["SVG","PDF"]) else 300
                     _a3_pstyl = _a3_sty.lower()
     
                     _a3_prev = render_assay_curve(
@@ -690,8 +768,13 @@ def render() -> None:
                         return float((dy - _f4["intercept"]) / s) if s != 0 else np.nan
                     elif ft == "quad":
                         a, b, c = _f4["a"], _f4["b"], _f4["c"] - dy
+                        # A near-zero quadratic term is a degenerate (linear)
+                        # case, not an unsolvable one — fall back to the
+                        # linear-equivalent solve instead of returning "undefined".
+                        if abs(a) <= 1e-9 * max(abs(b), 1e-12):
+                            return float(-c / b) if b != 0 else np.nan
                         disc = b**2 - 4*a*c
-                        if disc < 0 or a == 0:
+                        if disc < 0:
                             return np.nan
                         r1 = (-b + np.sqrt(disc)) / (2*a)
                         r2 = (-b - np.sqrt(disc)) / (2*a)
@@ -763,5 +846,6 @@ def render() -> None:
                     _plate_fig(SS["assay_plate"], _a4_sw, _slmap4,
                                SS["assay_conc_unit"], SS["assay_sig_unit"]),
                     use_container_width=True, config={"displayModeBar": False},
+                    key="as4_results_plate_map",
                 )
     

@@ -16,10 +16,17 @@ def init_session_state() -> None:
         ("solid_files", []),     # [{filename, df, channels}] — multi-file solid-state (potentiometric)
         ("solid_cal_results", None),
         ("cal_results", None),
-        ("ts_fig", None),
         ("cal_fig", None),
-        ("ts_visible", []),
-        ("conc_unit", "mM"),
+        ("solid_cal_fig", None),
+        # ts_fig/ts_visible are intentionally NOT declared here — they're
+        # namespaced per mode as f"{files_key}_ts_fig"/f"{files_key}_ts_vis_ms"
+        # (set in core/shared_tabs.py) so Amperometry and Solid-State don't
+        # silently share one Time Series plot/selection between modes.
+        ("conc_unit", "mM"),          # Amperometry's concentration unit
+        ("solid_conc_unit", "M"),     # Solid-State's own concentration unit — kept
+                                       # separate from conc_unit since the two
+                                       # modes' typical concentration ranges/units
+                                       # differ and shouldn't leak into each other
         ("cur_unit", "µA"),
         ("solid_unit", "mV"),
         ("vol_unit", "µL"),
