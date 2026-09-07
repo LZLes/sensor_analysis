@@ -6,6 +6,9 @@ import numpy as np
 import streamlit as st
 
 
+APP_VERSION = "1.0.0"
+APP_AUTHOR = "LZLes"
+
 PAL = [
     "#4c96d7", "#ff9230", "#2ecc71", "#e05c5c",
     "#b39ddb", "#f0a050", "#f48fb1", "#6d8ea0",

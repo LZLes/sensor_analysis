@@ -21,6 +21,7 @@ from core.drive import (
 from core.persistence import (
     _apply_cfg_dict, _build_cfg_dict, _build_session_bundle, _apply_session_bundle,
 )
+from core.constants import APP_VERSION, APP_AUTHOR
 from core.state import init_session_state
 import modes.amperometry
 import modes.assay
@@ -219,7 +220,7 @@ with st.sidebar:
         )
 
     st.divider()
-    st.caption("Sensor Analysis Studio")
+    st.caption(f"Sensor Analysis Studio · v{APP_VERSION} · {APP_AUTHOR}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
