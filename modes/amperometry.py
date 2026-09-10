@@ -223,8 +223,11 @@ def render_cal_png(res_map: dict, ft: str, ns: int,
                 _sign = "+" if b >= 0 else "−"
                 _ch_lines.append(f"{_pfx}y = {s:.3g}x {_sign} {abs(b):.3g}   R² = {r2:.4f}")
                 if np.isfinite(sigma_bl) and s != 0:
-                    lod = 3.0 * abs(sigma_bl) / abs(s)
-                    loq = 10.0 * abs(sigma_bl) / abs(s)
+                    # y = a + b*x; blank response in ΔI units is 0, so solve
+                    # the fitted line for x at y = 3.3*sigma (10*sigma for LOQ)
+                    # instead of assuming the intercept a is 0.
+                    lod = (3.3  * abs(sigma_bl) - b) / s
+                    loq = (10.0 * abs(sigma_bl) - b) / s
                     _ch_lines.append(
                         f"{_pfx}Sens = {s:.3g} {cur_unit}/{conc_unit}"
                         f"   LOD = {lod:.3g}   LOQ = {loq:.3g} {conc_unit}"
@@ -952,8 +955,14 @@ def render() -> None:
     
                         sigma   = res["sigma_bl"]
                         sens    = seg["slope"]
-                        lod_val = (3.0  * abs(sigma) / abs(sens)) if sens else np.nan
-                        loq_val = (10.0 * abs(sigma) / abs(sens)) if sens else np.nan
+                        intcpt  = seg["intercept"]
+                        # y = a + b*x with a=intercept, b=slope; the blank response
+                        # in ΔI units is 0 by construction, so the detection
+                        # threshold is y = 3.3*sigma (resp. 10*sigma for LOQ).
+                        # Solving the fitted line for x at that threshold —
+                        # LOD = (3.3*sigma - a)/b — instead of assuming a=0.
+                        lod_val = ((3.3  * abs(sigma) - intcpt) / sens) if sens else np.nan
+                        loq_val = ((10.0 * abs(sigma) - intcpt) / sens) if sens else np.nan
     
                         stat_rows.append({
                             "Channel": ch_name,
@@ -1017,8 +1026,8 @@ def render() -> None:
     | **Sensitivity** | Slope of the fit line — the current change per unit concentration ({SS.cur_unit}/{SS.conc_unit}) |
     | **Intercept** | Fitted current at zero analyte concentration |
     | **R²** | Coefficient of determination — closer to 1.0 indicates a better fit |
-    | **LOD** | Limit of Detection = 3 × σ_blank / sensitivity. Smallest concentration distinguishable from noise. |
-    | **LOQ** | Limit of Quantification = 10 × σ_blank / sensitivity. Smallest concentration reliably quantifiable. |
+    | **LOD** | Limit of Detection = (3.3 × σ_blank − Intercept) / Sensitivity — the concentration where the fitted line crosses a response of 3.3σ above the blank. Smallest concentration distinguishable from noise. |
+    | **LOQ** | Limit of Quantification = (10 × σ_blank − Intercept) / Sensitivity, by the same logic. Smallest concentration reliably quantifiable. |
     | **σ blank** | Standard deviation of the current during the baseline averaging window — a measure of baseline noise. |
     """)
                     st.dataframe(
