@@ -139,7 +139,7 @@ def _render_import_tab(
                     SS[conc_unit_key] = sample_conc_unit
                 if sample_signal_unit is not None:
                     SS[unit_key] = sample_signal_unit
-                SS[f"{files_key}_ts_vis_ms"] = []
+                SS.pop(f"{files_key}_ts_vis_ms", None)
                 SS[f"{files_key}_cal_editor_version"] = SS.get(f"{files_key}_cal_editor_version", 0) + 1
                 SS[active_file_key] = _sample_files[0]["filename"]
                 SS["_files_applied_msg"] = sample_loaded_msg
@@ -233,7 +233,7 @@ def _render_import_tab(
             if set_legacy_alias:
                 SS.df       = _parsed_files[0]["df"]
                 SS.channels = _parsed_files[0]["channels"]
-            SS[f"{files_key}_ts_vis_ms"] = []
+            SS.pop(f"{files_key}_ts_vis_ms", None)
             SS[f"{files_key}_cal_editor_version"] = SS.get(f"{files_key}_cal_editor_version", 0) + 1
             SS["_files_applied_msg"] = (
                 f"{len(_parsed_files)} file(s), "
