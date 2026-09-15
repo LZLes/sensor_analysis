@@ -146,7 +146,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name=f"{APP_FILE_NAME}.app",
-    icon=None,  # add macos_app/packaging/AppIcon.icns here once a real icon is designed
+    icon=str(REPO_ROOT / "macos_app" / "packaging" / "AppIcon.icns"),
     bundle_identifier=BUNDLE_ID,
     version=APP_VERSION,
     info_plist={
