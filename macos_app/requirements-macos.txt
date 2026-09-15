@@ -1,0 +1,16 @@
+# Runtime dependencies for the native macOS app (macos_app/).
+# Kept separate from the top-level requirements.txt so installing the
+# Streamlit app is never affected by Qt/packaging dependencies, and
+# vice versa.
+PySide6>=6.6.0
+PySide6-Addons>=6.6.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
+scipy>=1.11.0
+matplotlib>=3.7.0
+ollama>=0.3.0
+
+# Build-only (not needed to run macos_app/main.py from source):
+#   pyinstaller>=6.3.0
+#   pyinstaller-hooks-contrib

@@ -279,3 +279,53 @@ def _parse_one_file(_up, _fi: int, key_prefix: str = "amp") -> tuple[pd.DataFram
     )
     _df.columns = [c.lstrip("﻿").strip() for c in _df.columns]
     return _df, []
+
+
+# ── Non-Streamlit callers (e.g. macos_app/) ─────────────────────────────────
+# Added alongside _parse_one_file rather than refactoring it, so the
+# Streamlit UI above is untouched. Same parsing behavior, format/delimiter/
+# skip-rows passed in directly instead of read from st widgets.
+_DELIMITER_CHOICES = {
+    "auto": None,
+    "comma": ",", "tab": "\t", "semicolon": ";", "space": r"\s+",
+}
+
+
+def parse_with_options(
+    filename: str,
+    raw_bytes: bytes,
+    fmt: str = "standard",       # "standard" | "multichannel"
+    delimiter: str = "auto",     # one of _DELIMITER_CHOICES
+    skip_rows: int = 0,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Pure equivalent of _parse_one_file's logic, for callers with no
+    Streamlit widgets to read options from (format/delimiter/skip_rows are
+    plain arguments instead)."""
+    if filename.lower().endswith(".pssession"):
+        return parse_pssession(raw_bytes)
+
+    if raw_bytes[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        raw = raw_bytes.decode("utf-16")
+    else:
+        raw = raw_bytes.decode("utf-8", errors="replace")
+
+    if delimiter not in _DELIMITER_CHOICES:
+        raise ValueError(f"Unknown delimiter option: {delimiter!r}")
+    d = _DELIMITER_CHOICES[delimiter]
+    if d is None:
+        lines = raw.splitlines()
+        sniff_line = lines[skip_rows] if skip_rows < len(lines) else (lines[0] if lines else "")
+        d = next((c for c in [",", "\t", ";"] if c in sniff_line), r"\s+")
+
+    if fmt == "multichannel":
+        return parse_potentiostat_csv(raw, d)
+    if fmt != "standard":
+        raise ValueError(f"Unknown format option: {fmt!r}")
+
+    engine = "python" if d == r"\s+" else "c"
+    df = pd.read_csv(
+        io.StringIO(raw), sep=d, skiprows=skip_rows,
+        engine=engine, skipinitialspace=True,
+    )
+    df.columns = [c.lstrip("﻿").strip() for c in df.columns]
+    return df, []
