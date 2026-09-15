@@ -9,7 +9,11 @@ numpy>=1.24.0
 plotly>=5.18.0
 scipy>=1.11.0
 matplotlib>=3.7.0
-ollama>=0.3.0
+
+# ollama is deliberately NOT listed here: core/ai_insights.py (the only
+# consumer of the ollama package) was flagged in the migration plan as a
+# cheap follow-up to wire into a mode view, but was never actually built —
+# nothing in macos_app/ imports it. Add it back if/when that panel is built.
 
 # Not used interactively — the macOS app reuses pure functions straight out
 # of modes/solid_state.py, modes/amperometry.py, core/shared_tabs.py, and
@@ -20,6 +24,7 @@ ollama>=0.3.0
 # import, not duplication" approach, not something this app runs.
 streamlit>=1.32.0
 
-# Build-only (not needed to run macos_app/main.py from source):
-#   pyinstaller>=6.3.0
-#   pyinstaller-hooks-contrib
+# Build-only deps (PyInstaller etc., not needed to run macos_app/main.py
+# from source) live in macos_app/packaging/requirements-build.txt instead
+# of here, so a plain `pip install -r requirements-macos.txt` (to just run
+# the app) never pulls in packaging tooling.

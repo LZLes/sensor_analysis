@@ -1,0 +1,6 @@
+# Build-only dependencies for producing a macOS .app/.dmg via
+# macos_app/packaging/build_macos.sh — install alongside
+# macos_app/requirements-macos.txt (not instead of it), on the Mac doing
+# the build. Never needed just to run macos_app/main.py from source.
+pyinstaller>=6.3.0
+pyinstaller-hooks-contrib>=2024.0
