@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from macos_app.ui.app_state import AppState
+from macos_app.ui.modes.amperometry_view import AmperometryView
 from macos_app.ui.modes.solid_state_view import SolidStateView
 from macos_app.ui.settings import Settings
 
@@ -157,7 +158,9 @@ class MainWindow(QMainWindow):
 
         self._stack = QStackedWidget(central)
         for mode in _MODES:
-            if mode == "Solid-State":
+            if mode == "Amperometry":
+                self._stack.addWidget(AmperometryView(self.app_state, central))
+            elif mode == "Solid-State":
                 self._stack.addWidget(SolidStateView(self.app_state, central))
             else:
                 self._stack.addWidget(_placeholder_page(mode))

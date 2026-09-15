@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.calibration_table import _default_solid_cpdf
-from core.constants import fmt
+from core.constants import PAL, fmt
 from core.numeric import _eff_t_start, to_num
 from core.shared_tabs import _amp_label
 from macos_app.ui.app_state import AppState
@@ -58,12 +58,6 @@ _FILES_KEY = "solid_files"
 _UNIT_KEY = "solid_unit"
 _CONC_UNIT_KEY = "solid_conc_unit"
 _CPDF_COLUMNS = ["Label", "Concentration", "t_start", "t_end", "avg_duration", "Reading_mV"]
-_PAL = [
-    "#4c96d7", "#ff9230", "#2ecc71", "#e05c5c",
-    "#b39ddb", "#f0a050", "#f48fb1", "#6d8ea0",
-]
-
-
 class SolidStateView(QWidget):
     def __init__(self, app_state: AppState, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -197,7 +191,21 @@ class SolidStateView(QWidget):
         self._dataset_combo.blockSignals(False)
         if files:
             self._dataset_combo.setCurrentIndex(min(self._active_file_index, len(files) - 1))
+        self._refresh_channels_list()
         self._on_dataset_changed(self._dataset_combo.currentIndex())
+
+    def _refresh_channels_list(self) -> None:
+        """"Channels to analyse" spans every loaded file (matching
+        modes/solid_state.py's _solid_combo_lookup, built over all of
+        SS.solid_files) — independent of which file the Dataset selector
+        has active for editing its calibration table below."""
+        multi_file = len(self._files()) > 1
+        self._channels_list.clear()
+        for frec in self._files():
+            for ch in frec.get("channels", []):
+                label = _amp_label(frec["filename"], ch["name"], multi_file)
+                item = QListWidgetItem(label, self._channels_list)
+                item.setSelected(True)
 
     def _on_dataset_changed(self, index: int) -> None:
         if index < 0:
@@ -206,11 +214,6 @@ class SolidStateView(QWidget):
         frec = self._active_frec()
         if frec is None:
             return
-        self._channels_list.clear()
-        for ch in frec.get("channels", []):
-            label = _amp_label(frec["filename"], ch["name"], len(self._files()) > 1)
-            item = QListWidgetItem(label, self._channels_list)
-            item.setSelected(True)
         self._autodetect_panel.set_active_file(frec, self._active_file_index)
         self._load_active_cpdf_into_table()
 
@@ -323,7 +326,7 @@ class SolidStateView(QWidget):
         fig = go.Figure()
         stat_rows = []
         for j, (ch_name, res) in enumerate(res_map.items()):
-            col = _PAL[j % len(_PAL)]
+            col = PAL[j % len(PAL)]
             x = np.asarray(res["log_conc"], dtype=float)
             y = np.asarray(res["potential_mv"], dtype=float)
             vmask = res.get("valid_mask", [True] * len(res["labels"]))

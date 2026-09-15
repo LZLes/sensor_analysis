@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.constants import PAL
 from core.numeric import _eff_t_start, smooth_signal, to_num
 from core.shared_tabs import _amp_label, render_ts_png
 from macos_app.ui.app_state import AppState
@@ -40,10 +41,6 @@ from macos_app.ui.undo_commands import SetFieldCommand
 from macos_app.ui.widgets.plot_view import PlotView
 
 _DASHES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
-_PAL = [
-    "#4c96d7", "#ff9230", "#2ecc71", "#e05c5c",
-    "#b39ddb", "#f0a050", "#f48fb1", "#6d8ea0",
-]
 
 
 class TimeSeriesPanel(QWidget):
@@ -168,7 +165,7 @@ class TimeSeriesPanel(QWidget):
             t = to_num(df[ch["tc"]])
             raw = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
             smoothed = smooth_signal(raw, method, window, polyorder)
-            color = _PAL[(fi if multi_file else ci) % len(_PAL)]
+            color = PAL[(fi if multi_file else ci) % len(PAL)]
             dash = _DASHES[ci % len(_DASHES)] if multi_file else "solid"
             if method != "None":
                 fig.add_trace(go.Scatter(x=t, y=raw, name=f"{label} (raw)", mode="lines",
