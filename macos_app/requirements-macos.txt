@@ -1,0 +1,30 @@
+# Runtime dependencies for the native macOS app (macos_app/).
+# Kept separate from the top-level requirements.txt so installing the
+# Streamlit app is never affected by Qt/packaging dependencies, and
+# vice versa.
+PySide6>=6.6.0
+PySide6-Addons>=6.6.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
+scipy>=1.11.0
+matplotlib>=3.7.0
+
+# ollama is deliberately NOT listed here: core/ai_insights.py (the only
+# consumer of the ollama package) was flagged in the migration plan as a
+# cheap follow-up to wire into a mode view, but was never actually built —
+# nothing in macos_app/ imports it. Add it back if/when that panel is built.
+
+# Not used interactively — the macOS app reuses pure functions straight out
+# of modes/solid_state.py, modes/amperometry.py, core/shared_tabs.py, and
+# core/constants.py (fit math, PNG-export builders) rather than duplicating
+# them. Those files do `import streamlit as st` at module level (even
+# though the specific reused functions never call st.*), so importing them
+# at all requires streamlit installed. A side effect of the "reuse via
+# import, not duplication" approach, not something this app runs.
+streamlit>=1.32.0
+
+# Build-only deps (PyInstaller etc., not needed to run macos_app/main.py
+# from source) live in macos_app/packaging/requirements-build.txt instead
+# of here, so a plain `pip install -r requirements-macos.txt` (to just run
+# the app) never pulls in packaging tooling.
