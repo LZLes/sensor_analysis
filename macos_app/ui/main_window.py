@@ -40,6 +40,8 @@ from macos_app.ui.modes.assay_view import AssayView
 from macos_app.ui.modes.cyclic_voltammetry_view import CyclicVoltammetryView
 from macos_app.ui.modes.solid_state_view import SolidStateView
 from macos_app.ui.settings import Settings
+from macos_app.ui.update_dialogs import show_check_failed_dialog, show_up_to_date_dialog, show_update_available_dialog
+from macos_app.update_check import UpdateChecker
 
 _MODES = ["Amperometry", "Solid-State", "Cyclic Voltammetry", "Assay"]
 
@@ -125,6 +127,23 @@ class MainWindow(QMainWindow):
         redo_action.setShortcut(QKeySequence.StandardKey.Redo)
         edit_menu.addAction(undo_action)
         edit_menu.addAction(redo_action)
+
+        help_menu = menu_bar.addMenu("&Help")
+        check_updates_action = QAction("Check for Updates…", self)
+        check_updates_action.triggered.connect(self._check_for_updates)
+        help_menu.addAction(check_updates_action)
+
+    def _check_for_updates(self) -> None:
+        # Explicit user action, unlike main.py's silent startup check — this
+        # one always reports back, including "you're up to date" or a
+        # network error, since the user asked directly. Held on self (not a
+        # local variable) so the async QNetworkAccessManager reply isn't at
+        # risk of the checker being garbage-collected mid-request.
+        self._update_checker = UpdateChecker()
+        self._update_checker.update_available.connect(lambda info: show_update_available_dialog(info, self))
+        self._update_checker.no_update.connect(lambda: show_up_to_date_dialog(self))
+        self._update_checker.check_failed.connect(lambda msg: show_check_failed_dialog(msg, self))
+        self._update_checker.check()
 
     def _rebuild_recent_menu(self) -> None:
         self._recent_menu.clear()
