@@ -52,6 +52,7 @@ from macos_app.ui.app_state import AppState
 from macos_app.ui.theme import plot_theme
 from macos_app.ui.undo_commands import SetFieldCommand, TableEditCommand
 from macos_app.ui.widgets.autodetect_panel import AutodetectPanel
+from macos_app.ui.widgets.comparison_view import ComparisonView
 from macos_app.ui.widgets.editable_table_view import EditableTableView
 from macos_app.ui.widgets.import_panel import ImportPanel
 from macos_app.ui.widgets.plot_view import PlotView
@@ -68,6 +69,66 @@ _FILES_KEY = "amp_files"
 _UNIT_KEY = "cur_unit"
 _CONC_UNIT_KEY = "conc_unit"
 _CPDF_COLUMNS = ["Label", "Concentration", "Spike Vol", "Stock Conc", "t_start", "t_end", "avg_duration", "Baseline"]
+
+
+def _compute_file_fit(frec: dict, app_state: AppState) -> dict | None:
+    """Comparison-tab adapter (see comparison_view.py): one independent
+    linear fit for this file alone, using its own calibration table and
+    first channel — not mixed with any other file's channels, unlike the
+    Calibration Curve tab's cross-file "Channels to analyse" selector.
+    Deliberately simple (always Linear, first channel only) since this is
+    a quick side-by-side comparison, not the full analysis workbench."""
+    channels = frec.get("channels", [])
+    if not channels:
+        return None
+    ch = channels[0]
+    cpdf = frec["cpdf"].dropna(subset=["t_end"]).reset_index(drop=True)
+    if cpdf.empty:
+        return None
+
+    base_rows = cpdf[cpdf["Baseline"].apply(lambda b: bool(b) if pd.notna(b) else False)]
+    base_idx = int(base_rows.index[0]) if len(base_rows) else 0
+
+    df = frec["df"]
+    t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
+    i_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+    i_arr = smooth_signal(i_arr, app_state.data.smooth_method, app_state.data.smooth_window, app_state.data.smooth_polyorder)
+
+    avgs = []
+    for _, row in cpdf.iterrows():
+        ets = _eff_t_start(row)
+        if ets is None:
+            avgs.append(np.nan)
+            continue
+        mask = (t_arr >= ets) & (t_arr <= row["t_end"])
+        pts = i_arr[mask]
+        pts = pts[~np.isnan(pts)]
+        avgs.append(float(np.mean(pts)) if pts.size > 0 else np.nan)
+
+    base_val = avgs[base_idx]
+    if np.isnan(base_val):
+        return None
+    delta_i = [(v - base_val) if not np.isnan(v) else np.nan for v in avgs]
+
+    keep = _baseline_keep_mask(cpdf["Baseline"].tolist())
+    x = np.asarray(cpdf["Concentration"].values, dtype=float)[keep]
+    y = np.asarray(delta_i, dtype=float)[keep]
+    fit_result = piecewise_fit(x, y, 1)
+    if not fit_result["segments"]:
+        return None
+    seg = fit_result["segments"][0]
+    curve_x = np.linspace(seg["xr"][0], seg["xr"][1], 100)
+    curve_y = seg["slope"] * curve_x + seg["intercept"]
+
+    conc_unit, cur_unit = app_state.get_field(_CONC_UNIT_KEY), app_state.get_field(_UNIT_KEY)
+    return {
+        "x": x.tolist(), "y": y.tolist(), "curve_x": curve_x.tolist(), "curve_y": curve_y.tolist(),
+        "stats": {
+            "File": frec["filename"], "Channel": ch["name"],
+            f"Sensitivity ({cur_unit}/{conc_unit})": fmt(seg["slope"]),
+            "R²": f"{seg['r2']:.4f}",
+        },
+    }
 
 
 class AmperometryView(QWidget):
@@ -181,6 +242,14 @@ class AmperometryView(QWidget):
         export_layout.addWidget(png_btn)
         export_layout.addStretch(1)
         tabs.addTab(export_tab, "④ Export")
+
+        # -- Tab 5: Comparison (Phase 8 QoL enhancement) -------------------
+        comparison_tab = ComparisonView(
+            app_state, _FILES_KEY, _compute_file_fit,
+            x_label=f"Concentration ({app_state.get_field(_CONC_UNIT_KEY)})",
+            y_label=f"ΔI ({app_state.get_field(_UNIT_KEY)})",
+        )
+        tabs.addTab(comparison_tab, "⑤ Compare Files")
 
         app_state.files_changed.connect(self._on_files_changed)
         app_state.cpdf_changed.connect(self._on_cpdf_changed)

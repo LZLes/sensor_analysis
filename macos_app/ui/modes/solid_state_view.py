@@ -42,6 +42,7 @@ from macos_app.ui.app_state import AppState
 from macos_app.ui.theme import plot_theme
 from macos_app.ui.undo_commands import TableEditCommand
 from macos_app.ui.widgets.autodetect_panel import AutodetectPanel
+from macos_app.ui.widgets.comparison_view import ComparisonView
 from macos_app.ui.widgets.editable_table_view import EditableTableView
 from macos_app.ui.widgets.import_panel import ImportPanel
 from macos_app.ui.widgets.plot_view import PlotView
@@ -58,6 +59,69 @@ _FILES_KEY = "solid_files"
 _UNIT_KEY = "solid_unit"
 _CONC_UNIT_KEY = "solid_conc_unit"
 _CPDF_COLUMNS = ["Label", "Concentration", "t_start", "t_end", "avg_duration", "Reading_mV"]
+
+
+def _compute_file_fit(frec: dict, app_state: AppState) -> dict | None:
+    """Comparison-tab adapter (see comparison_view.py): one independent
+    Nernstian fit for this file alone, using its own calibration table and
+    first channel — not mixed with any other file's channels, unlike the
+    Calibration Curve tab's cross-file "Channels to analyse" selector."""
+    channels = frec.get("channels", [])
+    if not channels:
+        return None
+    ch = channels[0]
+    cpdf = frec["cpdf"].copy()
+    if cpdf.empty:
+        return None
+    rejected = ~(cpdf["Concentration"].astype(float) > 0)
+    cpdf = cpdf[~rejected].reset_index(drop=True)
+    if cpdf.empty:
+        return None
+
+    df = frec["df"]
+    t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
+    e_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+
+    readings = []
+    for _, row in cpdf.iterrows():
+        if pd.notna(row.get("Reading_mV")):
+            readings.append(float(row["Reading_mV"]))
+            continue
+        ets = _eff_t_start(row)
+        if ets is None or pd.isna(row.get("t_end")):
+            readings.append(np.nan)
+            continue
+        mask = (t_arr >= ets) & (t_arr <= row["t_end"])
+        pts = e_arr[mask]
+        pts = pts[~np.isnan(pts)]
+        readings.append(float(np.mean(pts)) if pts.size > 0 else np.nan)
+
+    log_conc = np.log10(cpdf["Concentration"].astype(float).to_numpy())
+    potential = np.array(readings, dtype=float)
+    valid = ~np.isnan(potential)
+    if valid.sum() < 2:
+        return None
+
+    lod_fit = nernstian_lod_fit(log_conc[valid], potential[valid])
+    nern = lod_fit["nernstian_segment"]
+    if nern is None:
+        return None
+    x_valid = log_conc[valid]
+    curve_x = np.linspace(float(x_valid.min()), float(x_valid.max()), 100)
+    curve_y = nern["slope"] * curve_x + nern["intercept"]
+
+    conc_unit, signal_unit = app_state.get_field(_CONC_UNIT_KEY), app_state.get_field(_UNIT_KEY)
+    return {
+        "x": x_valid.tolist(), "y": potential[valid].tolist(), "curve_x": curve_x.tolist(), "curve_y": curve_y.tolist(),
+        "stats": {
+            "File": frec["filename"], "Channel": ch["name"],
+            f"Sensitivity ({signal_unit}/decade)": fmt(nern["slope"]),
+            "R²": f"{nern['r2']:.4f}",
+            f"LOD ({conc_unit})": fmt(lod_fit.get("lod_conc")),
+        },
+    }
+
+
 class SolidStateView(QWidget):
     def __init__(self, app_state: AppState, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -149,6 +213,14 @@ class SolidStateView(QWidget):
         export_layout.addWidget(png_btn)
         export_layout.addStretch(1)
         tabs.addTab(export_tab, "④ Export")
+
+        # -- Tab 5: Comparison (Phase 8 QoL enhancement) -------------------
+        comparison_tab = ComparisonView(
+            app_state, _FILES_KEY, _compute_file_fit,
+            x_label=f"log₁₀(Concentration [{app_state.get_field(_CONC_UNIT_KEY)}])",
+            y_label=f"Potential ({app_state.get_field(_UNIT_KEY)})",
+        )
+        tabs.addTab(comparison_tab, "⑤ Compare Files")
 
         app_state.files_changed.connect(self._on_files_changed)
         app_state.cpdf_changed.connect(self._on_cpdf_changed)
