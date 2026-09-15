@@ -4,20 +4,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Sensor Calibration Studio — a Streamlit app for importing multi-channel electrochemical sensor data (amperometry, potentiometric/solid-state, cyclic voltammetry) and microplate assay data, defining calibration windows, fitting calibration curves, and exporting results/plots. Single-user lab tool, no backend/database — all state lives in the Streamlit session and the user's browser.
+Sensor Calibration Studio — importing multi-channel electrochemical sensor data (amperometry, potentiometric/solid-state, cyclic voltammetry) and microplate assay data, defining calibration windows, fitting calibration curves, and exporting results/plots. Single-user lab tool, no backend/database.
+
+There are **two independent UIs sharing the same `core/` computation layer**:
+- The original **Streamlit app** (`app.py` + `modes/`) — all state lives in the Streamlit session and the user's browser. See "Streamlit app architecture" below.
+- A **native macOS app** (`macos_app/`) — a PySide6/Qt desktop UI built later, reusing `core/`'s pure functions and each mode's fit math directly rather than duplicating it. See "Native macOS app" below. **Never edit `app.py`, `modes/*.py`, or existing behavior of any `core/*.py` function to support the macOS app** — that UI is additive-only against this codebase; see its own section for how new shared logic gets added instead.
+
+See `README.md` for end-user install/run instructions for both. This file is architecture guidance for working in the code.
 
 ## Commands
 
 ```bash
+# Streamlit app
 pip install -r requirements.txt
 streamlit run app.py                 # runs on localhost:8501
+
+# Tests (exercise core/ and modes/ via Streamlit's AppTest harness — see tests/conftest.py)
+pip install -r requirements-dev.txt
+pytest tests/unit                    # fast, no browser/AppTest involved
+pytest tests/e2e tests/regression    # AppTest-driven, slower
+pytest                               # everything
+
+# macOS app (see README.md for the full build/package/install flow)
+pip install -r macos_app/requirements-macos.txt
+python -m macos_app.main
 ```
 
-There is no test suite, linter, or build step configured in this repo. There is no `README.md`.
+There is no linter or build step configured for the Streamlit app.
 
 The devcontainer (`.devcontainer/devcontainer.json`) runs the same `streamlit run` command with CORS/XSRF disabled for Codespaces preview.
 
-## Architecture
+## Streamlit app architecture
 
 **Entry point:** [app.py](app.py) only handles page chrome shared across all modes — sidebar (mode switcher + the three persistence mechanisms below) and dispatch to whichever mode is selected in `SS.mode`. All actual feature code lives in `core/` (shared infrastructure) and `modes/` (one file per analysis mode, each with a `render()` entry point that `app.py` calls).
 
@@ -43,3 +60,21 @@ Calibration tables are **per-file**, not shared across an upload batch — each 
 The plotting stack is split: **Plotly** for interactive in-app charts, **Matplotlib** (headless `Agg` backend, set at the top of `app.py` before any other import touches `pyplot`) for publication-style PNG/SVG/PDF export, via the shared rc-context presets in `core/plotting.py`.
 
 Secrets (`.streamlit/secrets.toml`) are gitignored; only `.example` is committed.
+
+Tests (`tests/`) exercise this code via Streamlit's `AppTest` harness rather than mocking `pandas`/`numpy`/`scipy`/`streamlit` — `tests/unit/` targets `core/`/`modes/` pure functions directly, `tests/e2e/` drives each mode's `render()` through `AppTest.from_function` (bypassing `app.py`'s sidebar/localStorage-loading code, which hangs under `AppTest` — see `tests/conftest.py`'s docstring), and `tests/regression/test_known_bugs.py` pins specific fixed bugs so they can't silently reappear.
+
+## Native macOS app
+
+`macos_app/` is a second, independent UI for the same computation layer — a PySide6/Qt desktop app, built after the Streamlit app existed, packaged as a standalone `.app`/`.dmg` rather than run via `streamlit run`. It has its own entry point (`macos_app/main.py`), its own dependency list (`macos_app/requirements-macos.txt`), and its own persistence model — it does not use `st.session_state`, `streamlit_local_storage`, or anything else Streamlit-specific at runtime.
+
+**Non-negotiable constraint: `macos_app/` never changes `app.py`, `modes/*.py`, or the existing behavior of any `core/*.py` function.** The Streamlit app must keep working unmodified. When `macos_app/` needs logic that's tangled up with a Streamlit widget call in an existing file (e.g. `core/parsing.py`'s `_parse_one_file` mixes parsing with `st.selectbox`/`st.number_input`), the fix is to add a new pure sibling function alongside the existing one (see `parse_with_options` next to `_parse_one_file`) — never to refactor the original. Where a whole interactive chart is built inside a Streamlit-coupled function (e.g. anything calling `core/constants.py`'s `_plot_theme()`, which reads `st.context.theme.type`), `macos_app/` rebuilds the equivalent Plotly figure as new code using its own `macos_app/ui/theme.py` instead of importing the original — see any `ui/modes/*_view.py`'s module docstring for the specific reasoning per mode. Everything genuinely pure (fit math, parsing, `step_detection.py`, `calibration_table.py`, PNG-export builders like `render_cal_png`) is imported and reused directly, unmodified.
+
+**Structure:**
+- `macos_app/ui/app_state.py` — `AppState`, the Qt equivalent of `core/state.py`'s `SS` dict: one instance per open window (not a singleton — multi-window is supported), owns a `QUndoStack`, mutated only through `macos_app/ui/undo_commands.py`'s commands (`SetFieldCommand` for a plain field, `FilesListCommand` for replacing a whole `amp_files`/`solid_files`/`cv_runs` list — these fire different signals on undo/redo and are **not** interchangeable, see that file's docstring, `TableEditCommand` for a per-file calibration-table edit).
+- `macos_app/ui/widgets/` — shared panels reused across modes the same way Streamlit's `core/shared_tabs.py` is: `import_panel.py`/`timeseries_panel.py`/`autodetect_panel.py` (Amperometry + Solid-State), `plot_view.py` (Plotly-in-`QWebEngineView`, used by every mode), `editable_table_view.py`/`pandas_table_model.py` (the `st.data_editor` replacement), `comparison_view.py` (cross-file overlay — new relative to the Streamlit app, not a port).
+- `macos_app/ui/modes/*_view.py` — one per mode, mirroring `modes/*.py`'s scope. Amperometry/Solid-State reuse the shared panels above; Cyclic Voltammetry and Assay are self-contained (matching how their Streamlit counterparts don't use `core/shared_tabs.py` either).
+- `macos_app/persistence.py` — Tier 2 (Export/Import JSON) only, **byte-compatible with `core/persistence.py`'s bundle shape** — a session exported from either app opens in the other. Reuses `core/persistence.py`'s `_jsonify`/`_plate_df_to_csv`/`_plate_df_from_csv` and `core/calibration_table.py`'s `_cpdf_from_records`/`_solid_cpdf_from_records` directly. Tier 1 (settings-only "Save") is `macos_app/ui/settings.py`'s `QSettings` wrapper, unrelated to browser `localStorage`. Tier 3 (Google Drive Cloud Sessions) was deliberately not built — a native app has a real filesystem, so Tier 2 already covers session sharing.
+- `macos_app/update_check.py` + `macos_app/ui/update_dialogs.py` — a lightweight "new version available" notifier against this repo's GitHub Releases API (not a full auto-updater — the app is ad-hoc signed, not notarized, so Gatekeeper's warning shows on every install regardless of how the download happened; see `update_check.py`'s docstring).
+- `macos_app/packaging/` — `pyinstaller.spec` + `build_macos.sh` build, ad-hoc sign, and `.dmg`-package the app. Must run on an actual Mac (PyInstaller doesn't cross-compile); see `README.md` for the full flow.
+
+Google Drive (`core/drive.py`) and Ollama AI Insights (`core/ai_insights.py`) are deliberately **not** imported anywhere in `macos_app/` — Drive per the tier-3 decision above, AI Insights because it was never wired into a mode view. Don't add either to `macos_app/packaging/pyinstaller.spec`'s `hiddenimports` without actually building the corresponding feature first: doing so previously pulled in `google-auth`'s `cryptography` dependency and broke the PyInstaller build in the sandbox this was developed in (see the spec file's comment).
