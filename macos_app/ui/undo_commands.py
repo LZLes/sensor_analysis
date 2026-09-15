@@ -51,6 +51,31 @@ class SetFieldCommand(QUndoCommand):
             self._app_state.setting_changed.emit(self._field_name)
 
 
+class FilesListCommand(SetFieldCommand):
+    """SetFieldCommand for replacing an entire per-file-list field
+    (amp_files/solid_files/cv_runs) wholesale — Apply Channel
+    Configuration, Load sample data, or a session Import — firing
+    files_changed on both redo and undo instead of setting_changed, since
+    every mode view's file-list UI (dataset selector, channel list,
+    comparison panel) listens for files_changed specifically. Plain
+    SetFieldCommand's setting_changed was a silent no-op for these fields:
+    the underlying AppState.data reverted correctly on undo, but nothing
+    told the file-list widgets to redraw.
+
+    Deliberately NOT used for per-file cpdf edits — TableEditCommand's
+    narrower notify_cpdf_changed is correct there; firing files_changed on
+    every table cell edit would reset the active-file selection back to 0
+    each time."""
+
+    def redo(self) -> None:
+        self._app_state.set_field_silent(self._field_name, self._new_value)
+        self._app_state.notify_files_changed(self._field_name)
+
+    def undo(self) -> None:
+        self._app_state.set_field_silent(self._field_name, self._old_value)
+        self._app_state.notify_files_changed(self._field_name)
+
+
 class TableEditCommand(SetFieldCommand):
     """SetFieldCommand for a per-file calibration/standards/sample table edit
     — also fires cpdf_changed / files_changed so table widgets refresh."""

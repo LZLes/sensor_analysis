@@ -14,6 +14,7 @@ phase's job is the shell they'll plug into.
 
 from __future__ import annotations
 
+import json
 from typing import Callable
 
 from PySide6.QtCore import Qt
@@ -26,11 +27,13 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QStackedWidget,
     QStatusBar,
     QWidget,
 )
 
+from macos_app.persistence import build_session_bundle, apply_session_bundle
 from macos_app.ui.app_state import AppState
 from macos_app.ui.modes.amperometry_view import AmperometryView
 from macos_app.ui.modes.assay_view import AssayView
@@ -98,6 +101,18 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        export_session_action = QAction("Export Session…", self)
+        export_session_action.setShortcut(QKeySequence.StandardKey.Save)
+        export_session_action.triggered.connect(self._export_session)
+        file_menu.addAction(export_session_action)
+
+        import_session_action = QAction("Import Session…", self)
+        import_session_action.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        import_session_action.triggered.connect(self._import_session)
+        file_menu.addAction(import_session_action)
+
+        file_menu.addSeparator()
+
         close_action = QAction("Close Window", self)
         close_action.setShortcut(QKeySequence.StandardKey.Close)
         close_action.triggered.connect(self.close)
@@ -133,6 +148,30 @@ class MainWindow(QMainWindow):
         )
         if paths:
             self._handle_incoming_files(paths)
+
+    def _export_session(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Export Session", "session.json", "JSON (*.json)")
+        if not path:
+            return
+        bundle = build_session_bundle(self.app_state)
+        with open(path, "w") as f:
+            json.dump(bundle, f)
+        self._settings.add_recent_file(path)
+        self.statusBar().showMessage(f"Session exported to {path}", 5000)
+
+    def _import_session(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import Session", "", "JSON (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                bundle = json.load(f)
+            apply_session_bundle(self.app_state, bundle)
+        except Exception as exc:  # noqa: BLE001 - surface any parse/apply failure to the user
+            QMessageBox.warning(self, "Import Session", f"Could not import session: {exc}")
+            return
+        self._settings.add_recent_file(path)
+        self.statusBar().showMessage(f"Session imported from {path}", 5000)
 
     def _handle_incoming_files(self, paths: list[str]) -> None:
         """Common landing point for both the Open... dialog and drag-and-drop.

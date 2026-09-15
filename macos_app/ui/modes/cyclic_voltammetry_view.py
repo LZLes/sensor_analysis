@@ -61,7 +61,7 @@ from core.parsing import parse_potentiostat_csv
 from core.plotting import _apply_spine_style
 from macos_app.ui.app_state import AppState
 from macos_app.ui.theme import plot_theme
-from macos_app.ui.undo_commands import SetFieldCommand
+from macos_app.ui.undo_commands import FilesListCommand, SetFieldCommand
 from macos_app.ui.widgets.plot_view import PlotView
 from modes.cyclic_voltammetry import find_cv_peaks
 
@@ -246,7 +246,19 @@ class CyclicVoltammetryView(QWidget):
         tabs.addTab(self._build_export_tab(), "⑤ Export")
 
         app_state.files_changed.connect(self._on_files_changed)
+        app_state.setting_changed.connect(self._on_setting_changed)
         self._refresh_loaded_runs_table()
+
+    _UNIT_FIELDS = {"volt_unit": "_volt_unit_edit", "cv_cur_unit": "_cur_unit_edit", "cv_sr_unit": "_sr_unit_edit"}
+
+    def _on_setting_changed(self, field_name: str) -> None:
+        """Keep the unit fields in sync when changed from outside this
+        panel (session Import, undo/redo) — same reasoning as
+        ImportPanel._on_setting_changed. setText() doesn't itself fire
+        editingFinished, so no loop back into _commit_unit."""
+        edit_attr = self._UNIT_FIELDS.get(field_name)
+        if edit_attr:
+            getattr(self, edit_attr).setText(self._app_state.get_field(field_name))
 
     def import_files(self, paths: list[str]) -> None:
         self._load_files(paths)
@@ -478,9 +490,8 @@ class CyclicVoltammetryView(QWidget):
                 errors.append(f"{filename}: {exc}")
 
         new_runs.sort(key=lambda r: r["scan_rate"])
-        cmd = SetFieldCommand(self._app_state, _FILES_KEY, new_runs, text="Load CV files")
-        self._app_state.undo_stack.push(cmd)
-        self._app_state.notify_files_changed(_FILES_KEY)
+        cmd = FilesListCommand(self._app_state, _FILES_KEY, new_runs, text="Load CV files")
+        self._app_state.undo_stack.push(cmd)  # push() calls redo(), which already fires files_changed
         msg = f"Loaded {len(new_runs)} file(s)."
         if errors:
             msg += " Errors: " + "; ".join(errors)
@@ -666,9 +677,8 @@ class CyclicVoltammetryView(QWidget):
                 peaks[ch["name"]] = find_cv_peaks(v, i, self._prom_spin.value(), self._dist_spin.value(), width, height)
             new_run["peaks"] = peaks
             new_runs.append(new_run)
-        cmd = SetFieldCommand(self._app_state, _FILES_KEY, new_runs, text="Find CV peaks")
-        self._app_state.undo_stack.push(cmd)
-        self._app_state.notify_files_changed(_FILES_KEY)
+        cmd = FilesListCommand(self._app_state, _FILES_KEY, new_runs, text="Find CV peaks")
+        self._app_state.undo_stack.push(cmd)  # push() calls redo(), which already fires files_changed
         self._peak_status.setText(f"Peaks found in {len(new_runs)} run(s).")
         self._render_cv_plot()
         self._refresh_peaks_table()

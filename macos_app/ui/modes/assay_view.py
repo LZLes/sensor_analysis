@@ -147,6 +147,34 @@ class AssayView(QWidget):
         tabs.addTab(self._build_curve_tab(), "③ Standard Curve")
         tabs.addTab(self._build_results_tab(), "④ Results & Export")
 
+        app_state.setting_changed.connect(self._on_setting_changed)
+        self._refresh_all()
+
+    _ASSAY_FIELDS = {"assay_plate", "assay_std_df", "assay_sample_df", "assay_std_res", "assay_sig_unit", "assay_conc_unit"}
+
+    def _on_setting_changed(self, field_name: str) -> None:
+        """Refresh this view when one of its fields changes from outside
+        its own button handlers — a session Import, or undo/redo. Without
+        this, importing a session while Assay is open would silently leave
+        the old plate/standards/curve on screen even though AppState now
+        holds different data."""
+        if field_name not in self._ASSAY_FIELDS:
+            return
+        if field_name == "assay_std_df":
+            self._std_table.set_dataframe(self._app_state.data.assay_std_df)
+        if field_name == "assay_sample_df":
+            self._sample_table.set_dataframe(self._app_state.data.assay_sample_df)
+        if field_name in ("assay_sig_unit", "assay_conc_unit"):
+            self._sig_unit_edit.setText(self._app_state.data.assay_sig_unit)
+            self._conc_unit_edit.setText(self._app_state.data.assay_conc_unit)
+        if field_name == "assay_std_res":
+            res = self._app_state.data.assay_std_res
+            if res is not None:
+                self._render_curve(res)
+            else:
+                self._curve_plot.set_figure(go.Figure())
+                self._std_summary_table.setRowCount(0)
+                self._std_summary_table.setColumnCount(0)
         self._refresh_all()
 
     def import_files(self, paths: list[str]) -> None:

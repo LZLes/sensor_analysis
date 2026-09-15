@@ -253,7 +253,16 @@ class AmperometryView(QWidget):
 
         app_state.files_changed.connect(self._on_files_changed)
         app_state.cpdf_changed.connect(self._on_cpdf_changed)
+        app_state.setting_changed.connect(self._on_setting_changed)
         self._refresh_dataset_list()
+
+    def _on_setting_changed(self, field_name: str) -> None:
+        """Keep the dilution calculator's fields in sync when changed from
+        outside this view (session Import, undo/redo)."""
+        if field_name == "initial_volume":
+            self._initial_volume_spin.setValue(self._app_state.data.initial_volume)
+        elif field_name == "vol_unit":
+            self._vol_unit_edit.setText(self._app_state.data.vol_unit)
 
     def import_files(self, paths: list[str]) -> None:
         self._import_panel.add_files(paths)

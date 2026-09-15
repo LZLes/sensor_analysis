@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 
 from core.parsing import parse_with_options
 from macos_app.ui.app_state import AppState
-from macos_app.ui.undo_commands import SetFieldCommand
+from macos_app.ui.undo_commands import FilesListCommand, SetFieldCommand
 
 _IMPORTABLE_SUFFIXES = (".csv", ".txt", ".pssession")
 _MAX_CHANNELS = 8
@@ -189,6 +189,18 @@ class ImportPanel(QWidget):
         self._status_label = QLabel("", self)
         outer.addWidget(self._status_label)
 
+        app_state.setting_changed.connect(self._on_setting_changed)
+
+    def _on_setting_changed(self, field_name: str) -> None:
+        """Keep the unit fields in sync with AppState when they change from
+        outside this panel's own editingFinished handlers — a session
+        Import, or undo/redo. setText() doesn't itself fire editingFinished,
+        so this can't loop back into _commit_conc_unit/_commit_signal_unit."""
+        if field_name == self._conc_unit_key:
+            self._conc_unit_edit.setText(self._app_state.get_field(self._conc_unit_key))
+        elif field_name == self._unit_key:
+            self._signal_unit_edit.setText(self._app_state.get_field(self._unit_key))
+
     # -- entry points ---------------------------------------------------------
     def add_files(self, paths: list[str]) -> None:
         """Public entry point for both the Browse dialog and drag-and-drop
@@ -231,9 +243,8 @@ class ImportPanel(QWidget):
         if sample_files is None:
             self._status_label.setText("Sample data files are missing from this deployment.")
             return
-        cmd = SetFieldCommand(self._app_state, self._files_key, sample_files, text="Load sample data")
-        self._app_state.undo_stack.push(cmd)
-        self._app_state.notify_files_changed(self._files_key)
+        cmd = FilesListCommand(self._app_state, self._files_key, sample_files, text="Load sample data")
+        self._app_state.undo_stack.push(cmd)  # push() calls redo(), which already fires files_changed
         self._status_label.setText(f"Sample data loaded ({len(sample_files)} file(s)).")
 
     def _apply_configuration(self) -> None:
@@ -248,9 +259,8 @@ class ImportPanel(QWidget):
             cpdf = existing_by_name[filename]["cpdf"] if filename in existing_by_name else self._seed_cpdf_fn()
             new_files.append({"filename": filename, "df": entry["df"], "channels": channels, "cpdf": cpdf})
 
-        cmd = SetFieldCommand(self._app_state, self._files_key, new_files, text="Apply channel configuration")
-        self._app_state.undo_stack.push(cmd)
-        self._app_state.notify_files_changed(self._files_key)
+        cmd = FilesListCommand(self._app_state, self._files_key, new_files, text="Apply channel configuration")
+        self._app_state.undo_stack.push(cmd)  # push() calls redo(), which already fires files_changed
         n_channels = sum(len(f["channels"]) for f in new_files)
         self._status_label.setText(f"{len(new_files)} file(s), {n_channels} channel(s) applied.")
         self._pending.clear()
