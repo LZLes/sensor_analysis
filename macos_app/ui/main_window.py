@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from macos_app.ui.app_state import AppState
+from macos_app.ui.modes.solid_state_view import SolidStateView
 from macos_app.ui.settings import Settings
 
 _MODES = ["Amperometry", "Solid-State", "Cyclic Voltammetry", "Assay"]
@@ -132,13 +133,16 @@ class MainWindow(QMainWindow):
 
     def _handle_incoming_files(self, paths: list[str]) -> None:
         """Common landing point for both the Open... dialog and drag-and-drop.
-        Real per-mode import wiring (parse_with_options + AppState update)
-        lands in Phase 4 alongside the import panel; for now this records
-        Recent Files and confirms the drop/pick path works end-to-end."""
+        Forwards to the active mode's view if it knows how to import files
+        (see SolidStateView.import_files); modes without a real view yet
+        just get Recent Files recorded."""
         for path in paths:
             self._settings.add_recent_file(path)
+        current_page = self._stack.currentWidget()
+        if hasattr(current_page, "import_files"):
+            current_page.import_files(paths)
         names = ", ".join(p.split("/")[-1] for p in paths)
-        self.statusBar().showMessage(f"Ready to import: {names}", 5000)
+        self.statusBar().showMessage(f"Importing: {names}", 5000)
 
     # -- mode switcher ------------------------------------------------------
     def _build_central_widget(self) -> None:
@@ -153,7 +157,10 @@ class MainWindow(QMainWindow):
 
         self._stack = QStackedWidget(central)
         for mode in _MODES:
-            self._stack.addWidget(_placeholder_page(mode))
+            if mode == "Solid-State":
+                self._stack.addWidget(SolidStateView(self.app_state, central))
+            else:
+                self._stack.addWidget(_placeholder_page(mode))
 
         layout.addWidget(self._mode_list)
         layout.addWidget(self._stack, 1)

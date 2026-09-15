@@ -11,6 +11,15 @@ scipy>=1.11.0
 matplotlib>=3.7.0
 ollama>=0.3.0
 
+# Not used interactively — the macOS app reuses pure functions straight out
+# of modes/solid_state.py, modes/amperometry.py, core/shared_tabs.py, and
+# core/constants.py (fit math, PNG-export builders) rather than duplicating
+# them. Those files do `import streamlit as st` at module level (even
+# though the specific reused functions never call st.*), so importing them
+# at all requires streamlit installed. A side effect of the "reuse via
+# import, not duplication" approach, not something this app runs.
+streamlit>=1.32.0
+
 # Build-only (not needed to run macos_app/main.py from source):
 #   pyinstaller>=6.3.0
 #   pyinstaller-hooks-contrib
