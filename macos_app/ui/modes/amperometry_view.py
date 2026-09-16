@@ -1,20 +1,25 @@
 """
-AmperometryView — the Amperometry mode's Qt view (Phase 5).
+AmperometryView — the Amperometry mode's Qt view.
 
-Reuses Phase 4's ImportPanel/TimeSeriesPanel/AutodetectPanel unchanged
-(both modes share the exact same Import/Time-Series UI shape in the
-Streamlit app too), and calls modes/amperometry.py's fit/PNG functions
-directly (piecewise_fit, _apply_effective_concentration, render_cal_png) —
-none of them touched.
+Reuses Phase 4's ImportPanel/TimeSeriesPanel/AutodetectPanel (channel
+assignment now lives in TimeSeriesPanel's module, see its docstring) and
+calls modes/amperometry.py's fit/PNG functions directly (piecewise_fit,
+_apply_effective_concentration, render_cal_png) — none of them touched.
 
-Scope note (like Phase 4's ImportPanel note): the Streamlit version also
-has a "Quick-fill: common calibration protocols" preset expander, an
-"Averaging window details" results expander, interactive-HTML downloads,
-and a publication-quality (SVG/PDF/TIFF, DPI/size) export panel. This pass
+Tab layout is a 4-step pipeline (Import → Time Series & Windows →
+Calibration Results → Export), plus a 5th Compare Files tab, replacing the
+earlier 5-tab layout that split channel assignment from the trace view and
+crowded fit-settings/autodetect/calibration-table/dilution-calculator into
+one "Calibration Curve" tab. See the "Streamline Amperometry/Solid-State/CV"
+plan for the reasoning.
+
+Scope note (unchanged from before): the Streamlit version also has a
+"Quick-fill: common calibration protocols" preset expander, an "Averaging
+window details" results expander, and interactive-HTML downloads. This pass
 covers the mode's defining features versus Solid-State — baseline
 subtraction, segmented-linear fits, the channel-average trace, and the
-effective-concentration dilution calculator — plus PNG export; the
-remaining UI is straightforward follow-up on the same patterns already
+effective-concentration dilution calculator — plus customizable PNG export;
+the remaining UI is straightforward follow-up on the same patterns already
 established (ImportPanel, PlotView, EditableTableView).
 """
 
@@ -23,6 +28,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -33,10 +39,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -49,14 +55,16 @@ from core.constants import AVG_COLOR, PAL, fmt
 from core.numeric import _eff_t_start, smooth_signal, to_num
 from core.shared_tabs import _amp_label
 from macos_app.ui.app_state import AppState
+from macos_app.ui.dialogs.export_options_dialog import ExportOptionsDialog
 from macos_app.ui.theme import plot_theme
-from macos_app.ui.undo_commands import SetFieldCommand, TableEditCommand
+from macos_app.ui.undo_commands import FilesListCommand, SetFieldCommand, TableEditCommand
 from macos_app.ui.widgets.autodetect_panel import AutodetectPanel
+from macos_app.ui.widgets.collapsible import make_collapsible
 from macos_app.ui.widgets.comparison_view import ComparisonView
 from macos_app.ui.widgets.editable_table_view import EditableTableView
 from macos_app.ui.widgets.import_panel import ImportPanel
 from macos_app.ui.widgets.plot_view import PlotView
-from macos_app.ui.widgets.timeseries_panel import TimeSeriesPanel
+from macos_app.ui.widgets.timeseries_panel import TimeSeriesPanel, _FileChannelEditor
 from modes.amperometry import (
     _apply_effective_concentration,
     _cpdf_from_autodetect_windows,
@@ -75,9 +83,9 @@ def _compute_file_fit(frec: dict, app_state: AppState) -> dict | None:
     """Comparison-tab adapter (see comparison_view.py): one independent
     linear fit for this file alone, using its own calibration table and
     first channel — not mixed with any other file's channels, unlike the
-    Calibration Curve tab's cross-file "Channels to analyse" selector.
-    Deliberately simple (always Linear, first channel only) since this is
-    a quick side-by-side comparison, not the full analysis workbench."""
+    Calibration Results tab's cross-file channel selection. Deliberately
+    simple (always Linear, first channel only) since this is a quick
+    side-by-side comparison, not the full analysis workbench."""
     channels = frec.get("channels", [])
     if not channels:
         return None
@@ -137,42 +145,34 @@ class AmperometryView(QWidget):
         self._app_state = app_state
         self._active_file_index = 0
         self._last_cal_results: dict | None = None
+        self._channel_editor: _FileChannelEditor | None = None
 
         outer = QVBoxLayout(self)
         tabs = QTabWidget(self)
         outer.addWidget(tabs)
 
-        # -- Tab 1: Import & Configure -----------------------------------
+        # -- Tab 1: Import -----------------------------------------------
         self._import_panel = ImportPanel(
             app_state, _FILES_KEY, "Current", _UNIT_KEY, _CONC_UNIT_KEY,
             seed_cpdf_fn=_default_cpdf,
             sample_loader_fn=_load_sample_data,
             sample_caption="Two synthetic amperometric runs (2 channels each) with a ready-made calibration table.",
         )
-        tabs.addTab(self._import_panel, "① Import & Configure")
+        tabs.addTab(self._import_panel, "① Import")
 
-        # -- Tab 2: Time Series -------------------------------------------
+        # -- Tab 2: Time Series & Windows -----------------------------------
         self._timeseries_panel = TimeSeriesPanel(app_state, _FILES_KEY, _UNIT_KEY, "Current")
-        tabs.addTab(self._timeseries_panel, "② Time Series")
+        windows_tab = self._build_windows_tab(app_state)
+        tabs.addTab(windows_tab, "② Time Series & Windows")
 
-        # -- Tab 3: Calibration Curve ---------------------------------------
+        # -- Tab 3: Calibration Results ---------------------------------------
         cal_tab = QWidget(self)
         cal_layout = QVBoxLayout(cal_tab)
 
-        dataset_row = QHBoxLayout()
-        dataset_row.addWidget(QLabel("Dataset:", self))
-        self._dataset_combo = QComboBox(self)
-        self._dataset_combo.currentIndexChanged.connect(self._on_dataset_changed)
-        dataset_row.addWidget(self._dataset_combo, 1)
-        cal_layout.addLayout(dataset_row)
-
         settings_group = QGroupBox("Analysis Settings", self)
         settings_form = QFormLayout(settings_group)
-        self._channels_list = QListWidget(self)
-        self._channels_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        self._channels_list.setMaximumHeight(80)
-        self._channels_list.itemSelectionChanged.connect(self._on_channel_selection_changed)
-        settings_form.addRow("Channels to analyse", self._channels_list)
+        settings_form.addRow(QLabel(
+            "Channels analysed = the checked traces in ② Time Series & Windows.", self))
         self._fit_type_combo = QComboBox(self)
         self._fit_type_combo.addItems(["Linear", "Segmented Linear"])
         self._fit_type_combo.currentTextChanged.connect(self._on_fit_type_changed)
@@ -186,34 +186,6 @@ class AmperometryView(QWidget):
         self._show_avg_checkbox.setEnabled(False)
         settings_form.addRow(self._show_avg_checkbox)
         cal_layout.addWidget(settings_group)
-
-        self._autodetect_panel = AutodetectPanel(app_state, _FILES_KEY, _cpdf_from_autodetect_windows, has_baseline=True)
-        self._autodetect_panel.edges_detected.connect(self._timeseries_panel.refresh)
-        cal_layout.addWidget(self._autodetect_panel)
-
-        cal_layout.addWidget(QLabel("Calibration Points", self))
-        self._cal_table = EditableTableView(
-            _default_cpdf(),
-            editable_columns=set(_CPDF_COLUMNS),
-            row_defaults={"Label": "New", "Concentration": 0.0, "Spike Vol": np.nan, "Stock Conc": np.nan,
-                          "t_start": 0.0, "t_end": 60.0, "avg_duration": np.nan, "Baseline": False},
-        )
-        self._cal_table.row_committed.connect(self._commit_active_cpdf)
-        cal_layout.addWidget(self._cal_table)
-
-        effconc_group = QGroupBox("Effective concentration calculator (serial dilution)", self)
-        effconc_form = QFormLayout(effconc_group)
-        self._initial_volume_spin = QDoubleSpinBox(self)
-        self._initial_volume_spin.setRange(0.0, 1e9)
-        self._initial_volume_spin.setDecimals(5)
-        self._initial_volume_spin.setValue(app_state.data.initial_volume)
-        effconc_form.addRow("Initial volume", self._initial_volume_spin)
-        self._vol_unit_edit = QLineEdit(app_state.data.vol_unit, self)
-        effconc_form.addRow("Volume unit", self._vol_unit_edit)
-        preview_btn = QPushButton("Preview: update Concentration & t start", self)
-        preview_btn.clicked.connect(self._preview_effective_concentration)
-        effconc_form.addRow(preview_btn)
-        cal_layout.addWidget(effconc_group)
 
         compute_btn = QPushButton("Compute Calibration", self)
         compute_btn.clicked.connect(self._compute_calibration)
@@ -229,7 +201,7 @@ class AmperometryView(QWidget):
         self._stats_table.setMaximumHeight(160)
         cal_layout.addWidget(self._stats_table)
 
-        tabs.addTab(cal_tab, "③ Calibration Curve")
+        tabs.addTab(cal_tab, "③ Calibration Results")
 
         # -- Tab 4: Export --------------------------------------------------
         export_tab = QWidget(self)
@@ -237,13 +209,13 @@ class AmperometryView(QWidget):
         csv_btn = QPushButton("Export calibration summary CSV", self)
         csv_btn.clicked.connect(self._export_csv)
         export_layout.addWidget(csv_btn)
-        png_btn = QPushButton("Export calibration curve PNG", self)
+        png_btn = QPushButton("Export calibration curve…", self)
         png_btn.clicked.connect(self._export_curve_png)
         export_layout.addWidget(png_btn)
         export_layout.addStretch(1)
         tabs.addTab(export_tab, "④ Export")
 
-        # -- Tab 5: Comparison (Phase 8 QoL enhancement) -------------------
+        # -- Tab 5: Comparison (cross-file overlay) -------------------
         comparison_tab = ComparisonView(
             app_state, _FILES_KEY, _compute_file_fit,
             x_label=f"Concentration ({app_state.get_field(_CONC_UNIT_KEY)})",
@@ -254,7 +226,94 @@ class AmperometryView(QWidget):
         app_state.files_changed.connect(self._on_files_changed)
         app_state.cpdf_changed.connect(self._on_cpdf_changed)
         app_state.setting_changed.connect(self._on_setting_changed)
+        self._timeseries_panel.channels_changed.connect(self._on_channel_selection_changed)
         self._refresh_dataset_list()
+        self._on_channel_selection_changed()
+
+    # -- Tab 2 construction ---------------------------------------------------
+    def _build_windows_tab(self, app_state: AppState) -> QWidget:
+        tab = QWidget(self)
+        outer = QVBoxLayout(tab)
+
+        dataset_row = QHBoxLayout()
+        dataset_row.addWidget(QLabel("Dataset:", self))
+        self._dataset_combo = QComboBox(self)
+        self._dataset_combo.currentIndexChanged.connect(self._on_dataset_changed)
+        dataset_row.addWidget(self._dataset_combo, 1)
+        outer.addLayout(dataset_row)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        splitter.addWidget(self._timeseries_panel)
+
+        side_scroll = QScrollArea(self)
+        side_scroll.setWidgetResizable(True)
+        side_container = QWidget(side_scroll)
+        side_layout = QVBoxLayout(side_container)
+
+        # -- Channel assignment (collapsed by default; edit column mapping
+        #    for the active dataset once its trace is already visible) -----
+        chan_group = QGroupBox("Channel assignment", self)
+        chan_outer = QVBoxLayout(chan_group)
+        self._chan_content = QWidget(self)
+        self._chan_content_layout = QVBoxLayout(self._chan_content)
+        self._chan_content_layout.setContentsMargins(0, 0, 0, 0)
+        apply_chan_btn = QPushButton("Apply channel assignment", self)
+        apply_chan_btn.clicked.connect(self._apply_channel_assignment)
+        self._chan_content_layout.addWidget(apply_chan_btn)
+        chan_outer.addWidget(self._chan_content)
+        make_collapsible(chan_group, self._chan_content, expanded=False)
+        side_layout.addWidget(chan_group)
+
+        # -- Calibration windows (expanded by default — this is the core
+        #    "define where the spikes are" step) ---------------------------
+        windows_group = QGroupBox("Calibration windows", self)
+        windows_outer = QVBoxLayout(windows_group)
+        windows_content = QWidget(self)
+        windows_content_layout = QVBoxLayout(windows_content)
+        windows_content_layout.setContentsMargins(0, 0, 0, 0)
+        self._autodetect_panel = AutodetectPanel(app_state, _FILES_KEY, _cpdf_from_autodetect_windows, has_baseline=True)
+        self._autodetect_panel.edges_detected.connect(self._timeseries_panel.refresh)
+        windows_content_layout.addWidget(self._autodetect_panel)
+        windows_content_layout.addWidget(QLabel("Calibration Points", self))
+        self._cal_table = EditableTableView(
+            _default_cpdf(),
+            editable_columns=set(_CPDF_COLUMNS),
+            row_defaults={"Label": "New", "Concentration": 0.0, "Spike Vol": np.nan, "Stock Conc": np.nan,
+                          "t_start": 0.0, "t_end": 60.0, "avg_duration": np.nan, "Baseline": False},
+        )
+        self._cal_table.row_committed.connect(self._commit_active_cpdf)
+        windows_content_layout.addWidget(self._cal_table)
+        windows_outer.addWidget(windows_content)
+        make_collapsible(windows_group, windows_content, expanded=True)
+        side_layout.addWidget(windows_group)
+
+        # -- Effective concentration calculator (Amperometry only; collapsed
+        #    by default — a secondary tool, not needed for every dataset) --
+        effconc_group = QGroupBox("Effective concentration calculator (serial dilution)", self)
+        effconc_outer = QVBoxLayout(effconc_group)
+        effconc_content = QWidget(self)
+        effconc_form = QFormLayout(effconc_content)
+        self._initial_volume_spin = QDoubleSpinBox(self)
+        self._initial_volume_spin.setRange(0.0, 1e9)
+        self._initial_volume_spin.setDecimals(5)
+        self._initial_volume_spin.setValue(app_state.data.initial_volume)
+        effconc_form.addRow("Initial volume", self._initial_volume_spin)
+        self._vol_unit_edit = QLineEdit(app_state.data.vol_unit, self)
+        effconc_form.addRow("Volume unit", self._vol_unit_edit)
+        preview_btn = QPushButton("Preview: update Concentration & t start", self)
+        preview_btn.clicked.connect(self._preview_effective_concentration)
+        effconc_form.addRow(preview_btn)
+        effconc_outer.addWidget(effconc_content)
+        make_collapsible(effconc_group, effconc_content, expanded=False)
+        side_layout.addWidget(effconc_group)
+
+        side_layout.addStretch(1)
+        side_scroll.setWidget(side_container)
+        splitter.addWidget(side_scroll)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        outer.addWidget(splitter, 1)
+        return tab
 
     def _on_setting_changed(self, field_name: str) -> None:
         """Keep the dilution calculator's fields in sync when changed from
@@ -299,31 +358,37 @@ class AmperometryView(QWidget):
         self._dataset_combo.blockSignals(False)
         if files:
             self._dataset_combo.setCurrentIndex(min(self._active_file_index, len(files) - 1))
-        self._refresh_channels_list()
         self._on_dataset_changed(self._dataset_combo.currentIndex())
 
-    def _refresh_channels_list(self) -> None:
-        """"Channels to analyse" spans every loaded file (matching
-        modes/amperometry.py's _cal_combo_lookup, built over all of
-        SS.amp_files) — independent of which file the Dataset selector has
-        active for editing its calibration table below."""
-        multi_file = len(self._files()) > 1
-        self._channels_list.clear()
-        for frec in self._files():
-            for ch in frec.get("channels", []):
-                label = _amp_label(frec["filename"], ch["name"], multi_file)
-                item = QListWidgetItem(label, self._channels_list)
-                item.setSelected(True)
-
     def _on_dataset_changed(self, index: int) -> None:
-        if index < 0:
-            return
         self._active_file_index = index
         frec = self._active_frec()
+        self._rebuild_channel_editor(frec)
         if frec is None:
             return
         self._autodetect_panel.set_active_file(frec, self._active_file_index)
         self._load_active_cpdf_into_table()
+
+    def _rebuild_channel_editor(self, frec: dict | None) -> None:
+        if self._channel_editor is not None:
+            self._chan_content_layout.removeWidget(self._channel_editor)
+            self._channel_editor.deleteLater()
+            self._channel_editor = None
+        if frec is None:
+            return
+        self._channel_editor = _FileChannelEditor(frec["filename"], frec["df"], frec["channels"], "Current", self)
+        self._chan_content_layout.insertWidget(0, self._channel_editor)
+
+    def _apply_channel_assignment(self) -> None:
+        if self._channel_editor is None:
+            return
+        frec = self._active_frec()
+        if frec is None:
+            return
+        new_files = list(self._files())
+        new_files[self._active_file_index] = {**frec, "channels": self._channel_editor.channels()}
+        cmd = FilesListCommand(self._app_state, _FILES_KEY, new_files, text="Apply channel assignment")
+        self._app_state.undo_stack.push(cmd)
 
     def _load_active_cpdf_into_table(self) -> None:
         frec = self._active_frec()
@@ -343,7 +408,7 @@ class AmperometryView(QWidget):
         self._n_seg_spin.setEnabled(text == "Segmented Linear")
 
     def _on_channel_selection_changed(self) -> None:
-        self._show_avg_checkbox.setEnabled(len(self._channels_list.selectedItems()) >= 2)
+        self._show_avg_checkbox.setEnabled(len(self._timeseries_panel.visible_labels()) >= 2)
 
     # -- effective concentration calculator ----------------------------------
     def _preview_effective_concentration(self) -> None:
@@ -361,9 +426,9 @@ class AmperometryView(QWidget):
     # -- Compute (mirrors modes.amperometry.render()'s _do_compute_calibration
     #    closure, driven by AppState instead of st.session_state) ------------
     def _compute_calibration(self) -> None:
-        selected_labels = [item.text() for item in self._channels_list.selectedItems()]
+        selected_labels = self._timeseries_panel.visible_labels()
         if not selected_labels:
-            self._cal_status.setText("Select at least one channel to analyse above.")
+            self._cal_status.setText("Check at least one channel in ② Time Series & Windows.")
             return
 
         multi_file = len(self._files()) > 1
@@ -542,11 +607,16 @@ class AmperometryView(QWidget):
         if not results:
             self._cal_status.setText("Run calibration analysis first.")
             return
+        opts = ExportOptionsDialog.get_options(self, "Export calibration curve")
+        if opts is None:
+            return
         png_bytes = render_cal_png(
             results["results"], results["fit_type"], int(results["n_seg"]),
             self._app_state.get_field(_CONC_UNIT_KEY), self._app_state.get_field(_UNIT_KEY),
+            dpi=opts["dpi"], fmt=opts["fmt"], figsize=opts["figsize"], style=opts["style"],
         )
-        path, _ = QFileDialog.getSaveFileName(self, "Export calibration curve PNG", "calibration_curve.png", "PNG image (*.png)")
+        ext = opts["fmt"]
+        path, _ = QFileDialog.getSaveFileName(self, "Export calibration curve", f"calibration_curve.{ext}", f"{ext.upper()} (*.{ext})")
         if path:
             with open(path, "wb") as f:
                 f.write(png_bytes)

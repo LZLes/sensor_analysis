@@ -4,8 +4,8 @@ A lab tool for importing multi-channel electrochemical sensor data (amperometry,
 
 There are **two independent UIs** built on the same computation core:
 
-- **Streamlit app** (`app.py`) — runs in a browser, zero install beyond Python. Best for quick use on any machine.
-- **Native macOS app** (`macos_app/`) — a PySide6/Qt desktop app with multi-window sessions, undo/redo, drag-and-drop import, and a cross-file comparison view. Best for regular day-to-day use on a Mac.
+- **Streamlit app** (`app.py`) — runs in a browser, zero install beyond Python. Covers all four modes (Amperometry, Solid-State, Cyclic Voltammetry, Assay). Best for quick use on any machine.
+- **Native macOS app** (`macos_app/`) — a PySide6/Qt desktop app with multi-window sessions, undo/redo, drag-and-drop import, publication-quality export with format/DPI/style options, and a cross-file comparison view. Covers Amperometry, Solid-State, and Cyclic Voltammetry (Assay is Streamlit-only). Best for regular day-to-day use on a Mac.
 
 Both read/write the same Export/Import JSON session format, so a session saved from one opens in the other.
 
@@ -44,6 +44,17 @@ python -m macos_app.main
 ```
 
 This launches the Qt app directly — no packaging step needed for day-to-day development.
+
+### Using the app
+
+Amperometry and Solid-State each follow the same 4-step pipeline, one tab per step:
+
+1. **① Import** — browse for files, drag-and-drop them onto the window, or load the built-in sample data. Channel names/columns are auto-detected; there's no separate "apply" step before you can see the trace.
+2. **② Time Series & Windows** — the trace is plotted immediately, with a checklist to choose which channels are visible (this same checklist is what "Compute Calibration" analyses in step 3). Fine-tune channel assignment, mark calibration windows (spike start/end, concentration, spike volume), and auto-detect step edges from the trace, all in one screen — collapsible side panels keep these out of the way until you open them. Amperometry also has the effective-concentration (serial dilution) calculator here.
+3. **③ Calibration Results** — pick a fit type, click Compute Calibration, and see the fitted curve with sensitivity/R²/LOD/LOQ statistics.
+4. **④ Export** — CSV summary, plus a calibration-curve/time-series image export with a Format (PNG/SVG/PDF/TIFF), DPI, Style (Default/Origin/Minimal), and figure-size dialog.
+
+A 5th **⑤ Compare Files** tab overlays fits from multiple loaded files. Cyclic Voltammetry follows the same shape (① Import → ② Plot & Peaks → ③ Scan Rate Analysis → ④ Export) without the calibration-window concept, since peak detection there plays the same role.
 
 ### Building an installable `.app` / `.dmg`
 

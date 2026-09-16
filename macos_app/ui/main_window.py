@@ -36,14 +36,16 @@ from PySide6.QtWidgets import (
 from macos_app.persistence import build_session_bundle, apply_session_bundle
 from macos_app.ui.app_state import AppState
 from macos_app.ui.modes.amperometry_view import AmperometryView
-from macos_app.ui.modes.assay_view import AssayView
 from macos_app.ui.modes.cyclic_voltammetry_view import CyclicVoltammetryView
 from macos_app.ui.modes.solid_state_view import SolidStateView
 from macos_app.ui.settings import Settings
 from macos_app.ui.update_dialogs import show_check_failed_dialog, show_up_to_date_dialog, show_update_available_dialog
 from macos_app.update_check import UpdateChecker
 
-_MODES = ["Amperometry", "Solid-State", "Cyclic Voltammetry", "Assay"]
+# Assay is intentionally not offered here — the desktop app focuses on
+# Amperometry/Solid-State/Cyclic Voltammetry; Assay remains fully available
+# in the Streamlit app (modes/assay.py, app.py — untouched by this).
+_MODES = ["Amperometry", "Solid-State", "Cyclic Voltammetry"]
 
 _IMPORTABLE_SUFFIXES = (".csv", ".txt", ".pssession")
 
@@ -224,8 +226,6 @@ class MainWindow(QMainWindow):
                 self._stack.addWidget(SolidStateView(self.app_state, central))
             elif mode == "Cyclic Voltammetry":
                 self._stack.addWidget(CyclicVoltammetryView(self.app_state, central))
-            elif mode == "Assay":
-                self._stack.addWidget(AssayView(self.app_state, central))
             else:
                 self._stack.addWidget(_placeholder_page(mode))
 
@@ -233,7 +233,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._stack, 1)
         self.setCentralWidget(central)
 
-        self._mode_list.setCurrentRow(_MODES.index(self.app_state.data.mode))
+        # A session imported from the Streamlit app (or an older macOS-app
+        # export) could carry mode="Assay" — fall back to Amperometry rather
+        # than crash, since Assay isn't one of this app's mode pages.
+        start_mode = self.app_state.data.mode if self.app_state.data.mode in _MODES else _MODES[0]
+        self._mode_list.setCurrentRow(_MODES.index(start_mode))
 
     def _on_mode_list_row_changed(self, row: int) -> None:
         if row < 0:

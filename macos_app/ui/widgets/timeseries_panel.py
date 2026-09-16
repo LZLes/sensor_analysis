@@ -8,14 +8,21 @@ living in a file that imports streamlit at module level; see
 macos_app/requirements-macos.txt for the resulting dependency note), and
 this app's own macos_app.ui.theme.plot_theme() (not core/constants.py's
 st.context.theme-based _plot_theme()).
+
+_ChannelRow/_FileChannelEditor live here (moved from import_panel.py) since
+channel assignment is now part of the combined "Time Series & Windows" step
+in each mode view rather than a separate Import-tab gate — see
+amperometry_view.py/solid_state_view.py's _build_windows_tab.
 """
 
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -24,6 +31,8 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -36,14 +45,104 @@ from core.constants import PAL
 from core.numeric import _eff_t_start, smooth_signal, to_num
 from core.shared_tabs import _amp_label, render_ts_png
 from macos_app.ui.app_state import AppState
+from macos_app.ui.dialogs.export_options_dialog import ExportOptionsDialog
 from macos_app.ui.theme import plot_theme
 from macos_app.ui.undo_commands import SetFieldCommand
+from macos_app.ui.widgets.collapsible import make_collapsible
 from macos_app.ui.widgets.plot_view import PlotView
 
 _DASHES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
+_MAX_CHANNELS = 8
+
+
+class _ChannelRow(QWidget):
+    """One channel's (name, time col, signal col) mapping."""
+
+    def __init__(self, columns: list[str], index: int, preset: dict | None, parent=None) -> None:
+        super().__init__(parent)
+        self.name_edit = QLineEdit(preset.get("name", f"Channel {index + 1}") if preset else f"Channel {index + 1}", self)
+        self.time_combo = QComboBox(self)
+        self.time_combo.addItems(columns)
+        self.signal_combo = QComboBox(self)
+        self.signal_combo.addItems(columns)
+
+        def col_idx(col: str | None, fallback_idx: int) -> int:
+            if col is not None and col in columns:
+                return columns.index(col)
+            return min(fallback_idx, len(columns) - 1) if columns else 0
+
+        self.time_combo.setCurrentIndex(col_idx(preset.get("tc") if preset else None, index * 2))
+        self.signal_combo.setCurrentIndex(col_idx(preset.get("ic") if preset else None, index * 2 + 1))
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.name_edit, 2)
+        row.addWidget(self.time_combo, 3)
+        row.addWidget(self.signal_combo, 3)
+
+    def channel(self) -> dict:
+        return {"name": self.name_edit.text(), "tc": self.time_combo.currentText(), "ic": self.signal_combo.currentText()}
+
+
+class _FileChannelEditor(QGroupBox):
+    """One file's full channel mapping — N channels, each a _ChannelRow."""
+
+    def __init__(self, filename: str, df: pd.DataFrame, preset_channels: list[dict], signal_col_label: str, parent=None) -> None:
+        super().__init__(filename, parent)
+        self.df = df
+        self._columns = list(df.columns)
+        self._preset_channels = preset_channels
+        self._signal_col_label = signal_col_label
+        self._rows: list[_ChannelRow] = []
+
+        outer = QVBoxLayout(self)
+
+        meta_label = QLabel(f"{len(df):,} rows, {len(df.columns)} columns", self)
+        outer.addWidget(meta_label)
+
+        spin_row = QHBoxLayout()
+        spin_row.addWidget(QLabel("Number of channels", self))
+        self._n_channels_spin = QSpinBox(self)
+        self._n_channels_spin.setRange(1, _MAX_CHANNELS)
+        default_n = len(preset_channels) if preset_channels else max(1, len(self._columns) // 2)
+        self._n_channels_spin.setValue(min(_MAX_CHANNELS, default_n))
+        self._n_channels_spin.valueChanged.connect(self._set_row_count)
+        spin_row.addWidget(self._n_channels_spin)
+        spin_row.addStretch(1)
+        outer.addLayout(spin_row)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>Channel name</b>", self), 2)
+        header.addWidget(QLabel("<b>Time column</b>", self), 3)
+        header.addWidget(QLabel(f"<b>{signal_col_label} column</b>", self), 3)
+        outer.addLayout(header)
+
+        self._rows_container = QVBoxLayout()
+        outer.addLayout(self._rows_container)
+
+        self._set_row_count(self._n_channels_spin.value())
+
+    def _set_row_count(self, n: int) -> None:
+        while len(self._rows) < n:
+            i = len(self._rows)
+            preset = self._preset_channels[i] if i < len(self._preset_channels) else None
+            row = _ChannelRow(self._columns, i, preset, self)
+            self._rows.append(row)
+            self._rows_container.addWidget(row)
+        while len(self._rows) > n:
+            row = self._rows.pop()
+            self._rows_container.removeWidget(row)
+            row.deleteLater()
+
+    def channels(self) -> list[dict]:
+        return [row.channel() for row in self._rows]
 
 
 class TimeSeriesPanel(QWidget):
+    channels_changed = Signal()  # emitted whenever refresh() runs — lets mode
+    # views (e.g. Amperometry's "add average trace" checkbox) react to the
+    # channel-visibility checklist without reaching into a private attribute.
+
     def __init__(self, app_state: AppState, files_key: str, unit_key: str, signal_axis_label: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._app_state = app_state
@@ -54,7 +153,9 @@ class TimeSeriesPanel(QWidget):
         outer = QVBoxLayout(self)
 
         smooth_group = QGroupBox("Signal smoothing", self)
-        smooth_form = QFormLayout(smooth_group)
+        smooth_outer = QVBoxLayout(smooth_group)
+        smooth_content = QWidget(self)
+        smooth_form = QFormLayout(smooth_content)
         self._smooth_method = QComboBox(self)
         self._smooth_method.addItems(["None", "Moving average", "Savitzky-Golay"])
         self._smooth_method.setCurrentText(app_state.data.smooth_method)
@@ -71,6 +172,8 @@ class TimeSeriesPanel(QWidget):
         smooth_form.addRow("Method", self._smooth_method)
         smooth_form.addRow("Window (samples)", self._smooth_window)
         smooth_form.addRow("Polynomial order", self._smooth_polyorder)
+        smooth_outer.addWidget(smooth_content)
+        make_collapsible(smooth_group, smooth_content, expanded=False)
         outer.addWidget(smooth_group)
 
         self._channel_list = QListWidget(self)
@@ -138,6 +241,7 @@ class TimeSeriesPanel(QWidget):
             self._channel_list.blockSignals(False)
 
         self._render_figure()
+        self.channels_changed.emit()
 
     def visible_labels(self) -> list[str]:
         return [
@@ -242,13 +346,18 @@ class TimeSeriesPanel(QWidget):
         files = self._app_state.files_for(self._files_key)
         if not files:
             return None
+        opts = ExportOptionsDialog.get_options(self, "Export time series")
+        if opts is None:
+            return None
         png_bytes = render_ts_png(
             files, self._app_state.get_field(self._unit_key), self.visible_labels(),
+            dpi=opts["dpi"], fmt=opts["fmt"], figsize=opts["figsize"], style=opts["style"],
             smooth_method=self._smooth_method.currentText(),
             smooth_window=self._smooth_window.value(),
             smooth_polyorder=self._smooth_polyorder.value(),
         )
-        path, _ = QFileDialog.getSaveFileName(self, "Export time series PNG", "time_series.png", "PNG image (*.png)")
+        ext = opts["fmt"]
+        path, _ = QFileDialog.getSaveFileName(self, "Export time series", f"time_series.{ext}", f"{ext.upper()} (*.{ext})")
         if path:
             with open(path, "wb") as f:
                 f.write(png_bytes)

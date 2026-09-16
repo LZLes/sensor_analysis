@@ -1,16 +1,17 @@
 """
 ImportPanel — Qt rebuild of core/shared_tabs.py's _render_import_tab.
 
-Shared between Amperometry and Solid-State (same as the Streamlit version),
-parameterized by files_key/unit_key/etc. Reuses core.parsing.parse_with_options
-(the pure sibling of _parse_one_file added for exactly this purpose) and
-whichever seed_cpdf_fn the calling mode passes in.
+Shared between Amperometry and Solid-State, parameterized by
+files_key/unit_key/etc. Reuses core.parsing.parse_with_options (the pure
+sibling of _parse_one_file added for exactly this purpose) and whichever
+seed_cpdf_fn the calling mode passes in.
 
-Supports an arbitrary number of channels per file (name / time-col /
-signal-col per channel, same shape as the Streamlit grid) via a "Number of
-channels" spinner that adds/removes rows, defaulting new rows to the same
-paired-column guess Streamlit used (columns 2i / 2i+1) when there's no
-auto-detected or previously-configured channel to seed from.
+Deliberately lightweight: files are added with their auto-detected channel
+guess (or a single-channel fallback) and are immediately usable — there is
+no "Apply Channel Configuration" gate here. Fine-tuning channel names/time
+column/signal column happens directly in the "Time Series & Windows" step
+(see macos_app/ui/widgets/timeseries_panel.py's _FileChannelEditor) once the
+user can see the trace, rather than being forced before it's even visible.
 """
 
 from __future__ import annotations
@@ -19,16 +20,15 @@ from typing import Callable
 
 import pandas as pd
 from PySide6.QtWidgets import (
-    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
-    QScrollArea,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -38,90 +38,16 @@ from macos_app.ui.app_state import AppState
 from macos_app.ui.undo_commands import FilesListCommand, SetFieldCommand
 
 _IMPORTABLE_SUFFIXES = (".csv", ".txt", ".pssession")
-_MAX_CHANNELS = 8
 
 
-class _ChannelRow(QWidget):
-    """One channel's (name, time col, signal col) mapping."""
-
-    def __init__(self, columns: list[str], index: int, preset: dict | None, signal_col_label: str, parent=None) -> None:
-        super().__init__(parent)
-        self.name_edit = QLineEdit(preset.get("name", f"Channel {index + 1}") if preset else f"Channel {index + 1}", self)
-        self.time_combo = QComboBox(self)
-        self.time_combo.addItems(columns)
-        self.signal_combo = QComboBox(self)
-        self.signal_combo.addItems(columns)
-
-        def col_idx(col: str | None, fallback_idx: int) -> int:
-            if col is not None and col in columns:
-                return columns.index(col)
-            return min(fallback_idx, len(columns) - 1) if columns else 0
-
-        self.time_combo.setCurrentIndex(col_idx(preset.get("tc") if preset else None, index * 2))
-        self.signal_combo.setCurrentIndex(col_idx(preset.get("ic") if preset else None, index * 2 + 1))
-
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(self.name_edit, 2)
-        row.addWidget(self.time_combo, 3)
-        row.addWidget(self.signal_combo, 3)
-
-    def channel(self) -> dict:
-        return {"name": self.name_edit.text(), "tc": self.time_combo.currentText(), "ic": self.signal_combo.currentText()}
-
-
-class _FileChannelEditor(QGroupBox):
-    """One file's full channel mapping — N channels, each a _ChannelRow."""
-
-    def __init__(self, filename: str, df: pd.DataFrame, preset_channels: list[dict], signal_col_label: str, parent=None) -> None:
-        super().__init__(filename, parent)
-        self.df = df
-        self._columns = list(df.columns)
-        self._preset_channels = preset_channels
-        self._signal_col_label = signal_col_label
-        self._rows: list[_ChannelRow] = []
-
-        outer = QVBoxLayout(self)
-
-        meta_label = QLabel(f"{len(df):,} rows, {len(df.columns)} columns", self)
-        outer.addWidget(meta_label)
-
-        spin_row = QHBoxLayout()
-        spin_row.addWidget(QLabel("Number of channels", self))
-        self._n_channels_spin = QSpinBox(self)
-        self._n_channels_spin.setRange(1, _MAX_CHANNELS)
-        default_n = len(preset_channels) if preset_channels else max(1, len(self._columns) // 2)
-        self._n_channels_spin.setValue(min(_MAX_CHANNELS, default_n))
-        self._n_channels_spin.valueChanged.connect(self._set_row_count)
-        spin_row.addWidget(self._n_channels_spin)
-        spin_row.addStretch(1)
-        outer.addLayout(spin_row)
-
-        header = QHBoxLayout()
-        header.addWidget(QLabel("<b>Channel name</b>", self), 2)
-        header.addWidget(QLabel("<b>Time column</b>", self), 3)
-        header.addWidget(QLabel(f"<b>{signal_col_label} column</b>", self), 3)
-        outer.addLayout(header)
-
-        self._rows_container = QVBoxLayout()
-        outer.addLayout(self._rows_container)
-
-        self._set_row_count(self._n_channels_spin.value())
-
-    def _set_row_count(self, n: int) -> None:
-        while len(self._rows) < n:
-            i = len(self._rows)
-            preset = self._preset_channels[i] if i < len(self._preset_channels) else None
-            row = _ChannelRow(self._columns, i, preset, self._signal_col_label, self)
-            self._rows.append(row)
-            self._rows_container.addWidget(row)
-        while len(self._rows) > n:
-            row = self._rows.pop()
-            self._rows_container.removeWidget(row)
-            row.deleteLater()
-
-    def channels(self) -> list[dict]:
-        return [row.channel() for row in self._rows]
+def _fallback_channels(df: pd.DataFrame) -> list[dict]:
+    """Single-channel guess used when parse_with_options can't auto-detect
+    any channels at all (e.g. an unrecognized plain CSV) — better than
+    landing with zero channels and nothing to plot."""
+    columns = list(df.columns)
+    if not columns:
+        return []
+    return [{"name": "Channel 1", "tc": columns[0], "ic": columns[1] if len(columns) > 1 else columns[0]}]
 
 
 class ImportPanel(QWidget):
@@ -145,8 +71,6 @@ class ImportPanel(QWidget):
         self._conc_unit_key = conc_unit_key
         self._seed_cpdf_fn = seed_cpdf_fn
         self._sample_loader_fn = sample_loader_fn
-        self._pending: list[dict] = []  # [{filename, df}] awaiting Apply
-        self._editors: dict[str, _FileChannelEditor] = {}
 
         outer = QVBoxLayout(self)
 
@@ -165,17 +89,6 @@ class ImportPanel(QWidget):
         browse_row.addStretch(1)
         outer.addLayout(browse_row)
 
-        self._files_area = QScrollArea(self)
-        self._files_area.setWidgetResizable(True)
-        self._files_container = QWidget(self._files_area)
-        self._files_layout = QVBoxLayout(self._files_container)
-        self._files_area.setWidget(self._files_container)
-        outer.addWidget(self._files_area, 1)
-
-        apply_btn = QPushButton("Apply Channel Configuration", self)
-        apply_btn.clicked.connect(self._apply_configuration)
-        outer.addWidget(apply_btn)
-
         units_group = QGroupBox("Units", self)
         units_form = QFormLayout(units_group)
         self._conc_unit_edit = QLineEdit(app_state.get_field(conc_unit_key), self)
@@ -186,10 +99,16 @@ class ImportPanel(QWidget):
         units_form.addRow(f"{signal_col_label} unit", self._signal_unit_edit)
         outer.addWidget(units_group)
 
+        outer.addWidget(QLabel("Loaded files — fine-tune channel assignment in the Time Series & Windows tab.", self))
+        self._files_list = QListWidget(self)
+        outer.addWidget(self._files_list, 1)
+
         self._status_label = QLabel("", self)
         outer.addWidget(self._status_label)
 
         app_state.setting_changed.connect(self._on_setting_changed)
+        app_state.files_changed.connect(self._on_files_changed)
+        self._refresh_files_list()
 
     def _on_setting_changed(self, field_name: str) -> None:
         """Keep the unit fields in sync with AppState when they change from
@@ -201,11 +120,26 @@ class ImportPanel(QWidget):
         elif field_name == self._unit_key:
             self._signal_unit_edit.setText(self._app_state.get_field(self._unit_key))
 
+    def _on_files_changed(self, files_key: str) -> None:
+        if files_key == self._files_key:
+            self._refresh_files_list()
+
+    def _refresh_files_list(self) -> None:
+        self._files_list.clear()
+        for frec in self._app_state.files_for(self._files_key):
+            n_ch = len(frec.get("channels", []))
+            label = f"{frec['filename']} — {n_ch} channel{'s' if n_ch != 1 else ''}"
+            QListWidgetItem(label, self._files_list)
+
     # -- entry points ---------------------------------------------------------
     def add_files(self, paths: list[str]) -> None:
         """Public entry point for both the Browse dialog and drag-and-drop
-        (forwarded from MainWindow.dropEvent)."""
-        existing_by_name = {f["filename"]: f for f in self._app_state.files_for(self._files_key)}
+        (forwarded from MainWindow.dropEvent). Parses, auto-detects channels,
+        and commits straight to AppState — no separate "Apply" step."""
+        existing = list(self._app_state.files_for(self._files_key))
+        by_name = {f["filename"]: f for f in existing}
+        order = [f["filename"] for f in existing]
+        added = 0
         for path in paths:
             if not path.lower().endswith(_IMPORTABLE_SUFFIXES):
                 continue
@@ -217,11 +151,24 @@ class ImportPanel(QWidget):
             except Exception as exc:  # noqa: BLE001 - surface any parse failure to the status label
                 self._status_label.setText(f"Parse error in {path}: {exc}")
                 continue
-            # Re-importing a file that's already configured keeps its existing
-            # channel mapping as the preset (same as Streamlit's _preset_chs),
-            # so re-uploading to change delimiter/etc doesn't lose channel edits.
-            preset_channels = existing_by_name[filename]["channels"] if filename in existing_by_name else (auto_channels or [])
-            self._add_parsed_file(filename, df, preset_channels)
+            if filename in by_name:
+                # Re-importing keeps the existing channel mapping and
+                # calibration table, only refreshing the parsed data.
+                channels = by_name[filename]["channels"]
+                cpdf = by_name[filename]["cpdf"]
+            else:
+                channels = auto_channels or _fallback_channels(df)
+                cpdf = self._seed_cpdf_fn()
+                order.append(filename)
+            by_name[filename] = {"filename": filename, "df": df, "channels": channels, "cpdf": cpdf}
+            added += 1
+        if added == 0:
+            return
+        new_files = [by_name[name] for name in order]
+        cmd = FilesListCommand(self._app_state, self._files_key, new_files, text="Import files")
+        self._app_state.undo_stack.push(cmd)  # push() calls redo(), which already fires files_changed
+        n_channels = sum(len(f["channels"]) for f in new_files)
+        self._status_label.setText(f"{len(new_files)} file(s), {n_channels} channel(s) loaded.")
 
     def _browse_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -229,12 +176,6 @@ class ImportPanel(QWidget):
         )
         if paths:
             self.add_files(paths)
-
-    def _add_parsed_file(self, filename: str, df: pd.DataFrame, preset_channels: list[dict]) -> None:
-        editor = _FileChannelEditor(filename, df, preset_channels, self._signal_col_label, self)
-        self._editors[filename] = editor
-        self._files_layout.addWidget(editor)
-        self._pending.append({"filename": filename, "df": df})
 
     def _load_sample(self) -> None:
         if self._sample_loader_fn is None:
@@ -246,24 +187,6 @@ class ImportPanel(QWidget):
         cmd = FilesListCommand(self._app_state, self._files_key, sample_files, text="Load sample data")
         self._app_state.undo_stack.push(cmd)  # push() calls redo(), which already fires files_changed
         self._status_label.setText(f"Sample data loaded ({len(sample_files)} file(s)).")
-
-    def _apply_configuration(self) -> None:
-        if not self._pending:
-            return
-        existing_by_name = {f["filename"]: f for f in self._app_state.files_for(self._files_key)}
-        new_files = []
-        for entry in self._pending:
-            filename = entry["filename"]
-            editor = self._editors[filename]
-            channels = editor.channels()
-            cpdf = existing_by_name[filename]["cpdf"] if filename in existing_by_name else self._seed_cpdf_fn()
-            new_files.append({"filename": filename, "df": entry["df"], "channels": channels, "cpdf": cpdf})
-
-        cmd = FilesListCommand(self._app_state, self._files_key, new_files, text="Apply channel configuration")
-        self._app_state.undo_stack.push(cmd)  # push() calls redo(), which already fires files_changed
-        n_channels = sum(len(f["channels"]) for f in new_files)
-        self._status_label.setText(f"{len(new_files)} file(s), {n_channels} channel(s) applied.")
-        self._pending.clear()
 
     def _commit_conc_unit(self) -> None:
         value = self._conc_unit_edit.text()

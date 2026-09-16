@@ -1,5 +1,5 @@
 """
-CyclicVoltammetryView — Cyclic Voltammetry mode's Qt view (Phase 6).
+CyclicVoltammetryView — Cyclic Voltammetry mode's Qt view.
 
 Unlike Amperometry/Solid-State, CV doesn't reuse ImportPanel/TimeSeriesPanel/
 AutodetectPanel here either — modes/cyclic_voltammetry.py's own docstring/
@@ -11,17 +11,24 @@ the original app deliberately didn't.
 Reuses find_cv_peaks (the one module-level pure function in
 modes/cyclic_voltammetry.py) and core.numeric.lin_reg directly, unmodified.
 
+Tab layout follows the same 4-step declutter/merge shape used for
+Amperometry/Solid-State: ① Import (column-mapping details collapsed by
+default — auto-detection already seeds sensible values), ② Plot & Peaks
+(merging the former separate "CV Plot" and "Peak Analysis" tabs so running
+peak detection and seeing the markers land on the same screen), ③ Scan Rate
+Analysis (unchanged content), ④ Export (every PNG/CSV export in one place,
+run through the shared export-options dialog instead of a hardcoded-default
+button per plot). See the "Streamline Amperometry/Solid-State/CV" plan.
+
 PNG export: modes/cyclic_voltammetry.py's _render_cv_plot/_render_sr_analysis
 are closures defined inside render(), not importable standalone functions
 (unlike the other modes' render_*_png builders) — so rather than editing
 that file (out of scope per the non-negotiable constraint), _render_cv_plot_png
 and _render_sr_plot_png below are new, independent matplotlib builders that
 cover the same visual content, using the same core.plotting rc-context
-presets. Still deferred: the SVG/PDF/TIFF format and DPI/size picker (this
-covers plain 150dpi PNG, matching the other modes' export buttons) and
-interactive-HTML downloads. Also deferred: per-item "Isolate" solo buttons
-(Time Series' panel uses a plain checklist for the same reason) and the
-duplicate-scan-rate warning.
+presets, and now accept fmt/figsize/style like the other modes' PNG
+builders (mirroring render_cal_png's pattern) since they're macOS-app-local
+code, not a core/modes file.
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -58,10 +66,12 @@ from PySide6.QtWidgets import (
 from core.constants import PAL
 from core.numeric import lin_reg, to_num
 from core.parsing import parse_potentiostat_csv
-from core.plotting import _apply_spine_style
+from core.plotting import _ORIGIN_RC, _MINIMAL_RC, _apply_spine_style
 from macos_app.ui.app_state import AppState
+from macos_app.ui.dialogs.export_options_dialog import ExportOptionsDialog
 from macos_app.ui.theme import plot_theme
 from macos_app.ui.undo_commands import FilesListCommand, SetFieldCommand
+from macos_app.ui.widgets.collapsible import make_collapsible
 from macos_app.ui.widgets.plot_view import PlotView
 from modes.cyclic_voltammetry import find_cv_peaks
 
@@ -95,9 +105,10 @@ def _read_text(path: str) -> str:
 
 
 def _render_cv_plot_png(runs: list[dict], visible_srs: set[str], visible_chs: set[str],
-                        volt_unit: str, cur_unit: str, dpi: int = 150) -> bytes:
-    """New matplotlib PNG builder for the CV Plot tab — see this module's
-    docstring for why it's new code rather than an import from
+                        volt_unit: str, cur_unit: str, dpi: int = 150,
+                        fmt: str = "png", figsize: tuple | None = None, style: str = "default") -> bytes:
+    """Matplotlib PNG builder for the CV Plot — see this module's docstring
+    for why it's new code rather than an import from
     modes/cyclic_voltammetry.py (its _render_cv_plot is an unexported
     closure). Visual content mirrors that closure: Viridis-by-scan-rate,
     dashed-by-channel, detected peaks as triangle markers."""
@@ -105,43 +116,46 @@ def _render_cv_plot_png(runs: list[dict], visible_srs: set[str], visible_chs: se
     import matplotlib.pyplot as plt
 
     matplotlib.use("Agg")
+    _rc = {"origin": _ORIGIN_RC, "minimal": _MINIMAL_RC}.get(style, {})
     vis_runs = [r for r in runs if r["label"] in visible_srs]
     n = len(vis_runs)
-    # matplotlib.cm.get_cmap(name, N) was removed in matplotlib 3.9 — this app
-    # pins matplotlib>=3.7.0 with no upper bound, so a fresh install can land
-    # on 3.9+. matplotlib.colormaps[name] is the modern registry access;
-    # sampling the continuous colormap at ri/(n-1) below is visually
-    # equivalent to the old N-level discretization this replaces.
-    cmap = matplotlib.colormaps["viridis"]
-    fig, ax = plt.subplots(figsize=(9, 6))
-    for ri, run in enumerate(vis_runs):
-        color = cmap(ri / max(1, n - 1))
-        for ci, ch in enumerate(run["channels"]):
-            if ch["name"] not in visible_chs:
-                continue
-            v = to_num(run["df"][ch["vc"]]).to_numpy(dtype=float, na_value=np.nan)
-            i = to_num(run["df"][ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
-            ax.plot(v, i, color=color, linestyle=["-", "--", ":", "-."][ci % 4],
-                    linewidth=1.4, label=run["label"] if ci == 0 else None)
-            for p in run["peaks"].get(ch["name"], {}).get("anodic", []):
-                ax.plot(p["Ep"], p["Ip"], "^", color=color, markersize=8, zorder=5)
-            for p in run["peaks"].get(ch["name"], {}).get("cathodic", []):
-                ax.plot(p["Ep"], p["Ip"], "v", color=color, markersize=8, zorder=5)
-    ax.axhline(0, color="#bbbbbb", linewidth=0.8, linestyle="--")
-    ax.set_xlabel(f"Potential ({volt_unit})")
-    ax.set_ylabel(f"Current ({cur_unit})")
-    ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0)
-    _apply_spine_style(ax, "default")
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
+    with matplotlib.rc_context(_rc):
+        # matplotlib.cm.get_cmap(name, N) was removed in matplotlib 3.9 — this
+        # app pins matplotlib>=3.7.0 with no upper bound, so a fresh install
+        # can land on 3.9+. matplotlib.colormaps[name] is the modern registry
+        # access; sampling the continuous colormap at ri/(n-1) below is
+        # visually equivalent to the old N-level discretization this replaces.
+        cmap = matplotlib.colormaps["viridis"]
+        fig, ax = plt.subplots(figsize=figsize or (9, 6))
+        for ri, run in enumerate(vis_runs):
+            color = cmap(ri / max(1, n - 1))
+            for ci, ch in enumerate(run["channels"]):
+                if ch["name"] not in visible_chs:
+                    continue
+                v = to_num(run["df"][ch["vc"]]).to_numpy(dtype=float, na_value=np.nan)
+                i = to_num(run["df"][ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+                ax.plot(v, i, color=color, linestyle=["-", "--", ":", "-."][ci % 4],
+                        linewidth=1.4, label=run["label"] if ci == 0 else None)
+                for p in run["peaks"].get(ch["name"], {}).get("anodic", []):
+                    ax.plot(p["Ep"], p["Ip"], "^", color=color, markersize=8, zorder=5)
+                for p in run["peaks"].get(ch["name"], {}).get("cathodic", []):
+                    ax.plot(p["Ep"], p["Ip"], "v", color=color, markersize=8, zorder=5)
+        ax.axhline(0, color="#bbbbbb", linewidth=0.8, linestyle="--")
+        ax.set_xlabel(f"Potential ({volt_unit})")
+        ax.set_ylabel(f"Current ({cur_unit})")
+        ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0)
+        _apply_spine_style(ax, style)
+        buf = io.BytesIO()
+        fig.savefig(buf, format=fmt, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
 
 
 def _render_sr_plot_png(kind: str, ch_data: dict[str, pd.DataFrame],
-                        volt_unit: str, cur_unit: str, sr_unit: str, dpi: int = 150) -> bytes:
-    """New matplotlib PNG builder for one Scan Rate Analysis chart (kind in
+                        volt_unit: str, cur_unit: str, sr_unit: str, dpi: int = 150,
+                        fmt: str = "png", figsize: tuple | None = None, style: str = "default") -> bytes:
+    """Matplotlib PNG builder for one Scan Rate Analysis chart (kind in
     ip_nu/ip_sqrt_nu/ep_nu/delta_ep) — new code for the same reason as
     _render_cv_plot_png above (modes/cyclic_voltammetry.py's
     _render_sr_analysis is a closure, not importable)."""
@@ -149,47 +163,49 @@ def _render_sr_plot_png(kind: str, ch_data: dict[str, pd.DataFrame],
     import matplotlib.pyplot as plt
 
     matplotlib.use("Agg")
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for ci, (ch_name, d) in enumerate(ch_data.items()):
-        col = PAL[ci % len(PAL)]
-        nu = d["scan_rate"].to_numpy(dtype=float)
-        x = np.sqrt(nu) if kind == "ip_sqrt_nu" else nu
-        if kind == "delta_ep":
-            y = d["delta_Ep"].to_numpy(dtype=float)
-            ok = np.isfinite(y)
-            if ok.any():
-                ax.plot(x[ok], y[ok], color=col, linestyle="-", marker="o", markersize=6, linewidth=1.4, label=ch_name)
-            continue
-        series = [("anodic", "Ip_a", "^", "-"), ("cathodic", "Ip_c", "v", "--")]
-        if kind == "ep_nu":
-            series = [("anodic", "Ep_a", "^", "-"), ("cathodic", "Ep_c", "v", "--"), ("E½", "E_half", "o", ":")]
-        for pt, ycol, marker, ls in series:
-            y = d[ycol].to_numpy(dtype=float)
-            ok = np.isfinite(y)
-            if not ok.any():
+    _rc = {"origin": _ORIGIN_RC, "minimal": _MINIMAL_RC}.get(style, {})
+    with matplotlib.rc_context(_rc):
+        fig, ax = plt.subplots(figsize=figsize or (7, 5))
+        for ci, (ch_name, d) in enumerate(ch_data.items()):
+            col = PAL[ci % len(PAL)]
+            nu = d["scan_rate"].to_numpy(dtype=float)
+            x = np.sqrt(nu) if kind == "ip_sqrt_nu" else nu
+            if kind == "delta_ep":
+                y = d["delta_Ep"].to_numpy(dtype=float)
+                ok = np.isfinite(y)
+                if ok.any():
+                    ax.plot(x[ok], y[ok], color=col, linestyle="-", marker="o", markersize=6, linewidth=1.4, label=ch_name)
                 continue
-            ax.plot(x[ok], y[ok], color=col, linestyle=ls, marker=marker, markersize=6, linewidth=1.4, label=f"{ch_name} ({pt})")
-            if kind == "ip_sqrt_nu":
-                fit = lin_reg(x[ok], y[ok])
-                if fit:
-                    xf = np.linspace(x[ok].min(), x[ok].max(), 200)
-                    ax.plot(xf, fit["slope"] * xf + fit["intercept"], color=col, linestyle=":", linewidth=1.2)
+            series = [("anodic", "Ip_a", "^", "-"), ("cathodic", "Ip_c", "v", "--")]
+            if kind == "ep_nu":
+                series = [("anodic", "Ep_a", "^", "-"), ("cathodic", "Ep_c", "v", "--"), ("E½", "E_half", "o", ":")]
+            for pt, ycol, marker, ls in series:
+                y = d[ycol].to_numpy(dtype=float)
+                ok = np.isfinite(y)
+                if not ok.any():
+                    continue
+                ax.plot(x[ok], y[ok], color=col, linestyle=ls, marker=marker, markersize=6, linewidth=1.4, label=f"{ch_name} ({pt})")
+                if kind == "ip_sqrt_nu":
+                    fit = lin_reg(x[ok], y[ok])
+                    if fit:
+                        xf = np.linspace(x[ok].min(), x[ok].max(), 200)
+                        ax.plot(xf, fit["slope"] * xf + fit["intercept"], color=col, linestyle=":", linewidth=1.2)
 
-    x_labels = {
-        "ip_nu": f"Scan rate ν ({sr_unit})", "ip_sqrt_nu": f"√ Scan rate  √ν  (√{sr_unit})",
-        "ep_nu": f"Scan rate ν ({sr_unit})", "delta_ep": f"Scan rate ν ({sr_unit})",
-    }
-    y_labels = {
-        "ip_nu": f"Peak current Ip ({cur_unit})", "ip_sqrt_nu": f"Peak current Ip ({cur_unit})",
-        "ep_nu": f"Potential ({volt_unit})", "delta_ep": f"ΔEp ({volt_unit})",
-    }
-    ax.set_xlabel(x_labels[kind])
-    ax.set_ylabel(y_labels[kind])
-    ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0)
-    _apply_spine_style(ax, "default")
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
+        x_labels = {
+            "ip_nu": f"Scan rate ν ({sr_unit})", "ip_sqrt_nu": f"√ Scan rate  √ν  (√{sr_unit})",
+            "ep_nu": f"Scan rate ν ({sr_unit})", "delta_ep": f"Scan rate ν ({sr_unit})",
+        }
+        y_labels = {
+            "ip_nu": f"Peak current Ip ({cur_unit})", "ip_sqrt_nu": f"Peak current Ip ({cur_unit})",
+            "ep_nu": f"Potential ({volt_unit})", "delta_ep": f"ΔEp ({volt_unit})",
+        }
+        ax.set_xlabel(x_labels[kind])
+        ax.set_ylabel(y_labels[kind])
+        ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0)
+        _apply_spine_style(ax, style)
+        buf = io.BytesIO()
+        fig.savefig(buf, format=fmt, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
 
@@ -240,10 +256,9 @@ class CyclicVoltammetryView(QWidget):
         outer.addWidget(tabs)
 
         tabs.addTab(self._build_import_tab(), "① Import")
-        tabs.addTab(self._build_plot_tab(), "② CV Plot")
-        tabs.addTab(self._build_peak_tab(), "③ Peak Analysis")
-        tabs.addTab(self._build_scan_rate_tab(), "④ Scan Rate Analysis")
-        tabs.addTab(self._build_export_tab(), "⑤ Export")
+        tabs.addTab(self._build_plot_peaks_tab(), "② Plot & Peaks")
+        tabs.addTab(self._build_scan_rate_tab(), "③ Scan Rate Analysis")
+        tabs.addTab(self._build_export_tab(), "④ Export")
 
         app_state.files_changed.connect(self._on_files_changed)
         app_state.setting_changed.connect(self._on_setting_changed)
@@ -298,8 +313,15 @@ class CyclicVoltammetryView(QWidget):
         self._sr_table.setMaximumHeight(140)
         layout.addWidget(self._sr_table)
 
-        format_group = QGroupBox("Column Mapping", self)
-        format_form = QFormLayout(format_group)
+        # -- Column mapping (collapsed by default — auto-detection already
+        #    seeds a sensible guess; only needed when that guess is wrong) --
+        mapping_group = QGroupBox("Column mapping — only needed if auto-detection guessed wrong", self)
+        mapping_outer = QVBoxLayout(mapping_group)
+        mapping_content = QWidget(self)
+        mapping_layout = QVBoxLayout(mapping_content)
+        mapping_layout.setContentsMargins(0, 0, 0, 0)
+
+        format_form = QFormLayout()
         self._fmt_combo = QComboBox(self)
         self._fmt_combo.addItems(["Standard CSV", "Multi-channel instrument"])
         self._fmt_combo.currentTextChanged.connect(self._on_format_changed)
@@ -312,7 +334,7 @@ class CyclicVoltammetryView(QWidget):
         self._skip_spin.setRange(0, 50)
         self._skip_spin.valueChanged.connect(self._on_format_changed)
         format_form.addRow("Rows to skip", self._skip_spin)
-        layout.addWidget(format_group)
+        mapping_layout.addLayout(format_form)
 
         self._n_channels_spin = QSpinBox(self)
         self._n_channels_spin.setRange(1, _MAX_CHANNELS)
@@ -321,15 +343,19 @@ class CyclicVoltammetryView(QWidget):
         channels_header.addWidget(QLabel("Number of channels", self))
         channels_header.addWidget(self._n_channels_spin)
         channels_header.addStretch(1)
-        layout.addLayout(channels_header)
+        mapping_layout.addLayout(channels_header)
 
         col_header = QHBoxLayout()
         col_header.addWidget(QLabel("<b>Name</b>", self), 2)
         col_header.addWidget(QLabel("<b>Voltage col</b>", self), 2)
         col_header.addWidget(QLabel("<b>Current col(s) — multi = averaged</b>", self), 3)
-        layout.addLayout(col_header)
+        mapping_layout.addLayout(col_header)
         self._channel_rows_layout = QVBoxLayout()
-        layout.addLayout(self._channel_rows_layout)
+        mapping_layout.addLayout(self._channel_rows_layout)
+
+        mapping_outer.addWidget(mapping_content)
+        make_collapsible(mapping_group, mapping_content, expanded=False)
+        layout.addWidget(mapping_group)
 
         load_btn = QPushButton("Load All Files", self)
         load_btn.clicked.connect(self._load_all_files)
@@ -515,8 +541,8 @@ class CyclicVoltammetryView(QWidget):
             ch_summary = ", ".join(c["name"] + (" ⏢" if c.get("is_avg") else "") for c in r["channels"])
             self._runs_table.setItem(row, 3, QTableWidgetItem(ch_summary))
 
-    # -- Tab 2: CV Plot -----------------------------------------------------
-    def _build_plot_tab(self) -> QWidget:
+    # -- Tab 2: Plot & Peaks ----------------------------------------------------
+    def _build_plot_peaks_tab(self) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
         layout.addWidget(QLabel("Scan rates", self))
@@ -531,9 +557,52 @@ class CyclicVoltammetryView(QWidget):
         layout.addWidget(self._plot_ch_list)
         self._cv_plot_view = PlotView(self)
         layout.addWidget(self._cv_plot_view, 1)
-        export_btn = QPushButton("Export CV plot PNG", self)
-        export_btn.clicked.connect(self._export_cv_plot_png)
-        layout.addWidget(export_btn)
+
+        # -- Peak detection (expanded by default — this is the core "define
+        #    where the spikes are, see it on the plot" step for CV) --------
+        peak_group = QGroupBox("Peak detection", self)
+        peak_outer = QVBoxLayout(peak_group)
+        peak_content = QWidget(self)
+        peak_layout = QVBoxLayout(peak_content)
+        peak_layout.setContentsMargins(0, 0, 0, 0)
+
+        params_form = QFormLayout()
+        self._prom_spin = QDoubleSpinBox(self)
+        self._prom_spin.setRange(0.0, 1e12)
+        self._prom_spin.setDecimals(5)
+        params_form.addRow("Prominence", self._prom_spin)
+        self._dist_spin = QSpinBox(self)
+        self._dist_spin.setRange(1, 100000)
+        self._dist_spin.setValue(10)
+        params_form.addRow("Min distance (points)", self._dist_spin)
+        self._width_spin = QSpinBox(self)
+        self._width_spin.setRange(0, 100000)
+        params_form.addRow("Min width (points)", self._width_spin)
+        self._height_spin = QDoubleSpinBox(self)
+        self._height_spin.setRange(0.0, 1e12)
+        self._height_spin.setDecimals(5)
+        params_form.addRow("Min |Ip|", self._height_spin)
+        peak_layout.addLayout(params_form)
+
+        peak_layout.addWidget(QLabel("Channels", self))
+        self._peak_ch_list = QListWidget(self)
+        self._peak_ch_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self._peak_ch_list.setMaximumHeight(90)
+        peak_layout.addWidget(self._peak_ch_list)
+
+        find_btn = QPushButton("Find Peaks in All Runs", self)
+        find_btn.clicked.connect(self._find_peaks)
+        peak_layout.addWidget(find_btn)
+        self._peak_status = QLabel("", self)
+        peak_layout.addWidget(self._peak_status)
+
+        peak_outer.addWidget(peak_content)
+        make_collapsible(peak_group, peak_content, expanded=True)
+        layout.addWidget(peak_group)
+
+        layout.addWidget(QLabel("All detected peaks", self))
+        self._peaks_table = QTableWidget(self)
+        layout.addWidget(self._peaks_table, 1)
         return tab
 
     def _refresh_plot_selectors(self) -> None:
@@ -595,52 +664,20 @@ class CyclicVoltammetryView(QWidget):
         runs = self._runs()
         if not runs:
             return
+        opts = ExportOptionsDialog.get_options(self, "Export CV plot")
+        if opts is None:
+            return
         vis_srs = set(self._checked_labels(self._plot_sr_list))
         vis_chs = set(self._checked_labels(self._plot_ch_list))
-        png_bytes = _render_cv_plot_png(runs, vis_srs, vis_chs, self._app_state.get_field("volt_unit"), self._app_state.get_field("cv_cur_unit"))
-        path, _ = QFileDialog.getSaveFileName(self, "Export CV plot PNG", "cv_plot.png", "PNG image (*.png)")
+        png_bytes = _render_cv_plot_png(
+            runs, vis_srs, vis_chs, self._app_state.get_field("volt_unit"), self._app_state.get_field("cv_cur_unit"),
+            dpi=opts["dpi"], fmt=opts["fmt"], figsize=opts["figsize"], style=opts["style"],
+        )
+        ext = opts["fmt"]
+        path, _ = QFileDialog.getSaveFileName(self, "Export CV plot", f"cv_plot.{ext}", f"{ext.upper()} (*.{ext})")
         if path:
             with open(path, "wb") as f:
                 f.write(png_bytes)
-
-    # -- Tab 3: Peak Analysis -------------------------------------------------
-    def _build_peak_tab(self) -> QWidget:
-        tab = QWidget(self)
-        layout = QVBoxLayout(tab)
-        params_form = QFormLayout()
-        self._prom_spin = QDoubleSpinBox(self)
-        self._prom_spin.setRange(0.0, 1e12)
-        self._prom_spin.setDecimals(5)
-        params_form.addRow("Prominence", self._prom_spin)
-        self._dist_spin = QSpinBox(self)
-        self._dist_spin.setRange(1, 100000)
-        self._dist_spin.setValue(10)
-        params_form.addRow("Min distance (points)", self._dist_spin)
-        self._width_spin = QSpinBox(self)
-        self._width_spin.setRange(0, 100000)
-        params_form.addRow("Min width (points)", self._width_spin)
-        self._height_spin = QDoubleSpinBox(self)
-        self._height_spin.setRange(0.0, 1e12)
-        self._height_spin.setDecimals(5)
-        params_form.addRow("Min |Ip|", self._height_spin)
-        layout.addLayout(params_form)
-
-        layout.addWidget(QLabel("Channels", self))
-        self._peak_ch_list = QListWidget(self)
-        self._peak_ch_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
-        self._peak_ch_list.setMaximumHeight(90)
-        layout.addWidget(self._peak_ch_list)
-
-        find_btn = QPushButton("Find Peaks in All Runs", self)
-        find_btn.clicked.connect(self._find_peaks)
-        layout.addWidget(find_btn)
-        self._peak_status = QLabel("", self)
-        layout.addWidget(self._peak_status)
-
-        layout.addWidget(QLabel("All detected peaks", self))
-        self._peaks_table = QTableWidget(self)
-        layout.addWidget(self._peaks_table, 1)
-        return tab
 
     def _refresh_peak_channel_list(self) -> None:
         runs = self._runs()
@@ -699,7 +736,7 @@ class CyclicVoltammetryView(QWidget):
             for col, val in enumerate((f"{sr:g}", ch, kind, f"{ep:.4g}", f"{ip:.4g}")):
                 self._peaks_table.setItem(row, col, QTableWidgetItem(val))
 
-    # -- Tab 4: Scan Rate Analysis --------------------------------------------
+    # -- Tab 3: Scan Rate Analysis --------------------------------------------
     def _build_scan_rate_tab(self) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
@@ -714,17 +751,11 @@ class CyclicVoltammetryView(QWidget):
         self._ip_nu_plot = PlotView(self)
         self._ip_nu_plot.setMinimumHeight(300)
         layout.addWidget(self._ip_nu_plot)
-        ip_nu_export = QPushButton("Export Ip vs ν PNG", self)
-        ip_nu_export.clicked.connect(lambda: self._export_sr_plot_png("ip_nu", "ip_vs_nu.png"))
-        layout.addWidget(ip_nu_export)
 
         layout.addWidget(QLabel("Randles–Ševčík Plot (Ip vs √ν)", self))
         self._ip_sqrt_plot = PlotView(self)
         self._ip_sqrt_plot.setMinimumHeight(300)
         layout.addWidget(self._ip_sqrt_plot)
-        ip_sqrt_export = QPushButton("Export Ip vs √ν PNG", self)
-        ip_sqrt_export.clicked.connect(lambda: self._export_sr_plot_png("ip_sqrt_nu", "ip_vs_sqrtnu.png"))
-        layout.addWidget(ip_sqrt_export)
 
         self._sr_stats_table = QTableWidget(self)
         self._sr_stats_table.setMaximumHeight(140)
@@ -734,21 +765,12 @@ class CyclicVoltammetryView(QWidget):
         self._ep_nu_plot = PlotView(self)
         self._ep_nu_plot.setMinimumHeight(300)
         layout.addWidget(self._ep_nu_plot)
-        ep_nu_export = QPushButton("Export Ep vs ν PNG", self)
-        ep_nu_export.clicked.connect(lambda: self._export_sr_plot_png("ep_nu", "ep_vs_nu.png"))
-        layout.addWidget(ep_nu_export)
 
         layout.addWidget(QLabel("Peak Separation (ΔEp) vs Scan Rate", self))
         self._dep_nu_plot = PlotView(self)
         self._dep_nu_plot.setMinimumHeight(300)
         layout.addWidget(self._dep_nu_plot)
-        dep_nu_export = QPushButton("Export ΔEp vs ν PNG", self)
-        dep_nu_export.clicked.connect(lambda: self._export_sr_plot_png("delta_ep", "dep_vs_nu.png"))
-        layout.addWidget(dep_nu_export)
 
-        export_btn = QPushButton("Export scan-rate analysis CSV", self)
-        export_btn.clicked.connect(self._export_scan_rate_csv)
-        layout.addWidget(export_btn)
         return tab
 
     def _refresh_scan_rate_channel_list(self) -> None:
@@ -884,25 +906,58 @@ class CyclicVoltammetryView(QWidget):
         ch_data = self._scan_rate_data()
         if not ch_data:
             return
+        opts = ExportOptionsDialog.get_options(self, "Export scan-rate plot")
+        if opts is None:
+            return
         png_bytes = _render_sr_plot_png(
             kind, ch_data, self._app_state.get_field("volt_unit"),
             self._app_state.get_field("cv_cur_unit"), self._app_state.get_field("cv_sr_unit"),
+            dpi=opts["dpi"], fmt=opts["fmt"], figsize=opts["figsize"], style=opts["style"],
         )
-        path, _ = QFileDialog.getSaveFileName(self, "Export scan-rate plot PNG", default_name, "PNG image (*.png)")
+        ext = opts["fmt"]
+        base = default_name.rsplit(".", 1)[0]
+        path, _ = QFileDialog.getSaveFileName(self, "Export scan-rate plot", f"{base}.{ext}", f"{ext.upper()} (*.{ext})")
         if path:
             with open(path, "wb") as f:
                 f.write(png_bytes)
 
-    # -- Tab 5: Export ----------------------------------------------------------
+    # -- Tab 4: Export ----------------------------------------------------------
     def _build_export_tab(self) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
+
+        csv_group = QGroupBox("CSV exports", self)
+        csv_layout = QVBoxLayout(csv_group)
         peaks_btn = QPushButton("Export all peaks CSV", self)
         peaks_btn.clicked.connect(self._export_peaks_csv)
-        layout.addWidget(peaks_btn)
+        csv_layout.addWidget(peaks_btn)
+        sr_csv_btn = QPushButton("Export scan-rate analysis CSV", self)
+        sr_csv_btn.clicked.connect(self._export_scan_rate_csv)
+        csv_layout.addWidget(sr_csv_btn)
         raw_btn = QPushButton("Export raw data (all runs, one CSV each)", self)
         raw_btn.clicked.connect(self._export_raw_data)
-        layout.addWidget(raw_btn)
+        csv_layout.addWidget(raw_btn)
+        layout.addWidget(csv_group)
+
+        plot_group = QGroupBox("Plot exports", self)
+        plot_layout = QVBoxLayout(plot_group)
+        cv_plot_btn = QPushButton("Export CV plot…", self)
+        cv_plot_btn.clicked.connect(self._export_cv_plot_png)
+        plot_layout.addWidget(cv_plot_btn)
+        ip_nu_btn = QPushButton("Export Ip vs ν plot…", self)
+        ip_nu_btn.clicked.connect(lambda: self._export_sr_plot_png("ip_nu", "ip_vs_nu.png"))
+        plot_layout.addWidget(ip_nu_btn)
+        ip_sqrt_btn = QPushButton("Export Ip vs √ν plot…", self)
+        ip_sqrt_btn.clicked.connect(lambda: self._export_sr_plot_png("ip_sqrt_nu", "ip_vs_sqrtnu.png"))
+        plot_layout.addWidget(ip_sqrt_btn)
+        ep_nu_btn = QPushButton("Export Ep vs ν plot…", self)
+        ep_nu_btn.clicked.connect(lambda: self._export_sr_plot_png("ep_nu", "ep_vs_nu.png"))
+        plot_layout.addWidget(ep_nu_btn)
+        dep_nu_btn = QPushButton("Export ΔEp vs ν plot…", self)
+        dep_nu_btn.clicked.connect(lambda: self._export_sr_plot_png("delta_ep", "dep_vs_nu.png"))
+        plot_layout.addWidget(dep_nu_btn)
+        layout.addWidget(plot_group)
+
         layout.addStretch(1)
         return tab
 

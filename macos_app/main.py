@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QUndoGroup
 from PySide6.QtWidgets import QApplication
 
@@ -71,6 +71,10 @@ class AppController:
 
 
 def main() -> int:
+    # Must be set before QApplication is constructed — Qt's documented
+    # prerequisite for QWebEngineView (every PlotView embeds one); without
+    # it QtWebEngine can construct but silently never paint.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
     app.setApplicationName("Sensor Calibration Studio")
 
