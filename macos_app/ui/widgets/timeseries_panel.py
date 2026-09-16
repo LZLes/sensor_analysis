@@ -21,7 +21,6 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -46,7 +45,6 @@ from core.numeric import _eff_t_start, smooth_signal, to_num
 from core.shared_tabs import _amp_label, render_ts_png
 from macos_app.ui.app_state import AppState
 from macos_app.ui.dialogs.export_options_dialog import ExportOptionsDialog
-from macos_app.ui.theme import plot_theme
 from macos_app.ui.undo_commands import SetFieldCommand
 from macos_app.ui.widgets.collapsible import make_collapsible
 from macos_app.ui.widgets.plot_view import PlotView
@@ -199,7 +197,7 @@ class TimeSeriesPanel(QWidget):
         y_row.addWidget(self._y_max)
         outer.addWidget(y_group)
 
-        self._plot_view = PlotView(self)
+        self._plot_view = PlotView(self, show_range_slider=True)
         outer.addWidget(self._plot_view, 1)
 
         export_row = QHBoxLayout()
@@ -208,8 +206,6 @@ class TimeSeriesPanel(QWidget):
         export_row.addWidget(png_btn)
         export_row.addStretch(1)
         outer.addLayout(export_row)
-
-        self._last_figure: go.Figure | None = None
 
     # -- data plumbing ----------------------------------------------------------
     def _combos(self) -> list[tuple[int, int, str, pd.DataFrame, dict]]:
@@ -261,7 +257,7 @@ class TimeSeriesPanel(QWidget):
         window = self._smooth_window.value()
         polyorder = self._smooth_polyorder.value()
 
-        fig = go.Figure()
+        self._plot_view.clear()
         for fi, ci, fn, df, ch in combos:
             label = _amp_label(fn, ch["name"], multi_file)
             if label not in visible:
@@ -272,22 +268,17 @@ class TimeSeriesPanel(QWidget):
             color = PAL[(fi if multi_file else ci) % len(PAL)]
             dash = _DASHES[ci % len(_DASHES)] if multi_file else "solid"
             if method != "None":
-                fig.add_trace(go.Scatter(x=t, y=raw, name=f"{label} (raw)", mode="lines",
-                                          opacity=0.35, line=dict(color=color, width=1, dash=dash),
-                                          showlegend=False))
-            fig.add_trace(go.Scatter(x=t, y=smoothed, name=label, mode="lines",
-                                      line=dict(color=color, width=1.5, dash=dash)))
+                self._plot_view.add_series(t, raw, name=f"{label} (raw)", color=color, width=1,
+                                            dash=dash, opacity=0.35, legend=False, hover=False)
+            self._plot_view.add_series(t, smoothed, name=label, color=color, width=1.5, dash=dash)
 
-        theme = plot_theme()
         for frec in files:
             for _, row in frec.get("cpdf", pd.DataFrame()).iterrows():
                 ets = _eff_t_start(row)
                 if ets is not None and pd.notna(row.get("t_end")):
                     color = "rgba(255,165,0,0.22)" if row.get("Baseline") else "rgba(100,160,255,0.15)"
                     label = f"{frec['filename']}: {row['Label']}" if multi_file else str(row["Label"])
-                    fig.add_vrect(x0=ets, x1=row["t_end"], fillcolor=color, layer="below", line_width=0,
-                                  annotation_text=label, annotation_position="top left",
-                                  annotation=dict(font_size=10, font_color=theme["annot_font"]))
+                    self._plot_view.add_region(ets, row["t_end"], color=color, text=label)
 
         # Auto-detect preview: candidate edges not yet applied to the
         # calibration table (see autodetect_panel.py) — thin dotted lines,
@@ -295,38 +286,15 @@ class TimeSeriesPanel(QWidget):
         edges_by_file = self._app_state.data.ts_ui.get(self._files_key, {}).get("autodetect_edges", {})
         for frec in files:
             for edge in edges_by_file.get(frec["filename"], []):
-                fig.add_vline(x=edge, line_dash="dot", line_color="#e91e63", opacity=0.55,
-                              annotation_text="detected", annotation_position="bottom",
-                              annotation=dict(font_size=9, font_color="#e91e63"))
+                self._plot_view.add_vline(edge, color="#e91e63", dash="dot", text="detected")
 
-        y_range_kwargs = {}
-        if not self._y_auto.isChecked():
-            y_range_kwargs["range"] = [self._y_min.value(), self._y_max.value()]
-
-        fig.update_layout(
-            xaxis_title="Time (s)",
-            yaxis_title=f"{self._signal_axis_label} ({self._app_state.get_field(self._unit_key)})",
-            hovermode="x unified",
-            height=520,
-            template=theme["template"],
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            showlegend=True,
-            xaxis=dict(
-                rangeslider=dict(visible=True, thickness=0.05),
-                showspikes=True, spikemode="across", spikesnap="cursor",
-                spikecolor=theme["spike"], spikethickness=1, spikedash="dot",
-                showgrid=True, gridcolor=theme["grid"], linecolor=theme["axisline"],
-            ),
-            yaxis=dict(
-                showspikes=True, spikemode="across",
-                spikecolor=theme["spike"], spikethickness=1, spikedash="dot",
-                showgrid=True, gridcolor=theme["grid"], linecolor=theme["axisline"],
-                **y_range_kwargs,
-            ),
+        self._plot_view.set_labels(
+            "Time (s)", f"{self._signal_axis_label} ({self._app_state.get_field(self._unit_key)})"
         )
-        self._plot_view.set_figure(fig)
-        self._last_figure = fig
+        self._plot_view.set_y_range(
+            auto=self._y_auto.isChecked(), y_min=self._y_min.value(), y_max=self._y_max.value()
+        )
+        self._plot_view.finish()
 
     # -- control handlers ---------------------------------------------------
     def _on_smoothing_changed(self, *_args) -> None:
@@ -346,16 +314,20 @@ class TimeSeriesPanel(QWidget):
         files = self._app_state.files_for(self._files_key)
         if not files:
             return None
-        opts = ExportOptionsDialog.get_options(self, "Export time series")
+
+        def render(opts: dict) -> bytes:
+            return render_ts_png(
+                files, self._app_state.get_field(self._unit_key), self.visible_labels(),
+                dpi=opts["dpi"], fmt=opts["fmt"], figsize=opts["figsize"], style=opts["style"],
+                smooth_method=self._smooth_method.currentText(),
+                smooth_window=self._smooth_window.value(),
+                smooth_polyorder=self._smooth_polyorder.value(),
+            )
+
+        opts = ExportOptionsDialog.get_options(self, "Export time series", render)
         if opts is None:
             return None
-        png_bytes = render_ts_png(
-            files, self._app_state.get_field(self._unit_key), self.visible_labels(),
-            dpi=opts["dpi"], fmt=opts["fmt"], figsize=opts["figsize"], style=opts["style"],
-            smooth_method=self._smooth_method.currentText(),
-            smooth_window=self._smooth_window.value(),
-            smooth_polyorder=self._smooth_polyorder.value(),
-        )
+        png_bytes = render(opts)
         ext = opts["fmt"]
         path, _ = QFileDialog.getSaveFileName(self, "Export time series", f"time_series.{ext}", f"{ext.upper()} (*.{ext})")
         if path:

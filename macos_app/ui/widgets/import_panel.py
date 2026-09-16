@@ -12,6 +12,10 @@ no "Apply Channel Configuration" gate here. Fine-tuning channel names/time
 column/signal column happens directly in the "Time Series & Windows" step
 (see macos_app/ui/widgets/timeseries_panel.py's _FileChannelEditor) once the
 user can see the trace, rather than being forced before it's even visible.
+
+Selecting a file in the loaded-files list shows its raw parsed CSV in a
+read-only table alongside it, so the user can sanity-check what was parsed
+without leaving this tab.
 """
 
 from __future__ import annotations
@@ -29,6 +33,8 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QSplitter,
+    QTableView,
     QVBoxLayout,
     QWidget,
 )
@@ -36,6 +42,7 @@ from PySide6.QtWidgets import (
 from core.parsing import parse_with_options
 from macos_app.ui.app_state import AppState
 from macos_app.ui.undo_commands import FilesListCommand, SetFieldCommand
+from macos_app.ui.widgets.pandas_table_model import PandasTableModel
 
 _IMPORTABLE_SUFFIXES = (".csv", ".txt", ".pssession")
 
@@ -100,8 +107,22 @@ class ImportPanel(QWidget):
         outer.addWidget(units_group)
 
         outer.addWidget(QLabel("Loaded files — fine-tune channel assignment in the Time Series & Windows tab.", self))
-        self._files_list = QListWidget(self)
-        outer.addWidget(self._files_list, 1)
+        splitter = QSplitter(self)
+        self._files_list = QListWidget(splitter)
+        self._files_list.currentRowChanged.connect(self._on_file_selected)
+        splitter.addWidget(self._files_list)
+
+        preview_container = QWidget(splitter)
+        preview_layout = QVBoxLayout(preview_container)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.addWidget(QLabel("Preview", preview_container))
+        self._preview_table = QTableView(preview_container)
+        self._preview_table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
+        preview_layout.addWidget(self._preview_table)
+        splitter.addWidget(preview_container)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        outer.addWidget(splitter, 1)
 
         self._status_label = QLabel("", self)
         outer.addWidget(self._status_label)
@@ -125,11 +146,25 @@ class ImportPanel(QWidget):
             self._refresh_files_list()
 
     def _refresh_files_list(self) -> None:
+        previously_selected = self._files_list.currentRow()
+        self._files_list.blockSignals(True)
         self._files_list.clear()
         for frec in self._app_state.files_for(self._files_key):
             n_ch = len(frec.get("channels", []))
             label = f"{frec['filename']} — {n_ch} channel{'s' if n_ch != 1 else ''}"
             QListWidgetItem(label, self._files_list)
+        self._files_list.blockSignals(False)
+        if self._files_list.count():
+            row = previously_selected if 0 <= previously_selected < self._files_list.count() else 0
+            self._files_list.setCurrentRow(row)
+        self._on_file_selected(self._files_list.currentRow())
+
+    def _on_file_selected(self, row: int) -> None:
+        files = self._app_state.files_for(self._files_key)
+        if not (0 <= row < len(files)):
+            self._preview_table.setModel(None)
+            return
+        self._preview_table.setModel(PandasTableModel(files[row]["df"], editable_columns=set(), parent=self._preview_table))
 
     # -- entry points ---------------------------------------------------------
     def add_files(self, paths: list[str]) -> None:

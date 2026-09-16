@@ -47,14 +47,15 @@ This launches the Qt app directly — no packaging step needed for day-to-day de
 
 ### Using the app
 
-Amperometry and Solid-State each follow the same 4-step pipeline, one tab per step:
+Amperometry and Solid-State each follow the same 3-step pipeline, one tab per step:
 
-1. **① Import** — browse for files, drag-and-drop them onto the window, or load the built-in sample data. Channel names/columns are auto-detected; there's no separate "apply" step before you can see the trace.
-2. **② Time Series & Windows** — the trace is plotted immediately, with a checklist to choose which channels are visible (this same checklist is what "Compute Calibration" analyses in step 3). Fine-tune channel assignment, mark calibration windows (spike start/end, concentration, spike volume), and auto-detect step edges from the trace, all in one screen — collapsible side panels keep these out of the way until you open them. Amperometry also has the effective-concentration (serial dilution) calculator here.
-3. **③ Calibration Results** — pick a fit type, click Compute Calibration, and see the fitted curve with sensitivity/R²/LOD/LOQ statistics.
-4. **④ Export** — CSV summary, plus a calibration-curve/time-series image export with a Format (PNG/SVG/PDF/TIFF), DPI, Style (Default/Origin/Minimal), and figure-size dialog.
+1. **① Import** — browse for files, drag-and-drop them onto the window, or load the built-in sample data. Channel names/columns are auto-detected; there's no separate "apply" step before you can see the trace. Selecting a file shows its raw parsed CSV in a table alongside the loaded-files list.
+2. **② Time Series & Calibration** — the trace is plotted immediately, with a checklist to choose which channels are visible (this same checklist is what "Compute Calibration" analyses below). Fine-tune channel assignment, mark calibration windows (spike start/end, concentration, spike volume), and auto-detect step edges from the trace, in collapsible side panels next to the plot — Amperometry also has the effective-concentration (serial dilution) calculator here. Below that, in the same tab: pick a fit type, click Compute Calibration, and see the fitted curve with sensitivity/R²/LOD/LOQ statistics.
+3. **③ Export** — CSV summary, plus a calibration-curve/time-series image export with a Format (PNG/SVG/PDF/TIFF), DPI, Style (Default/Origin/Minimal), and figure-size dialog, and a live preview of the exported image that updates as you change those options.
 
-A 5th **⑤ Compare Files** tab overlays fits from multiple loaded files. Cyclic Voltammetry follows the same shape (① Import → ② Plot & Peaks → ③ Scan Rate Analysis → ④ Export) without the calibration-window concept, since peak detection there plays the same role.
+A 4th **④ Compare Files** tab overlays fits from multiple loaded files. Cyclic Voltammetry follows a similar shape (① Import → ② Plot & Peaks → ③ Scan Rate Analysis → ④ Export) without the calibration-window concept, since peak detection there plays the same role.
+
+Every plot in the app is a native chart (scroll to zoom, drag to pan, hover for a crosshair readout) rather than an embedded web view.
 
 ### Building an installable `.app` / `.dmg`
 

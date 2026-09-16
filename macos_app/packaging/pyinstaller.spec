@@ -13,13 +13,23 @@ macos_app/packaging/requirements-build.txt installed.
 IMPORTANT — this has never been run on a real Mac (written and reasoned
 through in a Linux sandbox with no macOS/PyInstaller-for-macOS available
 to test against). Treat the first build as the Phase 0 feasibility spike
-the migration plan called for: confirm the app actually launches, and
-specifically that QtWebEngine renders a Plotly chart rather than a blank
-QWebEngineView (the collect_all("PySide6") call below exists to prevent
-that — see the comment on it), before trusting this for real distribution.
-Also validate the resulting bundle size (QtWebEngine's Chromium runtime
-was flagged early in the migration plan as the single biggest packaging-
-size driver in the whole app).
+the migration plan called for: confirm the app actually launches and its
+(now native pyqtgraph, not QtWebEngine) charts render, before trusting
+this for real distribution.
+
+Charts used to be Plotly HTML rendered inside a QWebEngineView, which is
+why collect_all("PySide6") below pulls in every Qt module PySide6 ships
+rather than a filtered subset — QtWebEngine's own hook needed that to find
+its Chromium runtime, resource .pak files, and helper process binary.
+Every chart is now native pyqtgraph (macos_app/ui/widgets/plot_view.py) —
+QtWebEngineWidgets/QtWebEngineCore aren't imported anywhere in macos_app/
+any more, so PyInstaller's own import-scanning should no longer pull in
+that Chromium runtime regardless of what collect_all("PySide6") grabs.
+That should shrink the bundle substantially (QtWebEngine's Chromium
+runtime was flagged early in the migration plan as the single biggest
+packaging-size driver in the whole app) — worth verifying on the first
+real build rather than assumed, and worth revisiting whether collect_all
+can now be narrowed instead of left indiscriminate.
 """
 
 import sys
@@ -94,6 +104,12 @@ a = Analysis(
         "modes.amperometry", "modes.solid_state", "modes.cyclic_voltammetry", "modes.assay",
         "core.parsing", "core.persistence", "core.calibration_table", "core.numeric",
         "core.plotting", "core.constants", "core.step_detection", "core.shared_tabs",
+        # pyqtgraph does a fair amount of its own dynamic/optional importing
+        # (numba/cupy acceleration, several Qt-binding shims) that
+        # PyInstaller's static analysis can miss; its own hook (via
+        # pyinstaller-hooks-contrib) normally covers this, but list it
+        # explicitly since it's new and unverified on a real build.
+        "pyqtgraph",
     ],
     hookspath=[],
     excludes=[

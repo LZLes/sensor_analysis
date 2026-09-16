@@ -6,9 +6,19 @@ PySide6>=6.6.0
 PySide6-Addons>=6.6.0
 pandas>=2.0.0
 numpy>=1.24.0
-plotly>=5.18.0
+pyqtgraph>=0.13.0
 scipy>=1.11.0
 matplotlib>=3.7.0
+
+# plotly is NOT used by any macos_app/ UI code any more — every interactive
+# chart is now the native pyqtgraph-based PlotView (macos_app/ui/widgets/
+# plot_view.py), replacing the earlier Plotly-in-QWebEngineView approach.
+# Still required transitively, same reasoning as the streamlit note below:
+# core/shared_tabs.py and modes/amperometry.py|solid_state.py|
+# cyclic_voltammetry.py do `import plotly.graph_objects as go` at module
+# level (for the Streamlit app's own st.plotly_chart calls) even though the
+# specific pure functions macos_app/ imports from them never touch it.
+plotly>=5.18.0
 
 # ollama is deliberately NOT listed here: core/ai_insights.py (the only
 # consumer of the ollama package) was flagged in the migration plan as a

@@ -30,12 +30,10 @@ from __future__ import annotations
 
 from typing import Callable
 
-import plotly.graph_objects as go
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 
 from core.constants import PAL
 from macos_app.ui.app_state import AppState
-from macos_app.ui.theme import plot_theme
 from macos_app.ui.widgets.plot_view import PlotView
 
 FileFitFn = Callable[[dict, AppState], "dict | None"]
@@ -125,26 +123,21 @@ class ComparisonView(QWidget):
         checked = self._checked_filenames()
         selected_files = [f for f in files if f["filename"] in checked]
 
-        fig = go.Figure()
+        self._plot_view.clear()
         stat_rows = []
         for fi, frec in enumerate(selected_files):
             result = self._compute_fn(frec, self._app_state)
             if result is None:
                 continue
             color = PAL[fi % len(PAL)]
-            fig.add_trace(go.Scatter(x=result["x"], y=result["y"], name=frec["filename"], mode="markers",
-                                      marker=dict(color=color, size=9)))
-            fig.add_trace(go.Scatter(x=result["curve_x"], y=result["curve_y"], name=f"{frec['filename']} fit",
-                                      mode="lines", showlegend=False, line=dict(color=color, dash="dash", width=2)))
+            self._plot_view.add_series(result["x"], result["y"], name=frec["filename"], color=color,
+                                        show_line=False, symbol="circle", size=9)
+            self._plot_view.add_series(result["curve_x"], result["curve_y"], name=f"{frec['filename']} fit",
+                                        color=color, dash="dash", width=2, legend=False, hover=False)
             stat_rows.append(result["stats"])
 
-        theme = plot_theme()
-        fig.update_layout(
-            xaxis_title=self._x_label, yaxis_title=self._y_label,
-            height=420, template=theme["template"],
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        )
-        self._plot_view.set_figure(fig)
+        self._plot_view.set_labels(self._x_label, self._y_label)
+        self._plot_view.finish()
 
         self._stats_table.clear()
         if stat_rows:

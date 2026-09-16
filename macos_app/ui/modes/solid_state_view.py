@@ -7,19 +7,17 @@ is imported directly from modes/solid_state.py — none of it is touched;
 this view calls the same pure functions the Streamlit render() function
 calls, just driven by AppState instead of st.session_state.
 
-Tab layout mirrors AmperometryView's 4-step pipeline (Import → Time Series
-& Windows → Calibration Results → Export) plus Compare Files — see that
-file's docstring and the "Streamline Amperometry/Solid-State/CV" plan for
-the reasoning. Solid-State has no dilution calculator (that's Amperometry-
-only), so its Time Series & Windows tab is channel assignment + calibration
-windows only.
+Tab layout mirrors AmperometryView's 3-step pipeline (Import → Time Series
+& Calibration → Export) plus Compare Files — see that file's docstring for
+the windows+results tab merge reasoning. Solid-State has no dilution
+calculator (that's Amperometry-only), so its side panel is channel
+assignment + calibration windows only.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
@@ -45,13 +43,12 @@ from core.constants import PAL, fmt
 from core.numeric import _eff_t_start, to_num
 from core.shared_tabs import _amp_label
 from macos_app.ui.app_state import AppState
-from macos_app.ui.dialogs.export_options_dialog import ExportOptionsDialog
-from macos_app.ui.theme import plot_theme
 from macos_app.ui.undo_commands import FilesListCommand, TableEditCommand
 from macos_app.ui.widgets.autodetect_panel import AutodetectPanel
 from macos_app.ui.widgets.collapsible import make_collapsible
 from macos_app.ui.widgets.comparison_view import ComparisonView
 from macos_app.ui.widgets.editable_table_view import EditableTableView
+from macos_app.ui.widgets.export_panel import ExportPanel, ExportTarget
 from macos_app.ui.widgets.import_panel import ImportPanel
 from macos_app.ui.widgets.plot_view import PlotView
 from macos_app.ui.widgets.timeseries_panel import TimeSeriesPanel, _FileChannelEditor
@@ -67,6 +64,7 @@ _FILES_KEY = "solid_files"
 _UNIT_KEY = "solid_unit"
 _CONC_UNIT_KEY = "solid_conc_unit"
 _CPDF_COLUMNS = ["Label", "Concentration", "t_start", "t_end", "avg_duration", "Reading_mV"]
+_CAL_TABLE_MIN_HEIGHT = 230  # header + ~5 data rows + the +/- row toolbar, at EditableTableView's default row height
 
 
 def _compute_file_fit(frec: dict, app_state: AppState) -> dict | None:
@@ -150,72 +148,46 @@ class SolidStateView(QWidget):
         )
         tabs.addTab(self._import_panel, "① Import")
 
-        # -- Tab 2: Time Series & Windows -----------------------------------
+        # -- Tab 2: Plot and Calibrate ----------------------------------------
+        # Merged from the earlier separate "Time Series & Windows" and
+        # "Calibration Results" tabs — see AmperometryView's docstring for
+        # the reasoning (same restructuring applied to both modes).
         self._timeseries_panel = TimeSeriesPanel(app_state, _FILES_KEY, _UNIT_KEY, "Potential")
-        windows_tab = self._build_windows_tab(app_state)
-        tabs.addTab(windows_tab, "② Time Series & Windows")
+        analysis_tab = self._build_analysis_tab(app_state)
+        tabs.addTab(analysis_tab, "② Plot and Calibrate")
 
-        # -- Tab 3: Calibration Results ---------------------------------------
-        cal_tab = QWidget(self)
-        cal_layout = QVBoxLayout(cal_tab)
-
-        settings_group = QGroupBox("Analysis Settings", self)
-        settings_form = QFormLayout(settings_group)
-        settings_form.addRow(QLabel(
-            "Channels analysed = the checked traces in ② Time Series & Windows.", self))
-        self._ion_charge = QSpinBox(self)
-        self._ion_charge.setRange(1, 4)
-        self._ion_charge.setValue(1)
-        settings_form.addRow("Ion charge |z|", self._ion_charge)
-        self._lab_temp = QDoubleSpinBox(self)
-        self._lab_temp.setRange(-20.0, 100.0)
-        self._lab_temp.setValue(25.0)
-        self._lab_temp.setSingleStep(0.5)
-        settings_form.addRow("Lab temperature (°C)", self._lab_temp)
-        cal_layout.addWidget(settings_group)
-
-        compute_btn = QPushButton("Compute Calibration", self)
-        compute_btn.clicked.connect(self._compute_calibration)
-        cal_layout.addWidget(compute_btn)
-
-        self._cal_status = QLabel("", self)
-        cal_layout.addWidget(self._cal_status)
-
-        self._cal_plot = PlotView(self)
-        cal_layout.addWidget(self._cal_plot, 1)
-
-        self._stats_table = QTableWidget(self)
-        self._stats_table.setMaximumHeight(160)
-        cal_layout.addWidget(self._stats_table)
-
-        tabs.addTab(cal_tab, "③ Calibration Results")
-
-        # -- Tab 4: Export --------------------------------------------------
+        # -- Tab 3: Export --------------------------------------------------
+        # ExportPanel builds the Format/DPI/Style/Size controls and a live
+        # preview right into the tab — no popup dialog, since exporting is
+        # this tab's only job. CSV has no visual preview, so it stays a
+        # plain button above the plot-export panel.
         export_tab = QWidget(self)
         export_layout = QVBoxLayout(export_tab)
-        csv_btn = QPushButton("Export calibration summary CSV", self)
+        csv_btn = QPushButton("Export calibration summary CSV…", self)
         csv_btn.clicked.connect(self._export_csv)
         export_layout.addWidget(csv_btn)
-        png_btn = QPushButton("Export calibration curve…", self)
-        png_btn.clicked.connect(self._export_curve_png)
-        export_layout.addWidget(png_btn)
-        export_layout.addStretch(1)
-        tabs.addTab(export_tab, "④ Export")
+        self._export_panel = ExportPanel(
+            [ExportTarget("Calibration curve", self._render_curve_export, "solid_state_calibration_curve")], export_tab
+        )
+        export_layout.addWidget(self._export_panel, 1)
+        tabs.addTab(export_tab, "③ Export")
+        tabs.currentChanged.connect(self._on_tab_changed)
+        self._export_tab_index = tabs.indexOf(export_tab)
 
-        # -- Tab 5: Comparison (cross-file overlay) -------------------
+        # -- Tab 4: Comparison (cross-file overlay) -------------------
         comparison_tab = ComparisonView(
             app_state, _FILES_KEY, _compute_file_fit,
             x_label=f"log₁₀(Concentration [{app_state.get_field(_CONC_UNIT_KEY)}])",
             y_label=f"Potential ({app_state.get_field(_UNIT_KEY)})",
         )
-        tabs.addTab(comparison_tab, "⑤ Compare Files")
+        tabs.addTab(comparison_tab, "④ Compare Files")
 
         app_state.files_changed.connect(self._on_files_changed)
         app_state.cpdf_changed.connect(self._on_cpdf_changed)
         self._refresh_dataset_list()
 
     # -- Tab 2 construction ---------------------------------------------------
-    def _build_windows_tab(self, app_state: AppState) -> QWidget:
+    def _build_analysis_tab(self, app_state: AppState) -> QWidget:
         tab = QWidget(self)
         outer = QVBoxLayout(tab)
 
@@ -225,6 +197,16 @@ class SolidStateView(QWidget):
         self._dataset_combo.currentIndexChanged.connect(self._on_dataset_changed)
         dataset_row.addWidget(self._dataset_combo, 1)
         outer.addLayout(dataset_row)
+
+        # See AmperometryView._build_analysis_tab's comment: the two
+        # sections below are a drag-resizable splitter, safe because
+        # PlotView and the tables inside enforce their own minimum sizes;
+        # the scroll area is a fallback for whatever doesn't fit even at
+        # those minimums.
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        content = QWidget(scroll)
+        content_layout = QVBoxLayout(content)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.addWidget(self._timeseries_panel)
@@ -255,15 +237,28 @@ class SolidStateView(QWidget):
         windows_content_layout.setContentsMargins(0, 0, 0, 0)
         self._autodetect_panel = AutodetectPanel(app_state, _FILES_KEY, _cpdf_from_autodetect_windows, has_baseline=False)
         self._autodetect_panel.edges_detected.connect(self._timeseries_panel.refresh)
-        windows_content_layout.addWidget(self._autodetect_panel)
-        windows_content_layout.addWidget(QLabel("Calibration Points", self))
+
+        # A splitter (not a plain stack) between autodetect and the table so
+        # the table's on-screen height is a drag, not a fixed guess — useful
+        # once a calibration table has more rows than fit its default size.
+        windows_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        windows_splitter.addWidget(self._autodetect_panel)
+        table_container = QWidget(self)
+        table_layout = QVBoxLayout(table_container)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.addWidget(QLabel("Calibration Points", self))
         self._cal_table = EditableTableView(
             _default_solid_cpdf(),
             editable_columns=set(_CPDF_COLUMNS),
             row_defaults={"Label": "New", "Concentration": 1.0, "t_start": 0.0, "t_end": 60.0, "avg_duration": np.nan, "Reading_mV": np.nan},
         )
+        self._cal_table.setMinimumHeight(_CAL_TABLE_MIN_HEIGHT)
         self._cal_table.row_committed.connect(self._commit_active_cpdf)
-        windows_content_layout.addWidget(self._cal_table)
+        table_layout.addWidget(self._cal_table)
+        windows_splitter.addWidget(table_container)
+        windows_splitter.setStretchFactor(0, 1)
+        windows_splitter.setStretchFactor(1, 2)
+        windows_content_layout.addWidget(windows_splitter)
         windows_outer.addWidget(windows_content)
         make_collapsible(windows_group, windows_content, expanded=True)
         side_layout.addWidget(windows_group)
@@ -273,7 +268,60 @@ class SolidStateView(QWidget):
         splitter.addWidget(side_scroll)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
-        outer.addWidget(splitter, 1)
+
+        # -- Calibration results (settings + Compute button + plot + stats),
+        #    merged in below the trace/windows it reads from ------------------
+        cal_container = QWidget(self)
+        cal_layout = QVBoxLayout(cal_container)
+
+        settings_group = QGroupBox("Analysis Settings", self)
+        settings_form = QFormLayout(settings_group)
+        settings_form.addRow(QLabel("Channels analysed = the checked traces above.", self))
+        self._ion_charge = QSpinBox(self)
+        self._ion_charge.setRange(1, 4)
+        self._ion_charge.setValue(1)
+        settings_form.addRow("Ion charge |z|", self._ion_charge)
+        self._lab_temp = QDoubleSpinBox(self)
+        self._lab_temp.setRange(-20.0, 100.0)
+        self._lab_temp.setValue(25.0)
+        self._lab_temp.setSingleStep(0.5)
+        settings_form.addRow("Lab temperature (°C)", self._lab_temp)
+        cal_layout.addWidget(settings_group)
+
+        compute_btn = QPushButton("Compute Calibration", self)
+        compute_btn.clicked.connect(self._compute_calibration)
+        cal_layout.addWidget(compute_btn)
+
+        self._cal_status = QLabel("", self)
+        cal_layout.addWidget(self._cal_status)
+
+        # A splitter (not a fixed-height stats table) so a calibration with
+        # several channels — more stats rows than the old 160px cap could
+        # show at once — can be given more room by dragging, instead of
+        # always needing an internal scrollbar.
+        results_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self._cal_plot = PlotView(self)
+        results_splitter.addWidget(self._cal_plot)
+        self._stats_table = QTableWidget(self)
+        self._stats_table.setMinimumHeight(80)
+        results_splitter.addWidget(self._stats_table)
+        results_splitter.setStretchFactor(0, 3)
+        results_splitter.setStretchFactor(1, 1)
+        cal_layout.addWidget(results_splitter, 1)
+
+        # Top (trace/windows) vs bottom (calibration results) is itself a
+        # drag-resizable splitter now that every plot/table inside enforces
+        # its own minimum size — nested inside the scroll area from above as
+        # a fallback for whatever still doesn't fit even at those minimums.
+        analysis_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        analysis_splitter.addWidget(splitter)
+        analysis_splitter.addWidget(cal_container)
+        analysis_splitter.setStretchFactor(0, 1)
+        analysis_splitter.setStretchFactor(1, 1)
+        content_layout.addWidget(analysis_splitter)
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
         return tab
 
     def import_files(self, paths: list[str]) -> None:
@@ -304,6 +352,13 @@ class SolidStateView(QWidget):
         self._timeseries_panel.refresh()
         if file_index == self._active_file_index:
             self._load_active_cpdf_into_table()
+
+    def _on_tab_changed(self, index: int) -> None:
+        # The export preview is a matplotlib render, not a live chart — it
+        # won't reflect a calibration recomputed while this tab wasn't
+        # visible unless refreshed on arrival.
+        if index == self._export_tab_index:
+            self._export_panel.refresh_preview()
 
     def _refresh_dataset_list(self) -> None:
         files = self._files()
@@ -375,7 +430,7 @@ class SolidStateView(QWidget):
     def _compute_calibration(self) -> None:
         selected_labels = self._timeseries_panel.visible_labels()
         if not selected_labels:
-            self._cal_status.setText("Check at least one channel in ② Time Series & Windows.")
+            self._cal_status.setText("Check at least one channel in the time-series checklist above.")
             return
 
         multi_file = len(self._files()) > 1
@@ -462,7 +517,7 @@ class SolidStateView(QWidget):
         self._render_calibration_curve(results)
 
     def _render_calibration_curve(self, res_map: dict) -> None:
-        fig = go.Figure()
+        self._cal_plot.clear()
         stat_rows = []
         for j, (ch_name, res) in enumerate(res_map.items()):
             col = PAL[j % len(PAL)]
@@ -471,9 +526,8 @@ class SolidStateView(QWidget):
             vmask = res.get("valid_mask", [True] * len(res["labels"]))
             labels_plot = np.asarray(res["labels"], dtype=object)[vmask]
 
-            fig.add_trace(go.Scatter(x=x, y=y, name=ch_name, mode="markers+text",
-                                      text=labels_plot, textposition="top center",
-                                      marker=dict(color=col, size=10)))
+            self._cal_plot.add_series(x, y, name=ch_name, color=col, show_line=False, symbol="circle",
+                                       size=10, text=[str(v) for v in labels_plot])
 
             low, nern = res.get("low_segment"), res.get("nernstian_segment")
             lod_log10 = res.get("lod_log10")
@@ -491,12 +545,11 @@ class SolidStateView(QWidget):
                     x0, x1 = float(np.min(x)), float(np.max(x))
                 xp = np.linspace(x0, x1, 200)
                 yp = seg["slope"] * xp + seg["intercept"]
-                fig.add_trace(go.Scatter(x=xp, y=yp, name=f"{ch_name} {seg_name} fit", mode="lines",
-                                          showlegend=False, line=dict(color=col, dash=dash, width=2)))
+                self._cal_plot.add_series(xp, yp, name=f"{ch_name} {seg_name} fit", color=col, width=2,
+                                           dash=dash, legend=False, hover=False)
 
             if has_lod:
-                fig.add_vline(x=lod_log10, line=dict(color=col, dash="dashdot", width=1.2),
-                              annotation_text=f"{ch_name} LOD", annotation_position="top")
+                self._cal_plot.add_vline(lod_log10, color=col, dash="dashdot", text=f"{ch_name} LOD")
 
             ideal = res.get("ideal_slope_mv_per_decade")
             sunit = res.get("signal_unit", self._app_state.get_field(_UNIT_KEY))
@@ -512,15 +565,11 @@ class SolidStateView(QWidget):
                 f"LOD ({self._app_state.get_field(_CONC_UNIT_KEY)})": fmt(res.get("lod_conc")),
             })
 
-        theme = plot_theme()
-        fig.update_layout(
-            xaxis_title=f"log₁₀(Concentration [{self._app_state.get_field(_CONC_UNIT_KEY)}])",
-            yaxis_title=f"Potential ({self._app_state.get_field(_UNIT_KEY)})",
-            hovermode="closest", height=480, template=theme["template"],
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        self._cal_plot.set_labels(
+            f"log₁₀(Concentration [{self._app_state.get_field(_CONC_UNIT_KEY)}])",
+            f"Potential ({self._app_state.get_field(_UNIT_KEY)})",
         )
-        self._cal_plot.set_figure(fig)
-        self._last_cal_figure = fig
+        self._cal_plot.finish()
 
         self._stats_table.clear()
         if stat_rows:
@@ -546,20 +595,11 @@ class SolidStateView(QWidget):
         if path:
             pd.DataFrame(rows).to_csv(path, index=False)
 
-    def _export_curve_png(self) -> None:
+    def _render_curve_export(self, opts: dict) -> bytes:
         results = self._app_state.data.solid_cal_results
         if not results:
-            self._cal_status.setText("Run calibration analysis first.")
-            return
-        opts = ExportOptionsDialog.get_options(self, "Export calibration curve")
-        if opts is None:
-            return
-        png_bytes = render_solid_cal_png(
+            raise ValueError("Run calibration analysis first (② Plot and Calibrate).")
+        return render_solid_cal_png(
             results["results"], self._app_state.get_field(_CONC_UNIT_KEY), self._app_state.get_field(_UNIT_KEY),
             dpi=opts["dpi"], fmt=opts["fmt"], figsize=opts["figsize"], style=opts["style"],
         )
-        ext = opts["fmt"]
-        path, _ = QFileDialog.getSaveFileName(self, "Export calibration curve", f"solid_state_calibration_curve.{ext}", f"{ext.upper()} (*.{ext})")
-        if path:
-            with open(path, "wb") as f:
-                f.write(png_bytes)
