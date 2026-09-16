@@ -488,3 +488,83 @@ def export_csv(session: SessionData = Depends(get_session)):
             })
     csv_text = pd.DataFrame(rows).to_csv(index=False)
     return png_response(csv_text.encode("utf-8"), "calibration_data.csv", "text/csv")
+
+
+# -- Comparison (cross-file overlay) -----------------------------------------------
+def _compute_file_fit(frec: dict, session: SessionData) -> dict | None:
+    """One independent linear fit per file, first channel only — a quick
+    side-by-side comparison, not the full multi-channel analysis workbench
+    (mirrors macos_app/ui/modes/amperometry_view.py's _compute_file_fit)."""
+    channels = frec.get("channels", [])
+    if not channels:
+        return None
+    ch = channels[0]
+    cpdf = frec["cpdf"].dropna(subset=["t_end"]).reset_index(drop=True)
+    if cpdf.empty:
+        return None
+
+    base_rows = cpdf[cpdf["Baseline"].apply(lambda b: bool(b) if pd.notna(b) else False)]
+    base_idx = int(base_rows.index[0]) if len(base_rows) else 0
+
+    df = frec["df"]
+    t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
+    i_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+    i_arr = smooth_signal(i_arr, session.smooth_method, session.smooth_window, session.smooth_polyorder)
+
+    avgs = []
+    for _, row in cpdf.iterrows():
+        ets = _eff_t_start(row)
+        if ets is None:
+            avgs.append(np.nan)
+            continue
+        mask = (t_arr >= ets) & (t_arr <= row["t_end"])
+        pts = i_arr[mask]
+        pts = pts[~np.isnan(pts)]
+        avgs.append(float(np.mean(pts)) if pts.size > 0 else np.nan)
+
+    base_val = avgs[base_idx]
+    if np.isnan(base_val):
+        return None
+    delta_i = [(v - base_val) if not np.isnan(v) else np.nan for v in avgs]
+
+    keep = _baseline_keep_mask(cpdf["Baseline"].tolist())
+    x = np.asarray(cpdf["Concentration"].values, dtype=float)[keep]
+    y = np.asarray(delta_i, dtype=float)[keep]
+    fit_result = piecewise_fit(x, y, 1)
+    if not fit_result["segments"]:
+        return None
+    seg = fit_result["segments"][0]
+    curve_x = np.linspace(seg["xr"][0], seg["xr"][1], 100)
+    curve_y = seg["slope"] * curve_x + seg["intercept"]
+
+    conc_unit, cur_unit = session.conc_unit, session.cur_unit
+    return {
+        "x": x.tolist(), "y": y.tolist(), "curve_x": curve_x.tolist(), "curve_y": curve_y.tolist(),
+        "stats": {
+            "File": frec["filename"], "Channel": ch["name"],
+            f"Sensitivity ({cur_unit}/{conc_unit})": fmt(seg["slope"]),
+            "R²": f"{seg['r2']:.4f}",
+        },
+    }
+
+
+@router.get("/comparison")
+def comparison(session: SessionData = Depends(get_session)) -> dict:
+    fig = go.Figure()
+    stat_rows = []
+    for j, frec in enumerate(session.amp_files):
+        result = _compute_file_fit(frec, session)
+        if result is None:
+            continue
+        col = PAL[j % len(PAL)]
+        fig.add_trace(go.Scatter(x=result["x"], y=result["y"], mode="markers", name=frec["filename"],
+                                  marker=dict(color=col, size=9)))
+        fig.add_trace(go.Scatter(x=result["curve_x"], y=result["curve_y"], mode="lines", showlegend=False,
+                                  line=dict(color=col, dash="dash", width=2)))
+        stat_rows.append(result["stats"])
+
+    fig.update_layout(
+        xaxis_title=f"Concentration ({session.conc_unit})", yaxis_title=f"ΔI ({session.cur_unit})",
+        hovermode="closest", height=480, template="plotly_white",
+    )
+    return {"figure": figure_json(fig) if stat_rows else None, "stats": stat_rows}

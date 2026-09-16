@@ -417,4 +417,30 @@ document.getElementById("amp-export-csv-btn").addEventListener("click", () => {
   downloadFromResponse(apiCall(`${AMP_API}/export/csv`));
 });
 
+// -- Compare Files ----------------------------------------------------------------
+document.getElementById("amp-compare-btn").addEventListener("click", async () => {
+  const result = await apiCall(`${AMP_API}/comparison`);
+  if (result.figure) {
+    Plotly.newPlot("amp-compare-plot", result.figure.data, result.figure.layout, { responsive: true });
+  } else {
+    document.getElementById("amp-compare-plot").innerHTML = "";
+  }
+  ampRenderComparisonTable(result.stats);
+});
+
+function ampRenderComparisonTable(rows) {
+  const table = document.getElementById("amp-compare-table");
+  table.innerHTML = "";
+  if (!rows.length) return;
+  const columns = Object.keys(rows[0]);
+  const thead = document.createElement("tr");
+  columns.forEach((c) => { const th = document.createElement("th"); th.textContent = c; thead.appendChild(th); });
+  table.appendChild(thead);
+  rows.forEach((row) => {
+    const tr = document.createElement("tr");
+    columns.forEach((c) => { const td = document.createElement("td"); td.textContent = row[c]; tr.appendChild(td); });
+    table.appendChild(tr);
+  });
+}
+
 ampRefresh();

@@ -25,6 +25,7 @@
         <button class="tab-btn" data-tab="windows">② Time Series &amp; Windows</button>
         <button class="tab-btn" data-tab="results">③ Calibration Results</button>
         <button class="tab-btn" data-tab="export">④ Export</button>
+        <button class="tab-btn" data-tab="compare">⑤ Compare Files</button>
       </div>
 
       <!-- Tab 1: Import -->
@@ -154,6 +155,14 @@
           <button id="ss-export-csv-btn">Export calibration summary CSV</button>
         </div>
       </div>
+
+      <!-- Tab 5: Compare Files -->
+      <div class="tab-page" data-tab-page="compare">
+        <p class="hint">A quick independent Nernstian fit per loaded file (first channel only) overlaid on one chart.</p>
+        <button id="ss-compare-btn">Refresh comparison</button>
+        <div id="ss-compare-plot" class="plot"></div>
+        <table id="ss-compare-table" class="stats-table"></table>
+      </div>
     </section>
 
     <section id="mode-amperometry" class="mode-page">
@@ -162,6 +171,7 @@
         <button class="tab-btn" data-tab="windows">② Time Series &amp; Windows</button>
         <button class="tab-btn" data-tab="results">③ Calibration Results</button>
         <button class="tab-btn" data-tab="export">④ Export</button>
+        <button class="tab-btn" data-tab="compare">⑤ Compare Files</button>
       </div>
 
       <!-- Tab 1: Import -->
@@ -307,7 +317,16 @@
           <button id="amp-export-csv-btn">Export calibration summary CSV</button>
         </div>
       </div>
+
+      <!-- Tab 5: Compare Files -->
+      <div class="tab-page" data-tab-page="compare">
+        <p class="hint">A quick independent linear fit per loaded file (first channel only) overlaid on one chart.</p>
+        <button id="amp-compare-btn">Refresh comparison</button>
+        <div id="amp-compare-plot" class="plot"></div>
+        <table id="amp-compare-table" class="stats-table"></table>
+      </div>
     </section>
+
     <section id="mode-cyclic_voltammetry" class="mode-page">
       <div class="tabs">
         <button class="tab-btn active" data-tab="import">① Import</button>

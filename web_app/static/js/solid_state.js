@@ -389,4 +389,30 @@ document.getElementById("ss-export-csv-btn").addEventListener("click", () => {
   downloadFromResponse(apiCall(`${SS_API}/export/csv`));
 });
 
+// -- Compare Files ----------------------------------------------------------------
+document.getElementById("ss-compare-btn").addEventListener("click", async () => {
+  const result = await apiCall(`${SS_API}/comparison`);
+  if (result.figure) {
+    Plotly.newPlot("ss-compare-plot", result.figure.data, result.figure.layout, { responsive: true });
+  } else {
+    document.getElementById("ss-compare-plot").innerHTML = "";
+  }
+  ssRenderComparisonTable(result.stats);
+});
+
+function ssRenderComparisonTable(rows) {
+  const table = document.getElementById("ss-compare-table");
+  table.innerHTML = "";
+  if (!rows.length) return;
+  const columns = Object.keys(rows[0]);
+  const thead = document.createElement("tr");
+  columns.forEach((c) => { const th = document.createElement("th"); th.textContent = c; thead.appendChild(th); });
+  table.appendChild(thead);
+  rows.forEach((row) => {
+    const tr = document.createElement("tr");
+    columns.forEach((c) => { const td = document.createElement("td"); td.textContent = row[c]; tr.appendChild(td); });
+    table.appendChild(tr);
+  });
+}
+
 ssRefresh();

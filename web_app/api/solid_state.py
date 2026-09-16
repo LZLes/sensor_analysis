@@ -472,3 +472,87 @@ def export_csv(session: SessionData = Depends(get_session)):
             rows.append({"Channel": ch_name, "Label": lbl, f"Concentration ({session.solid_conc_unit})": conc})
     csv_text = pd.DataFrame(rows).to_csv(index=False)
     return png_response(csv_text.encode("utf-8"), "solid_state_calibration_data.csv", "text/csv")
+
+
+# -- Comparison (cross-file overlay) -----------------------------------------------
+def _compute_file_fit(frec: dict, session: SessionData) -> dict | None:
+    """One independent Nernstian fit per file, first channel only — a quick
+    side-by-side comparison, not the full multi-channel analysis workbench
+    (mirrors macos_app/ui/modes/solid_state_view.py's _compute_file_fit)."""
+    channels = frec.get("channels", [])
+    if not channels:
+        return None
+    ch = channels[0]
+    cpdf = frec["cpdf"].copy()
+    if cpdf.empty:
+        return None
+    rejected = ~(cpdf["Concentration"].astype(float) > 0)
+    cpdf = cpdf[~rejected].reset_index(drop=True)
+    if cpdf.empty:
+        return None
+
+    df = frec["df"]
+    t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
+    e_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
+
+    readings = []
+    for _, row in cpdf.iterrows():
+        if pd.notna(row.get("Reading_mV")):
+            readings.append(float(row["Reading_mV"]))
+            continue
+        ets = _eff_t_start(row)
+        if ets is None or pd.isna(row.get("t_end")):
+            readings.append(np.nan)
+            continue
+        mask = (t_arr >= ets) & (t_arr <= row["t_end"])
+        pts = e_arr[mask]
+        pts = pts[~np.isnan(pts)]
+        readings.append(float(np.mean(pts)) if pts.size > 0 else np.nan)
+
+    log_conc = np.log10(cpdf["Concentration"].astype(float).to_numpy())
+    potential = np.array(readings, dtype=float)
+    valid = ~np.isnan(potential)
+    if valid.sum() < 2:
+        return None
+
+    lod_fit = nernstian_lod_fit(log_conc[valid], potential[valid])
+    nern = lod_fit["nernstian_segment"]
+    if nern is None:
+        return None
+    x_valid = log_conc[valid]
+    curve_x = np.linspace(float(x_valid.min()), float(x_valid.max()), 100)
+    curve_y = nern["slope"] * curve_x + nern["intercept"]
+
+    conc_unit, signal_unit = session.solid_conc_unit, session.solid_unit
+    return {
+        "x": x_valid.tolist(), "y": potential[valid].tolist(), "curve_x": curve_x.tolist(), "curve_y": curve_y.tolist(),
+        "stats": {
+            "File": frec["filename"], "Channel": ch["name"],
+            f"Sensitivity ({signal_unit}/decade)": fmt(nern["slope"]),
+            "R²": f"{nern['r2']:.4f}",
+            f"LOD ({conc_unit})": fmt(lod_fit.get("lod_conc")),
+        },
+    }
+
+
+@router.get("/comparison")
+def comparison(session: SessionData = Depends(get_session)) -> dict:
+    fig = go.Figure()
+    stat_rows = []
+    for j, frec in enumerate(session.solid_files):
+        result = _compute_file_fit(frec, session)
+        if result is None:
+            continue
+        col = PAL[j % len(PAL)]
+        fig.add_trace(go.Scatter(x=result["x"], y=result["y"], mode="markers", name=frec["filename"],
+                                  marker=dict(color=col, size=9)))
+        fig.add_trace(go.Scatter(x=result["curve_x"], y=result["curve_y"], mode="lines", showlegend=False,
+                                  line=dict(color=col, dash="dash", width=2)))
+        stat_rows.append(result["stats"])
+
+    fig.update_layout(
+        xaxis_title=f"log₁₀(Concentration [{session.solid_conc_unit}])",
+        yaxis_title=f"Potential ({session.solid_unit})",
+        hovermode="closest", height=480, template="plotly_white",
+    )
+    return {"figure": figure_json(fig) if stat_rows else None, "stats": stat_rows}
