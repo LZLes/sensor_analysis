@@ -385,10 +385,21 @@ class AmperometryView(QWidget):
         frec = self._active_frec()
         if frec is None:
             return
+        filename = frec["filename"]
         new_files = list(self._files())
         new_files[self._active_file_index] = {**frec, "channels": self._channel_editor.channels()}
         cmd = FilesListCommand(self._app_state, _FILES_KEY, new_files, text="Apply channel assignment")
         self._app_state.undo_stack.push(cmd)
+        # push() -> redo() fires files_changed, and _on_files_changed always
+        # resets to dataset 0 (correct for a fresh Import/Load-sample, wrong
+        # here — editing one file's channels shouldn't jump the user away
+        # from the dataset they were just looking at). Re-select it by name.
+        self._select_dataset_by_filename(filename)
+
+    def _select_dataset_by_filename(self, filename: str) -> None:
+        idx = self._dataset_combo.findText(filename)
+        if idx >= 0:
+            self._dataset_combo.setCurrentIndex(idx)
 
     def _load_active_cpdf_into_table(self) -> None:
         frec = self._active_frec()
