@@ -14,7 +14,7 @@
 
   <nav id="mode-nav">
     <button class="mode-btn active" data-mode="solid_state">Solid-State</button>
-    <button class="mode-btn" data-mode="amperometry" disabled title="Coming in a later phase">Amperometry</button>
+    <button class="mode-btn" data-mode="amperometry">Amperometry</button>
     <button class="mode-btn" data-mode="cyclic_voltammetry" disabled title="Coming in a later phase">Cyclic Voltammetry</button>
   </nav>
 
@@ -155,8 +155,162 @@
         </div>
       </div>
     </section>
+
+    <section id="mode-amperometry" class="mode-page">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="import">① Import</button>
+        <button class="tab-btn" data-tab="windows">② Time Series &amp; Windows</button>
+        <button class="tab-btn" data-tab="results">③ Calibration Results</button>
+        <button class="tab-btn" data-tab="export">④ Export</button>
+      </div>
+
+      <!-- Tab 1: Import -->
+      <div class="tab-page active" data-tab-page="import">
+        <div class="row">
+          <button id="amp-sample-btn">Load sample data</button>
+          <span class="hint">Two synthetic amperometric runs (2 channels each) with a ready-made calibration table.</span>
+        </div>
+        <div class="row">
+          <label for="amp-file-input" class="button-like">Browse Files&hellip;</label>
+          <input id="amp-file-input" type="file" multiple accept=".csv,.txt,.pssession" style="display:none" />
+        </div>
+        <div id="amp-dropzone" class="dropzone">Drop CSV / .pssession files here</div>
+
+        <fieldset class="group">
+          <legend>Units</legend>
+          <label>Concentration unit <input id="amp-conc-unit" type="text" /></label>
+          <label>Current unit <input id="amp-signal-unit" type="text" /></label>
+        </fieldset>
+
+        <div id="amp-status" class="status"></div>
+        <h3>Loaded files</h3>
+        <ul id="amp-files-list" class="files-list"></ul>
+      </div>
+
+      <!-- Tab 2: Time Series & Windows -->
+      <div class="tab-page" data-tab-page="windows">
+        <label>Dataset:
+          <select id="amp-dataset-select"></select>
+        </label>
+        <div class="windows-layout">
+          <div class="plot-col">
+            <div id="amp-channel-checklist" class="checklist"></div>
+            <div id="amp-plot" class="plot"></div>
+          </div>
+          <div class="side-col">
+            <details class="collapsible">
+              <summary>Signal smoothing</summary>
+              <div class="group-body">
+                <label>Method
+                  <select id="amp-smooth-method">
+                    <option>None</option>
+                    <option>Moving average</option>
+                    <option>Savitzky-Golay</option>
+                  </select>
+                </label>
+                <label>Window (samples) <input id="amp-smooth-window" type="number" value="11" min="3" step="2" /></label>
+                <label>Polynomial order <input id="amp-smooth-polyorder" type="number" value="2" min="1" max="5" /></label>
+              </div>
+            </details>
+
+            <details class="collapsible" open>
+              <summary>Calibration windows</summary>
+              <div class="group-body">
+                <fieldset class="group">
+                  <legend>Auto-detect step times from trace</legend>
+                  <label>Channel <select id="amp-autodetect-channel"></select></label>
+                  <label>Sensitivity <input id="amp-autodetect-sensitivity" type="number" value="1.0" step="0.1" min="0.3" max="3.0" /></label>
+                  <label>Min. seconds between steps <input id="amp-autodetect-mingap" type="number" value="30" min="1" /></label>
+                  <label>Expected step count (0 = keep all) <input id="amp-autodetect-maxsteps" type="number" value="0" min="0" /></label>
+                  <label><input id="amp-autodetect-baseline" type="checkbox" checked /> Leading Baseline row (0 → first step)</label>
+                  <button id="amp-autodetect-btn">Detect</button>
+                  <div id="amp-autodetect-result" class="hint"></div>
+                  <button id="amp-autodetect-apply-btn">Apply detected edges &mdash; replaces the table below</button>
+                </fieldset>
+                <h4>Calibration Points</h4>
+                <div id="amp-cal-table"></div>
+              </div>
+            </details>
+
+            <details class="collapsible">
+              <summary>Channel assignment</summary>
+              <div class="group-body">
+                <div id="amp-channel-assignment"></div>
+                <button id="amp-apply-channels-btn">Apply channel assignment</button>
+              </div>
+            </details>
+
+            <details class="collapsible">
+              <summary>Effective concentration calculator (serial dilution)</summary>
+              <div class="group-body">
+                <label>Initial volume <input id="amp-initial-volume" type="number" step="0.01" value="1.0" /></label>
+                <label>Volume unit <input id="amp-vol-unit" type="text" value="µL" /></label>
+                <button id="amp-effconc-btn">Preview: update Concentration &amp; t start</button>
+              </div>
+            </details>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 3: Calibration Results -->
+      <div class="tab-page" data-tab-page="results">
+        <fieldset class="group">
+          <legend>Analysis Settings</legend>
+          <p class="hint">Channels analysed = the checked traces in ② Time Series &amp; Windows.</p>
+          <label>Fit type
+            <select id="amp-fit-type">
+              <option>Linear</option>
+              <option>Segmented Linear</option>
+            </select>
+          </label>
+          <label>Segments <input id="amp-n-seg" type="number" value="2" min="2" max="4" disabled /></label>
+          <label><input id="amp-show-avg" type="checkbox" /> Add channel average trace</label>
+        </fieldset>
+        <button id="amp-compute-btn">Compute Calibration</button>
+        <div id="amp-cal-status" class="status"></div>
+        <div id="amp-cal-plot" class="plot"></div>
+        <table id="amp-stats-table" class="stats-table"></table>
+      </div>
+
+      <!-- Tab 4: Export -->
+      <div class="tab-page" data-tab-page="export">
+        <fieldset class="group">
+          <legend>Export options</legend>
+          <label>Format
+            <select id="amp-export-fmt">
+              <option value="png">PNG</option>
+              <option value="svg">SVG</option>
+              <option value="pdf">PDF</option>
+              <option value="tiff">TIFF</option>
+            </select>
+          </label>
+          <label>DPI
+            <select id="amp-export-dpi">
+              <option>150</option>
+              <option selected>300</option>
+              <option>600</option>
+            </select>
+          </label>
+          <label>Style
+            <select id="amp-export-style">
+              <option value="default">Default</option>
+              <option value="origin">Origin</option>
+              <option value="minimal">Minimal</option>
+            </select>
+          </label>
+          <label>Width (in, blank = auto) <input id="amp-export-width" type="number" step="0.1" /></label>
+          <label>Height (in, blank = auto) <input id="amp-export-height" type="number" step="0.1" /></label>
+        </fieldset>
+        <div class="row">
+          <button id="amp-export-curve-btn">Export calibration curve</button>
+          <button id="amp-export-ts-btn">Export time series</button>
+          <button id="amp-export-csv-btn">Export calibration summary CSV</button>
+        </div>
+      </div>
+    </section>
   </main>
   <script src="/js/app.js"></script>
   <script src="/js/solid_state.js"></script>
+  <script src="/js/amperometry.js"></script>
 </body>
 </html>
