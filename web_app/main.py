@@ -27,7 +27,7 @@ from fastapi import Response
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from web_app.api import _dev_test, amperometry, solid_state
+from web_app.api import _dev_test, amperometry, cyclic_voltammetry, solid_state
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -41,6 +41,7 @@ app = FastAPI(title="Sensor Calibration Studio (local)")
 app.include_router(_dev_test.router)
 app.include_router(solid_state.router)
 app.include_router(amperometry.router)
+app.include_router(cyclic_voltammetry.router)
 
 
 @app.get("/js/plotly.min.js")

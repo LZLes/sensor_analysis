@@ -15,7 +15,7 @@
   <nav id="mode-nav">
     <button class="mode-btn active" data-mode="solid_state">Solid-State</button>
     <button class="mode-btn" data-mode="amperometry">Amperometry</button>
-    <button class="mode-btn" data-mode="cyclic_voltammetry" disabled title="Coming in a later phase">Cyclic Voltammetry</button>
+    <button class="mode-btn" data-mode="cyclic_voltammetry">Cyclic Voltammetry</button>
   </nav>
 
   <main>
@@ -308,9 +308,167 @@
         </div>
       </div>
     </section>
+    <section id="mode-cyclic_voltammetry" class="mode-page">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="import">① Import</button>
+        <button class="tab-btn" data-tab="plot">② Plot &amp; Peaks</button>
+        <button class="tab-btn" data-tab="scanrate">③ Scan Rate Analysis</button>
+        <button class="tab-btn" data-tab="export">④ Export</button>
+      </div>
+
+      <!-- Tab 1: Import -->
+      <div class="tab-page active" data-tab-page="import">
+        <fieldset class="group">
+          <legend>Units</legend>
+          <label>Potential unit <input id="cv-volt-unit" type="text" value="V" /></label>
+          <label>Current unit <input id="cv-cur-unit" type="text" value="µA" /></label>
+          <label>Scan rate unit <input id="cv-sr-unit" type="text" value="mV/s" /></label>
+        </fieldset>
+
+        <div class="row">
+          <label for="cv-file-input" class="button-like">Browse CV Files&hellip;</label>
+          <input id="cv-file-input" type="file" multiple accept=".csv,.txt" style="display:none" />
+        </div>
+        <div id="cv-dropzone" class="dropzone">Drop CV CSV files here</div>
+
+        <details class="collapsible">
+          <summary>Column mapping &mdash; only needed if auto-detection guesses wrong</summary>
+          <div class="group-body">
+            <label>File format
+              <select id="cv-fmt">
+                <option value="standard">Standard CSV</option>
+                <option value="multichannel">Multi-channel instrument</option>
+              </select>
+            </label>
+            <label>Delimiter
+              <select id="cv-delim">
+                <option value="auto">Auto-detect</option>
+                <option value="comma">Comma</option>
+                <option value="tab">Tab</option>
+                <option value="semicolon">Semicolon</option>
+                <option value="space">Space</option>
+              </select>
+            </label>
+            <label>Rows to skip <input id="cv-skip-rows" type="number" value="0" min="0" /></label>
+          </div>
+        </details>
+
+        <div id="cv-status" class="status"></div>
+        <h3>Loaded runs</h3>
+        <table id="cv-runs-table" class="editable-table"></table>
+
+        <details class="collapsible">
+          <summary>Channel assignment</summary>
+          <div class="group-body">
+            <label>Run:
+              <select id="cv-channel-run-select"></select>
+            </label>
+            <div id="cv-channel-assignment"></div>
+            <button id="cv-apply-channels-btn">Apply channel assignment</button>
+          </div>
+        </details>
+      </div>
+
+      <!-- Tab 2: Plot & Peaks -->
+      <div class="tab-page" data-tab-page="plot">
+        <div class="windows-layout">
+          <div class="plot-col">
+            <h4>Scan rates</h4>
+            <div id="cv-sr-checklist" class="checklist"></div>
+            <h4>Channels</h4>
+            <div id="cv-ch-checklist" class="checklist"></div>
+            <div id="cv-plot" class="plot"></div>
+          </div>
+          <div class="side-col">
+            <details class="collapsible" open>
+              <summary>Peak detection</summary>
+              <div class="group-body">
+                <label>Prominence <input id="cv-prom" type="number" step="0.001" value="0.1" /></label>
+                <label>Min distance (points) <input id="cv-dist" type="number" value="10" min="1" /></label>
+                <label>Min width (points, blank = none) <input id="cv-width" type="number" min="0" /></label>
+                <label>Min |Ip| (blank = none) <input id="cv-height" type="number" step="0.001" min="0" /></label>
+                <h5>Channels to analyse</h5>
+                <div id="cv-peak-channels" class="checklist"></div>
+                <button id="cv-find-peaks-btn">Find Peaks in All Runs</button>
+                <div id="cv-peak-status" class="hint"></div>
+              </div>
+            </details>
+            <h4>All detected peaks</h4>
+            <table id="cv-peaks-table" class="stats-table"></table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 3: Scan Rate Analysis -->
+      <div class="tab-page" data-tab-page="scanrate">
+        <h4>Channels</h4>
+        <div id="cv-sranalysis-channels" class="checklist"></div>
+        <h4>Peak Current vs Scan Rate</h4>
+        <div id="cv-plot-ip-nu" class="plot"></div>
+        <h4>Randles–Ševčík Plot (Ip vs √ν)</h4>
+        <div id="cv-plot-ip-sqrt" class="plot"></div>
+        <table id="cv-sr-stats-table" class="stats-table"></table>
+        <h4>Peak Potential vs Scan Rate</h4>
+        <div id="cv-plot-ep-nu" class="plot"></div>
+        <h4>Peak Separation (ΔEp) vs Scan Rate</h4>
+        <div id="cv-plot-dep-nu" class="plot"></div>
+      </div>
+
+      <!-- Tab 4: Export -->
+      <div class="tab-page" data-tab-page="export">
+        <fieldset class="group">
+          <legend>Export options (applies to plot exports below)</legend>
+          <label>Format
+            <select id="cv-export-fmt">
+              <option value="png">PNG</option>
+              <option value="svg">SVG</option>
+              <option value="pdf">PDF</option>
+              <option value="tiff">TIFF</option>
+            </select>
+          </label>
+          <label>DPI
+            <select id="cv-export-dpi">
+              <option>150</option>
+              <option selected>300</option>
+              <option>600</option>
+            </select>
+          </label>
+          <label>Style
+            <select id="cv-export-style">
+              <option value="default">Default</option>
+              <option value="origin">Origin</option>
+              <option value="minimal">Minimal</option>
+            </select>
+          </label>
+          <label>Width (in, blank = auto) <input id="cv-export-width" type="number" step="0.1" /></label>
+          <label>Height (in, blank = auto) <input id="cv-export-height" type="number" step="0.1" /></label>
+        </fieldset>
+
+        <fieldset class="group">
+          <legend>CSV exports</legend>
+          <div class="row">
+            <button id="cv-export-peaks-csv-btn">Export all peaks CSV</button>
+            <button id="cv-export-sr-csv-btn">Export scan-rate analysis CSV</button>
+            <button id="cv-export-raw-btn">Export raw data (ZIP, one CSV per run)</button>
+          </div>
+        </fieldset>
+
+        <fieldset class="group">
+          <legend>Plot exports</legend>
+          <div class="row">
+            <button id="cv-export-plot-btn">Export CV plot</button>
+            <button id="cv-export-ipnu-btn">Export Ip vs ν plot</button>
+            <button id="cv-export-ipsqrt-btn">Export Ip vs √ν plot</button>
+            <button id="cv-export-epnu-btn">Export Ep vs ν plot</button>
+            <button id="cv-export-depnu-btn">Export ΔEp vs ν plot</button>
+          </div>
+        </fieldset>
+      </div>
+    </section>
   </main>
   <script src="/js/app.js"></script>
   <script src="/js/solid_state.js"></script>
   <script src="/js/amperometry.js"></script>
+  <script src="/js/cyclic_voltammetry.js"></script>
 </body>
 </html>
