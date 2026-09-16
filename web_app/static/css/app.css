@@ -22,6 +22,32 @@ header h1 {
   color: #b7c6d6;
 }
 
+.header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.session-controls {
+  display: flex;
+  gap: 8px;
+}
+
+.header-btn {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: white;
+}
+
+.header-btn:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.header-status {
+  color: #9fd9a8;
+  margin: 6px 0 0;
+}
+
 #mode-nav {
   display: flex;
   gap: 4px;

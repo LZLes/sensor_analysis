@@ -8,8 +8,18 @@
 </head>
 <body>
   <header>
-    <h1>Sensor Calibration Studio</h1>
-    <p class="subtitle">local app &mdash; runs entirely on this machine</p>
+    <div class="header-row">
+      <div>
+        <h1>Sensor Calibration Studio</h1>
+        <p class="subtitle">local app &mdash; runs entirely on this machine</p>
+      </div>
+      <div class="session-controls">
+        <button id="session-export-btn" class="header-btn">Export Session</button>
+        <label for="session-import-input" class="header-btn button-like">Import Session&hellip;</label>
+        <input id="session-import-input" type="file" accept="application/json" style="display:none" />
+      </div>
+    </div>
+    <div id="session-status" class="status header-status"></div>
   </header>
 
   <nav id="mode-nav">
