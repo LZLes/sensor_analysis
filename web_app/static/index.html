@@ -9,11 +9,154 @@
 <body>
   <header>
     <h1>Sensor Calibration Studio</h1>
-    <p class="subtitle">Phase 1 feasibility check &mdash; core/ &amp; modes/ reuse &rarr; Plotly.js render</p>
+    <p class="subtitle">local app &mdash; runs entirely on this machine</p>
   </header>
+
+  <nav id="mode-nav">
+    <button class="mode-btn active" data-mode="solid_state">Solid-State</button>
+    <button class="mode-btn" data-mode="amperometry" disabled title="Coming in a later phase">Amperometry</button>
+    <button class="mode-btn" data-mode="cyclic_voltammetry" disabled title="Coming in a later phase">Cyclic Voltammetry</button>
+  </nav>
+
   <main>
-    <div id="test-plot"></div>
+    <section id="mode-solid_state" class="mode-page active">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="import">① Import</button>
+        <button class="tab-btn" data-tab="windows">② Time Series &amp; Windows</button>
+        <button class="tab-btn" data-tab="results">③ Calibration Results</button>
+        <button class="tab-btn" data-tab="export">④ Export</button>
+      </div>
+
+      <!-- Tab 1: Import -->
+      <div class="tab-page active" data-tab-page="import">
+        <div class="row">
+          <button id="ss-sample-btn">Load sample data</button>
+          <span class="hint">A synthetic potentiometric (ISE-style) run with a two-regime response.</span>
+        </div>
+        <div class="row">
+          <label for="ss-file-input" class="button-like">Browse Files&hellip;</label>
+          <input id="ss-file-input" type="file" multiple accept=".csv,.txt,.pssession" style="display:none" />
+        </div>
+        <div id="ss-dropzone" class="dropzone">Drop CSV / .pssession files here</div>
+
+        <fieldset class="group">
+          <legend>Units</legend>
+          <label>Concentration unit <input id="ss-conc-unit" type="text" /></label>
+          <label>Potential unit <input id="ss-signal-unit" type="text" /></label>
+        </fieldset>
+
+        <div id="ss-status" class="status"></div>
+        <h3>Loaded files</h3>
+        <ul id="ss-files-list" class="files-list"></ul>
+      </div>
+
+      <!-- Tab 2: Time Series & Windows -->
+      <div class="tab-page" data-tab-page="windows">
+        <label>Dataset:
+          <select id="ss-dataset-select"></select>
+        </label>
+        <div class="windows-layout">
+          <div class="plot-col">
+            <div id="ss-channel-checklist" class="checklist"></div>
+            <div id="ss-plot" class="plot"></div>
+          </div>
+          <div class="side-col">
+            <details class="collapsible">
+              <summary>Signal smoothing</summary>
+              <div class="group-body">
+                <label>Method
+                  <select id="ss-smooth-method">
+                    <option>None</option>
+                    <option>Moving average</option>
+                    <option>Savitzky-Golay</option>
+                  </select>
+                </label>
+                <label>Window (samples) <input id="ss-smooth-window" type="number" value="11" min="3" step="2" /></label>
+                <label>Polynomial order <input id="ss-smooth-polyorder" type="number" value="2" min="1" max="5" /></label>
+              </div>
+            </details>
+
+            <details class="collapsible" open>
+              <summary>Calibration windows</summary>
+              <div class="group-body">
+                <fieldset class="group">
+                  <legend>Auto-detect step times from trace</legend>
+                  <label>Channel <select id="ss-autodetect-channel"></select></label>
+                  <label>Sensitivity <input id="ss-autodetect-sensitivity" type="number" value="1.0" step="0.1" min="0.3" max="3.0" /></label>
+                  <label>Min. seconds between steps <input id="ss-autodetect-mingap" type="number" value="30" min="1" /></label>
+                  <label>Expected step count (0 = keep all) <input id="ss-autodetect-maxsteps" type="number" value="0" min="0" /></label>
+                  <button id="ss-autodetect-btn">Detect</button>
+                  <div id="ss-autodetect-result" class="hint"></div>
+                  <button id="ss-autodetect-apply-btn">Apply detected edges &mdash; replaces the table below</button>
+                </fieldset>
+                <h4>Calibration Points</h4>
+                <div id="ss-cal-table"></div>
+              </div>
+            </details>
+
+            <details class="collapsible">
+              <summary>Channel assignment</summary>
+              <div class="group-body">
+                <div id="ss-channel-assignment"></div>
+                <button id="ss-apply-channels-btn">Apply channel assignment</button>
+              </div>
+            </details>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 3: Calibration Results -->
+      <div class="tab-page" data-tab-page="results">
+        <fieldset class="group">
+          <legend>Analysis Settings</legend>
+          <p class="hint">Channels analysed = the checked traces in ② Time Series &amp; Windows.</p>
+          <label>Ion charge |z| <input id="ss-ion-charge" type="number" value="1" min="1" max="4" /></label>
+          <label>Lab temperature (°C) <input id="ss-lab-temp" type="number" value="25" step="0.5" /></label>
+        </fieldset>
+        <button id="ss-compute-btn">Compute Calibration</button>
+        <div id="ss-cal-status" class="status"></div>
+        <div id="ss-cal-plot" class="plot"></div>
+        <table id="ss-stats-table" class="stats-table"></table>
+      </div>
+
+      <!-- Tab 4: Export -->
+      <div class="tab-page" data-tab-page="export">
+        <fieldset class="group">
+          <legend>Export options</legend>
+          <label>Format
+            <select id="ss-export-fmt">
+              <option value="png">PNG</option>
+              <option value="svg">SVG</option>
+              <option value="pdf">PDF</option>
+              <option value="tiff">TIFF</option>
+            </select>
+          </label>
+          <label>DPI
+            <select id="ss-export-dpi">
+              <option>150</option>
+              <option selected>300</option>
+              <option>600</option>
+            </select>
+          </label>
+          <label>Style
+            <select id="ss-export-style">
+              <option value="default">Default</option>
+              <option value="origin">Origin</option>
+              <option value="minimal">Minimal</option>
+            </select>
+          </label>
+          <label>Width (in, blank = auto) <input id="ss-export-width" type="number" step="0.1" /></label>
+          <label>Height (in, blank = auto) <input id="ss-export-height" type="number" step="0.1" /></label>
+        </fieldset>
+        <div class="row">
+          <button id="ss-export-curve-btn">Export calibration curve</button>
+          <button id="ss-export-ts-btn">Export time series</button>
+          <button id="ss-export-csv-btn">Export calibration summary CSV</button>
+        </div>
+      </div>
+    </section>
   </main>
   <script src="/js/app.js"></script>
+  <script src="/js/solid_state.js"></script>
 </body>
 </html>

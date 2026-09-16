@@ -23,10 +23,11 @@ import webbrowser
 import plotly.offline as pyo
 import uvicorn
 from fastapi import FastAPI
+from fastapi import Response
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from web_app.api import _dev_test
+from web_app.api import _dev_test, solid_state
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -38,6 +39,7 @@ app = FastAPI(title="Sensor Calibration Studio (local)")
 # Starlette matches routes in registration order, so /api/* always resolves
 # to these handlers rather than falling through to StaticFiles.
 app.include_router(_dev_test.router)
+app.include_router(solid_state.router)
 
 
 @app.get("/js/plotly.min.js")
@@ -48,6 +50,11 @@ def plotly_js() -> PlainTextResponse:
     # matches the offline-capability reasoning macos_app/ui/widgets/plot_view.py's
     # include_plotlyjs=True already established (no CDN fetch at chart-render time).
     return PlainTextResponse(pyo.get_plotlyjs(), media_type="application/javascript")
+
+
+@app.get("/favicon.ico")
+def favicon() -> Response:
+    return Response(status_code=204)
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
