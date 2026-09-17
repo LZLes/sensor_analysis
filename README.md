@@ -2,14 +2,15 @@
 
 A lab tool for importing multi-channel electrochemical sensor data (amperometry, potentiometric/solid-state, cyclic voltammetry) and microplate assay data, defining calibration windows, fitting calibration curves, and exporting results/plots.
 
-There are **two independent UIs** built on the same computation core:
+There are **three independent UIs** built on the same computation core:
 
 - **Streamlit app** (`app.py`) — runs in a browser, zero install beyond Python. Covers all four modes (Amperometry, Solid-State, Cyclic Voltammetry, Assay). Best for quick use on any machine.
 - **Native macOS app** (`macos_app/`) — a PySide6/Qt desktop app with multi-window sessions, undo/redo, drag-and-drop import, publication-quality export with format/DPI/style options, and a cross-file comparison view. Covers Amperometry, Solid-State, and Cyclic Voltammetry (Assay is Streamlit-only). Best for regular day-to-day use on a Mac.
+- **Local web app** (`web_app/`) — a FastAPI + Plotly app that runs a small localhost-only server and opens in your default browser. Covers Amperometry, Solid-State, and Cyclic Voltammetry (Assay is Streamlit-only). No auth, binds to `127.0.0.1` only — a lighter-weight alternative to the Streamlit app, not a hosted/multi-user service.
 
-Both read/write the same Export/Import JSON session format, so a session saved from one opens in the other.
+All three read/write the same Export/Import JSON session format, so a session saved from one opens in either of the others (Assay data round-trips through the Streamlit app only, since neither the macOS nor web app supports that mode).
 
-This file covers installing and running both. For architecture/contributor notes, see [`.claude/CLAUDE.md`](.claude/CLAUDE.md).
+This file covers installing and running all three. For architecture/contributor notes, see [`.claude/CLAUDE.md`](.claude/CLAUDE.md).
 
 ---
 
@@ -100,11 +101,29 @@ The app checks GitHub Releases for this repo on startup and shows a dialog if a 
 
 ---
 
+## Web app
+
+Requires Python 3.10+. Runs on any platform (not Mac-only, unlike the packaged macOS app).
+
+```bash
+pip install -r requirements.txt -r requirements-web.txt
+python -m web_app.main
+```
+
+Starts a Uvicorn server on `http://127.0.0.1:8000` and opens it in your default browser automatically (set `WEB_APP_NO_BROWSER=1` to skip that and open the URL yourself). Everything runs locally on your machine — there's no remote server and no data leaves it.
+
+Amperometry, Solid-State, and Cyclic Voltammetry each get their own tab in the page, covering the same import → time-series/calibration → export flow as the macOS app. Use the **Export Session** / **Import Session** buttons in the header to move a session between this app, the Streamlit app, and the macOS app.
+
+To stop the server, `Ctrl-C` the terminal it's running in (or `lsof -ti:8000 | xargs kill` if it's running in the background).
+
+---
+
 ## Repository layout
 
 ```
 app.py, modes/, core/     # Streamlit app + shared computation core
 macos_app/                 # Native macOS app (PySide6/Qt), see macos_app section above
+web_app/                    # Local FastAPI + Plotly web app, see web_app section above
 tests/                      # pytest suite (unit/e2e/regression) covering core/ and modes/
 sample_data/                 # Example CSVs for trying out each mode
 ```
