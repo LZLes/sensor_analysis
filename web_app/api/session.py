@@ -1,25 +1,17 @@
 """
-Tier 2 persistence (Export/Import JSON) — reuses core/persistence.py's
-bundle SHAPE (same keys/nesting _build_session_bundle/_apply_session_bundle
-use) so a session exported here opens in the Streamlit app, and vice versa.
-core/persistence.py's own functions can't be called directly — they read
-and write st.session_state via `SS = st.session_state`, the exact
-Streamlit-coupling problem macos_app/persistence.py already solved the
-same way for the macOS app: only the pure pieces
-(_cpdf_from_records/_solid_cpdf_from_records from core/calibration_table.py)
-are reused; the dict-building/applying logic is reimplemented here against
-SessionData instead of SS.
-
-Assay isn't in scope for web_app/ (see session.py's SessionData docstring)
-— exporting simply omits assay_* keys (core/persistence.py's own
-_apply_session_bundle guards every key with `if "..." in d`, so importing
-this bundle into the Streamlit app just leaves Assay untouched), and
-importing a Streamlit-exported bundle that does have assay_* keys just
-ignores them.
+Tier 2 persistence (Export/Import JSON) — same bundle SHAPE as
+core/persistence.py's _build_session_bundle/_apply_session_bundle (same keys
+and nesting), so a session exported here opens in the Streamlit app and vice
+versa, for all four modes. core/persistence.py's own functions can't be
+called directly since they read/write st.session_state; only its pure pieces
+(_jsonify, _plate_df_to_csv/_plate_df_from_csv) and core/calibration_table.py's
+record parsers are reused, with the dict-building/applying done against
+SessionData instead.
 """
 
 from __future__ import annotations
 
+import copy
 import io
 import json
 
@@ -28,14 +20,16 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from core.calibration_table import _cpdf_from_records, _solid_cpdf_from_records
+from core.persistence import _jsonify, _plate_df_from_csv, _plate_df_to_csv
 from web_app.deps import get_session
-from web_app.session import SessionData
+from web_app.session import SessionData, default_assay_sample_df, default_assay_std_df
 
 router = APIRouter(prefix="/api/session", tags=["session"])
 
 _UNIT_FIELDS = [
     "conc_unit", "solid_conc_unit", "cur_unit", "solid_unit",
     "volt_unit", "cv_cur_unit", "cv_sr_unit", "vol_unit",
+    "assay_sig_unit", "assay_conc_unit",
 ]
 
 
@@ -61,6 +55,10 @@ def _build_bundle(session: SessionData) -> dict:
          "csv": r["df"].to_csv(index=False), "channels": r["channels"], "peaks": r["peaks"]}
         for r in session.cv_runs
     ]
+    d["assay_plate"] = _plate_df_to_csv(session.assay_plate)
+    d["assay_std_df"] = _jsonify(session.assay_std_df.to_dict(orient="records"))
+    d["assay_sample_df"] = _jsonify(session.assay_sample_df.to_dict(orient="records"))
+    d["assay_std_res"] = _jsonify(session.assay_std_res)
     return d
 
 
@@ -74,14 +72,7 @@ def export_session(session: SessionData = Depends(get_session)) -> Response:
     )
 
 
-@router.post("/import")
-async def import_session(file: UploadFile = File(...), session: SessionData = Depends(get_session)) -> dict:
-    raw = await file.read()
-    try:
-        d = json.loads(raw)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"Could not parse session file: {exc}") from exc
-
+def _apply_bundle(session: SessionData, d: dict) -> None:
     for field in _UNIT_FIELDS:
         if field in d:
             setattr(session, field, d[field])
@@ -113,10 +104,51 @@ async def import_session(file: UploadFile = File(...), session: SessionData = De
             for r in d["cv_runs"]
         ]
 
+    if "assay_plate" in d:
+        session.assay_plate = _plate_df_from_csv(d["assay_plate"])
+    if "assay_std_df" in d:
+        session.assay_std_df = pd.DataFrame(d["assay_std_df"]) if d["assay_std_df"] else default_assay_std_df()
+    if "assay_sample_df" in d:
+        session.assay_sample_df = pd.DataFrame(d["assay_sample_df"]) if d["assay_sample_df"] else default_assay_sample_df()
+    if "assay_std_res" in d:
+        session.assay_std_res = d["assay_std_res"]
+
+    # Autodetect previews belong to the previous file set.
+    session.ts_ui = {}
+
     # Stale results tied to the previous file set — the user re-runs
     # Compute Calibration explicitly, same "compute on explicit action"
     # model the rest of this app uses.
     session.cal_results = None
     session.solid_cal_results = None
 
-    return {"amp_files": len(session.amp_files), "solid_files": len(session.solid_files), "cv_runs": len(session.cv_runs)}
+
+@router.post("/import")
+async def import_session(file: UploadFile = File(...), session: SessionData = Depends(get_session)) -> dict:
+    raw = await file.read()
+    try:
+        d = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Could not parse session file: {exc}") from exc
+
+    if not isinstance(d, dict):
+        raise HTTPException(status_code=400, detail="Not a session file (expected a JSON object).")
+
+    # Apply to a copy and swap in only on success, so a malformed/partial
+    # bundle can't leave the live session half-overwritten.
+    staged = copy.deepcopy(session)
+    try:
+        _apply_bundle(staged, d)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Session file is incomplete or malformed: {exc!r}") from exc
+    session.__dict__.update(staged.__dict__)
+
+    return {"amp_files": len(session.amp_files), "solid_files": len(session.solid_files),
+            "cv_runs": len(session.cv_runs), "assay_plate": session.assay_plate is not None}
+
+
+@router.get("/ping")
+def ping(session: SessionData = Depends(get_session)) -> dict:
+    """Called once on page load before any mode initializes, so the session
+    cookie exists before the modes fire their parallel /state requests."""
+    return {"ok": True}

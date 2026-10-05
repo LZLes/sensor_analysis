@@ -1,29 +1,47 @@
 """
 SessionStore — in-memory, cookie-keyed session state for web_app/.
 
-One SessionData per browser session (a new tab with no cookie gets its own),
-mirroring what macos_app/ui/app_state.py's AppState gave per window, without
-needing Qt's window/undo-group machinery. No auth: the cookie is purely for
-statefulness on a single-user localhost tool, not a security boundary.
-Lost on server restart by design — Export/Import JSON (web_app/api/session.py)
-is the durability mechanism, same as it already is for the Streamlit app.
+One SessionData per browser session (a new browser with no cookie gets its
+own). No auth: the cookie is purely for statefulness on a single-user
+localhost tool, not a security boundary. Lost on server restart by design —
+Export/Import JSON (web_app/api/session.py) is the durability mechanism,
+same as it already is for the Streamlit app.
 """
 
 from __future__ import annotations
 
+import re
 import secrets
 from dataclasses import dataclass, field
-from typing import Any
+
+import pandas as pd
 
 SESSION_COOKIE_NAME = "sensor_session"
+
+# Cookie ids we mint are token_urlsafe(24) — anything else the browser sends
+# is ignored and a fresh id is issued instead.
+_VALID_ID = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+
+def default_assay_std_df() -> pd.DataFrame:
+    """Same default standards layout core/state.py seeds the Streamlit app with."""
+    return pd.DataFrame({
+        "Label": ["Blank", "Std 2", "Std 3", "Std 4", "Std 5", "Std 6", "Std 7", "Std 8"],
+        "Conc": [0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0],
+        "S1": ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"],
+        "S2": ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8"],
+        "S3": ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"],
+    })
+
+
+def default_assay_sample_df() -> pd.DataFrame:
+    return pd.DataFrame({"Well": pd.Series([], dtype=str), "Label": pd.Series([], dtype=str)})
 
 
 @dataclass
 class SessionData:
-    """Mirrors macos_app/ui/app_state.py's SessionData fields (already a
-    plain, Qt-independent dataclass) minus the assay_* fields — Assay isn't
-    in scope for web_app/, and macos_app/ won't exist to round-trip them
-    with once it's removed."""
+    """Field names mirror core/state.py's session-state keys so the
+    Export/Import JSON bundle stays byte-compatible with the Streamlit app."""
 
     amp_files: list[dict] = field(default_factory=list)
     solid_files: list[dict] = field(default_factory=list)
@@ -45,8 +63,16 @@ class SessionData:
     cv_cur_unit: str = "µA"
     cv_sr_unit: str = "mV/s"
 
+    # Assay (96-well microplate)
+    assay_plate: pd.DataFrame | None = None
+    assay_sig_unit: str = "Abs"
+    assay_conc_unit: str = "µM"
+    assay_std_df: pd.DataFrame = field(default_factory=default_assay_std_df)
+    assay_sample_df: pd.DataFrame = field(default_factory=default_assay_sample_df)
+    assay_std_res: dict | None = None
+
     # Per-file-list UI state (autodetect preview edges etc.), namespaced by
-    # files_key the same way macos_app/ui/app_state.py's ts_ui was.
+    # files_key ("amp_files"/"solid_files").
     ts_ui: dict[str, dict] = field(default_factory=dict)
 
 
@@ -61,13 +87,14 @@ class SessionStore:
     def get_or_create(self, session_id: str | None) -> tuple[str, SessionData]:
         if session_id and session_id in self._sessions:
             return session_id, self._sessions[session_id]
-        new_id = secrets.token_urlsafe(24)
+        # An unknown-but-well-formed id (e.g. the server restarted while the
+        # tab stayed open) is reused rather than replaced, so several requests
+        # fired in parallel by the page all land in the same fresh session
+        # instead of each minting — and then overwriting — its own cookie.
+        new_id = session_id if (session_id and _VALID_ID.match(session_id)) else secrets.token_urlsafe(24)
         data = SessionData()
         self._sessions[new_id] = data
         return new_id, data
-
-    def replace(self, session_id: str, data: SessionData) -> None:
-        self._sessions[session_id] = data
 
 
 store = SessionStore()

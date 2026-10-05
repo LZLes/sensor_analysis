@@ -1,7 +1,7 @@
 """
-Amperometry mode API — ports macos_app/ui/modes/amperometry_view.py's logic
-to HTTP endpoints. Every fit/parse/export call below is the exact same
-core/*.py or modes/amperometry.py function that view used, unmodified.
+Amperometry mode API. Parsing, fitting (piecewise_fit), autodetect and
+PNG/SVG/PDF export reuse the core/*.py and modes/amperometry.py functions
+the Streamlit app uses, unmodified.
 
 Differs from solid_state.py by: baseline subtraction, segmented-linear
 fits, the channel-average trace, and the effective-concentration
@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.calibration_table import _baseline_keep_mask, _default_cpdf
 from core.constants import AVG_COLOR, PAL, fmt
@@ -30,7 +30,18 @@ from modes.amperometry import (
     piecewise_fit,
     render_cal_png,
 )
-from web_app.api.common import df_records, figure_json, png_response, records_to_df, require_file_index
+from web_app.api.common import (
+    ExportFmt,
+    ExportStyle,
+    channels_fit_columns,
+    df_records,
+    export_media_type,
+    figure_json,
+    guess_channels,
+    png_response,
+    records_to_df,
+    require_file_index,
+)
 from web_app.deps import get_session
 from web_app.session import SessionData
 
@@ -76,12 +87,6 @@ def get_state(session: SessionData = Depends(get_session)) -> dict:
 
 
 # -- Import ---------------------------------------------------------------------
-def _fallback_channels(df: pd.DataFrame) -> list[dict]:
-    columns = list(df.columns)
-    if not columns:
-        return []
-    return [{"name": "Channel 1", "tc": columns[0], "ic": columns[1] if len(columns) > 1 else columns[0]}]
-
 
 @router.post("/files")
 async def upload_files(files: list[UploadFile] = File(...), session: SessionData = Depends(get_session)) -> dict:
@@ -96,14 +101,36 @@ async def upload_files(files: list[UploadFile] = File(...), session: SessionData
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"Could not parse {filename}: {exc}") from exc
         if filename in by_name:
-            channels = by_name[filename]["channels"]
+            # Re-uploading a file keeps its calibration table, and its channel
+            # mapping too as long as those columns still exist in the new data.
+            prev_channels = by_name[filename]["channels"]
+            channels = (prev_channels if channels_fit_columns(prev_channels, df.columns)
+                        else (auto_channels or guess_channels(df)))
             cpdf = by_name[filename]["cpdf"]
         else:
-            channels = auto_channels or _fallback_channels(df)
+            channels = auto_channels or guess_channels(df)
             cpdf = _default_cpdf()
             order.append(filename)
         by_name[filename] = {"filename": filename, "df": df, "channels": channels, "cpdf": cpdf}
     session.amp_files = [by_name[name] for name in order]
+    session.cal_results = None
+    return _state(session)
+
+
+@router.delete("/files/{index}")
+def remove_file(index: int, session: SessionData = Depends(get_session)) -> dict:
+    frec = require_file_index(session.amp_files, index)
+    session.amp_files = [f for i, f in enumerate(session.amp_files) if i != index]
+    session.ts_ui.get(_FILES_KEY, {}).get("autodetect_edges", {}).pop(frec["filename"], None)
+    session.cal_results = None
+    return _state(session)
+
+
+@router.delete("/files")
+def clear_files(session: SessionData = Depends(get_session)) -> dict:
+    session.amp_files = []
+    session.ts_ui.pop(_FILES_KEY, None)
+    session.cal_results = None
     return _state(session)
 
 
@@ -113,6 +140,8 @@ def load_sample(session: SessionData = Depends(get_session)) -> dict:
     if sample_files is None:
         raise HTTPException(status_code=404, detail="Sample data files are missing from this deployment.")
     session.amp_files = sample_files
+    session.ts_ui.pop(_FILES_KEY, None)
+    session.cal_results = None
     return _state(session)
 
 
@@ -138,7 +167,14 @@ class ChannelsBody(BaseModel):
 @router.post("/files/{index}/channels")
 def set_channels(index: int, body: ChannelsBody, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.amp_files, index)
-    session.amp_files[index] = {**frec, "channels": body.channels}
+    if not body.channels:
+        raise HTTPException(status_code=400, detail="At least one channel is required.")
+    if not channels_fit_columns(body.channels, frec["df"].columns):
+        raise HTTPException(status_code=400, detail="Channel assignment references a column that isn't in this file.")
+    names = [str(c.get("name", "")).strip() for c in body.channels]
+    if any(not n for n in names) or len(set(names)) != len(names):
+        raise HTTPException(status_code=400, detail="Channel names must be non-empty and unique within a file.")
+    session.amp_files[index] = {**frec, "channels": [{**c, "name": n} for c, n in zip(body.channels, names)]}
     return _state(session)
 
 
@@ -150,7 +186,7 @@ class TableBody(BaseModel):
 @router.post("/files/{index}/table")
 def set_table(index: int, body: TableBody, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.amp_files, index)
-    session.amp_files[index] = {**frec, "cpdf": records_to_df(body.rows, _CPDF_COLUMNS)}
+    session.amp_files[index] = {**frec, "cpdf": records_to_df(body.rows, _CPDF_COLUMNS, bool_cols=("Baseline",))}
     return _state(session)
 
 
@@ -255,14 +291,22 @@ def timeseries_figure(body: TimeseriesBody, session: SessionData = Depends(get_s
                                           opacity=0.35, line=dict(color=color, width=1, dash=dash), showlegend=False))
             fig.add_trace(go.Scatter(x=t, y=smoothed, name=label, mode="lines", line=dict(color=color, width=1.5, dash=dash)))
 
+    # Draw each distinct window once — several files often share one
+    # calibration schedule, and stacked duplicate labels are unreadable.
+    drawn: set[tuple] = set()
     for frec in files:
         for _, row in frec.get("cpdf", pd.DataFrame()).iterrows():
             ets = _eff_t_start(row)
-            if ets is not None and pd.notna(row.get("t_end")):
-                color = "rgba(255,165,0,0.22)" if row.get("Baseline") else "rgba(100,160,255,0.15)"
-                label = f"{frec['filename']}: {row['Label']}" if multi else str(row["Label"])
-                fig.add_vrect(x0=ets, x1=row["t_end"], fillcolor=color, layer="below", line_width=0,
-                              annotation_text=label, annotation_position="top left")
+            if ets is None or pd.isna(row.get("t_end")):
+                continue
+            key = (round(float(ets), 6), round(float(row["t_end"]), 6), str(row["Label"]))
+            if key in drawn:
+                continue
+            drawn.add(key)
+            color = "rgba(255,165,0,0.22)" if row.get("Baseline") else "rgba(100,160,255,0.15)"
+            fig.add_vrect(x0=ets, x1=row["t_end"], fillcolor=color, layer="below", line_width=0,
+                          annotation_text=str(row["Label"]), annotation_position="top left",
+                          annotation_font_size=10)
 
     edges_by_file = session.ts_ui.get(_FILES_KEY, {}).get("autodetect_edges", {})
     for frec in files:
@@ -433,9 +477,9 @@ def _render_calibration_curve(res_map: dict, fit_type: str, n_seg: int, session:
 
 # -- Export -----------------------------------------------------------------------
 class ExportCurveBody(BaseModel):
-    fmt: str = "png"
-    dpi: int = 150
-    style: str = "default"
+    fmt: ExportFmt = "png"
+    dpi: int = Field(150, ge=50, le=1200)
+    style: ExportStyle = "default"
     figsize: tuple[float, float] | None = None
 
 
@@ -448,15 +492,15 @@ def export_curve(body: ExportCurveBody, session: SessionData = Depends(get_sessi
         session.conc_unit, session.cur_unit,
         dpi=body.dpi, fmt=body.fmt, figsize=body.figsize, style=body.style,
     )
-    media_type = {"svg": "image/svg+xml", "pdf": "application/pdf", "tiff": "image/tiff"}.get(body.fmt, "image/png")
+    media_type = export_media_type(body.fmt)
     return png_response(png_bytes, f"calibration_curve.{body.fmt}", media_type)
 
 
 class ExportTimeseriesBody(BaseModel):
     visible: list[str]
-    fmt: str = "png"
-    dpi: int = 150
-    style: str = "default"
+    fmt: ExportFmt = "png"
+    dpi: int = Field(150, ge=50, le=1200)
+    style: ExportStyle = "default"
     figsize: tuple[float, float] | None = None
 
 
@@ -471,7 +515,7 @@ def export_timeseries(body: ExportTimeseriesBody, session: SessionData = Depends
         smooth_method=session.smooth_method, smooth_window=session.smooth_window,
         smooth_polyorder=session.smooth_polyorder,
     )
-    media_type = {"svg": "image/svg+xml", "pdf": "application/pdf", "tiff": "image/tiff"}.get(body.fmt, "image/png")
+    media_type = export_media_type(body.fmt)
     return png_response(png_bytes, f"time_series.{body.fmt}", media_type)
 
 
@@ -493,8 +537,7 @@ def export_csv(session: SessionData = Depends(get_session)):
 # -- Comparison (cross-file overlay) -----------------------------------------------
 def _compute_file_fit(frec: dict, session: SessionData) -> dict | None:
     """One independent linear fit per file, first channel only — a quick
-    side-by-side comparison, not the full multi-channel analysis workbench
-    (mirrors macos_app/ui/modes/amperometry_view.py's _compute_file_fit)."""
+    side-by-side comparison, not the full multi-channel analysis workbench."""
     channels = frec.get("channels", [])
     if not channels:
         return None

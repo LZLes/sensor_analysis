@@ -1,2 +1,4 @@
 -r requirements.txt
+-r requirements-web.txt
 pytest>=7.4
+httpx>=0.25   # FastAPI TestClient, used by tests/web/

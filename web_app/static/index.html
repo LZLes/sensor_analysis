@@ -2,225 +2,122 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Sensor Calibration Studio</title>
   <link rel="stylesheet" href="/css/app.css" />
   <script src="/js/plotly.min.js"></script>
 </head>
 <body>
+  <!-- Element ids are the contract with the per-mode scripts in /js. -->
   <header>
     <div class="header-row">
       <div>
         <h1>Sensor Calibration Studio</h1>
-        <p class="subtitle">local app &mdash; runs entirely on this machine</p>
+        <p class="subtitle">Local app &mdash; your data never leaves this computer</p>
       </div>
       <div class="session-controls">
-        <button id="session-export-btn" class="header-btn">Export Session</button>
-        <label for="session-import-input" class="header-btn button-like">Import Session&hellip;</label>
-        <input id="session-import-input" type="file" accept="application/json" style="display:none" />
+        <button id="session-export-btn" class="header-btn" title="Save every mode's data and settings to one JSON file (opens in the Streamlit app too)">Export session</button>
+        <label for="session-import-input" class="header-btn button-like">Import session&hellip;</label>
+        <input id="session-import-input" type="file" accept="application/json,.json" hidden />
+        <button id="app-quit-btn" class="header-btn" title="Stop the local server">Quit</button>
       </div>
     </div>
-    <div id="session-status" class="status header-status"></div>
+    <nav id="mode-nav">
+      <button class="mode-btn active" data-mode="amperometry">Amperometry</button>
+      <button class="mode-btn" data-mode="solid_state">Solid-State</button>
+      <button class="mode-btn" data-mode="cyclic_voltammetry">Cyclic Voltammetry</button>
+      <button class="mode-btn" data-mode="assay">Assay (Microplate)</button>
+    </nav>
   </header>
 
-  <nav id="mode-nav">
-    <button class="mode-btn active" data-mode="solid_state">Solid-State</button>
-    <button class="mode-btn" data-mode="amperometry">Amperometry</button>
-    <button class="mode-btn" data-mode="cyclic_voltammetry">Cyclic Voltammetry</button>
-  </nav>
-
   <main>
-    <section id="mode-solid_state" class="mode-page active">
+    <section id="mode-amperometry" class="mode-page active">
       <div class="tabs">
         <button class="tab-btn active" data-tab="import">① Import</button>
         <button class="tab-btn" data-tab="windows">② Time Series &amp; Windows</button>
-        <button class="tab-btn" data-tab="results">③ Calibration Results</button>
+        <button class="tab-btn" data-tab="results">③ Calibration</button>
         <button class="tab-btn" data-tab="export">④ Export</button>
         <button class="tab-btn" data-tab="compare">⑤ Compare Files</button>
       </div>
 
-      <!-- Tab 1: Import -->
+      <!-- ① Import -->
       <div class="tab-page active" data-tab-page="import">
-        <div class="row">
-          <button id="ss-sample-btn">Load sample data</button>
-          <span class="hint">A synthetic potentiometric (ISE-style) run with a two-regime response.</span>
+        <div class="two-col">
+          <div>
+            <div class="row">
+              <label for="amp-file-input" class="button-like primary">Browse files&hellip;</label>
+              <input id="amp-file-input" type="file" multiple accept=".csv,.txt,.tsv,.pssession" hidden />
+              <button id="amp-sample-btn">Load sample data</button>
+            </div>
+            <p class="hint">Two synthetic amperometric runs (2 channels each) with a ready-made calibration table.</p>
+            <div id="amp-dropzone" class="dropzone">Drop CSV / TXT / .pssession files here</div>
+            <fieldset class="group">
+              <legend>Units</legend>
+              <div class="form-grid">
+                <label>Concentration <input id="amp-conc-unit" type="text" size="8" /></label>
+                <label>Current <input id="amp-signal-unit" type="text" size="8" /></label>
+              </div>
+            </fieldset>
+          </div>
+          <div>
+            <div class="row spread">
+              <h3>Loaded files</h3>
+              <button id="amp-clear-btn" class="danger" hidden>Remove all</button>
+            </div>
+            <ul id="amp-files-list" class="files-list"></ul>
+          </div>
         </div>
-        <div class="row">
-          <label for="ss-file-input" class="button-like">Browse Files&hellip;</label>
-          <input id="ss-file-input" type="file" multiple accept=".csv,.txt,.pssession" style="display:none" />
-        </div>
-        <div id="ss-dropzone" class="dropzone">Drop CSV / .pssession files here</div>
-
-        <fieldset class="group">
-          <legend>Units</legend>
-          <label>Concentration unit <input id="ss-conc-unit" type="text" /></label>
-          <label>Potential unit <input id="ss-signal-unit" type="text" /></label>
-        </fieldset>
-
-        <div id="ss-status" class="status"></div>
-        <h3>Loaded files</h3>
-        <ul id="ss-files-list" class="files-list"></ul>
       </div>
 
-      <!-- Tab 2: Time Series & Windows -->
+      <!-- ② Time Series & Windows -->
       <div class="tab-page" data-tab-page="windows">
-        <label>Dataset:
-          <select id="ss-dataset-select"></select>
-        </label>
+        <p class="empty-note needs-data">Load data in ① Import first.</p>
         <div class="windows-layout">
           <div class="plot-col">
-            <div id="ss-channel-checklist" class="checklist"></div>
-            <div id="ss-plot" class="plot"></div>
+            <div id="amp-channel-checklist" class="checklist"></div>
+            <div id="amp-plot" class="plot empty"></div>
           </div>
           <div class="side-col">
-            <details class="collapsible">
-              <summary>Signal smoothing</summary>
-              <div class="group-body">
-                <label>Method
-                  <select id="ss-smooth-method">
-                    <option>None</option>
-                    <option>Moving average</option>
-                    <option>Savitzky-Golay</option>
-                  </select>
-                </label>
-                <label>Window (samples) <input id="ss-smooth-window" type="number" value="11" min="3" step="2" /></label>
-                <label>Polynomial order <input id="ss-smooth-polyorder" type="number" value="2" min="1" max="5" /></label>
-              </div>
-            </details>
+            <label class="dataset-pick">File being edited <select id="amp-dataset-select"></select></label>
 
             <details class="collapsible" open>
               <summary>Calibration windows</summary>
               <div class="group-body">
-                <fieldset class="group">
-                  <legend>Auto-detect step times from trace</legend>
-                  <label>Channel <select id="ss-autodetect-channel"></select></label>
-                  <label>Sensitivity <input id="ss-autodetect-sensitivity" type="number" value="1.0" step="0.1" min="0.3" max="3.0" /></label>
-                  <label>Min. seconds between steps <input id="ss-autodetect-mingap" type="number" value="30" min="1" /></label>
-                  <label>Expected step count (0 = keep all) <input id="ss-autodetect-maxsteps" type="number" value="0" min="0" /></label>
-                  <button id="ss-autodetect-btn">Detect</button>
-                  <div id="ss-autodetect-result" class="hint"></div>
-                  <button id="ss-autodetect-apply-btn">Apply detected edges &mdash; replaces the table below</button>
-                </fieldset>
-                <h4>Calibration Points</h4>
-                <div id="ss-cal-table"></div>
+                <p class="hint">Each row averages the trace between t start and t end (or only the last <em>avg last</em> seconds, if set).</p>
+                <div id="amp-cal-table" class="table-scroll"></div>
+                <details class="sub-collapsible">
+                  <summary>Auto-detect step times from the trace</summary>
+                  <div class="form-grid">
+                    <label>Channel <select id="amp-autodetect-channel"></select></label>
+                    <label>Sensitivity <input id="amp-autodetect-sensitivity" type="number" value="1.0" step="0.1" min="0.3" max="3.0" /></label>
+                    <label>Min. gap (s) <input id="amp-autodetect-mingap" type="number" value="30" min="1" /></label>
+                    <label>Expected steps <input id="amp-autodetect-maxsteps" type="number" value="0" min="0" title="0 = keep all" /></label>
+                  </div>
+                  <label class="inline"><input id="amp-autodetect-baseline" type="checkbox" checked /> Add a leading Baseline row (0 → first step)</label>
+                  <div class="row">
+                    <button id="amp-autodetect-btn">Detect</button>
+                    <button id="amp-autodetect-apply-btn" disabled>Use detected steps (replaces table)</button>
+                  </div>
+                  <div id="amp-autodetect-result" class="hint"></div>
+                </details>
               </div>
             </details>
 
             <details class="collapsible">
-              <summary>Channel assignment</summary>
+              <summary>Effective concentration (serial dilution)</summary>
               <div class="group-body">
-                <div id="ss-channel-assignment"></div>
-                <button id="ss-apply-channels-btn">Apply channel assignment</button>
+                <p class="hint">Fills Concentration from each row's Spike Vol and Stock Conc, accounting for the growing volume.</p>
+                <div class="form-grid">
+                  <label>Initial volume <input id="amp-initial-volume" type="number" step="any" min="0" value="1.0" /></label>
+                  <label>Volume unit <input id="amp-vol-unit" type="text" size="6" value="µL" /></label>
+                </div>
+                <button id="amp-effconc-btn">Recalculate concentrations</button>
               </div>
             </details>
-          </div>
-        </div>
-      </div>
 
-      <!-- Tab 3: Calibration Results -->
-      <div class="tab-page" data-tab-page="results">
-        <fieldset class="group">
-          <legend>Analysis Settings</legend>
-          <p class="hint">Channels analysed = the checked traces in ② Time Series &amp; Windows.</p>
-          <label>Ion charge |z| <input id="ss-ion-charge" type="number" value="1" min="1" max="4" /></label>
-          <label>Lab temperature (°C) <input id="ss-lab-temp" type="number" value="25" step="0.5" /></label>
-        </fieldset>
-        <button id="ss-compute-btn">Compute Calibration</button>
-        <div id="ss-cal-status" class="status"></div>
-        <div id="ss-cal-plot" class="plot"></div>
-        <table id="ss-stats-table" class="stats-table"></table>
-      </div>
-
-      <!-- Tab 4: Export -->
-      <div class="tab-page" data-tab-page="export">
-        <fieldset class="group">
-          <legend>Export options</legend>
-          <label>Format
-            <select id="ss-export-fmt">
-              <option value="png">PNG</option>
-              <option value="svg">SVG</option>
-              <option value="pdf">PDF</option>
-              <option value="tiff">TIFF</option>
-            </select>
-          </label>
-          <label>DPI
-            <select id="ss-export-dpi">
-              <option>150</option>
-              <option selected>300</option>
-              <option>600</option>
-            </select>
-          </label>
-          <label>Style
-            <select id="ss-export-style">
-              <option value="default">Default</option>
-              <option value="origin">Origin</option>
-              <option value="minimal">Minimal</option>
-            </select>
-          </label>
-          <label>Width (in, blank = auto) <input id="ss-export-width" type="number" step="0.1" /></label>
-          <label>Height (in, blank = auto) <input id="ss-export-height" type="number" step="0.1" /></label>
-        </fieldset>
-        <div class="row">
-          <button id="ss-export-curve-btn">Export calibration curve</button>
-          <button id="ss-export-ts-btn">Export time series</button>
-          <button id="ss-export-csv-btn">Export calibration summary CSV</button>
-        </div>
-      </div>
-
-      <!-- Tab 5: Compare Files -->
-      <div class="tab-page" data-tab-page="compare">
-        <p class="hint">A quick independent Nernstian fit per loaded file (first channel only) overlaid on one chart.</p>
-        <button id="ss-compare-btn">Refresh comparison</button>
-        <div id="ss-compare-plot" class="plot"></div>
-        <table id="ss-compare-table" class="stats-table"></table>
-      </div>
-    </section>
-
-    <section id="mode-amperometry" class="mode-page">
-      <div class="tabs">
-        <button class="tab-btn active" data-tab="import">① Import</button>
-        <button class="tab-btn" data-tab="windows">② Time Series &amp; Windows</button>
-        <button class="tab-btn" data-tab="results">③ Calibration Results</button>
-        <button class="tab-btn" data-tab="export">④ Export</button>
-        <button class="tab-btn" data-tab="compare">⑤ Compare Files</button>
-      </div>
-
-      <!-- Tab 1: Import -->
-      <div class="tab-page active" data-tab-page="import">
-        <div class="row">
-          <button id="amp-sample-btn">Load sample data</button>
-          <span class="hint">Two synthetic amperometric runs (2 channels each) with a ready-made calibration table.</span>
-        </div>
-        <div class="row">
-          <label for="amp-file-input" class="button-like">Browse Files&hellip;</label>
-          <input id="amp-file-input" type="file" multiple accept=".csv,.txt,.pssession" style="display:none" />
-        </div>
-        <div id="amp-dropzone" class="dropzone">Drop CSV / .pssession files here</div>
-
-        <fieldset class="group">
-          <legend>Units</legend>
-          <label>Concentration unit <input id="amp-conc-unit" type="text" /></label>
-          <label>Current unit <input id="amp-signal-unit" type="text" /></label>
-        </fieldset>
-
-        <div id="amp-status" class="status"></div>
-        <h3>Loaded files</h3>
-        <ul id="amp-files-list" class="files-list"></ul>
-      </div>
-
-      <!-- Tab 2: Time Series & Windows -->
-      <div class="tab-page" data-tab-page="windows">
-        <label>Dataset:
-          <select id="amp-dataset-select"></select>
-        </label>
-        <div class="windows-layout">
-          <div class="plot-col">
-            <div id="amp-channel-checklist" class="checklist"></div>
-            <div id="amp-plot" class="plot"></div>
-          </div>
-          <div class="side-col">
             <details class="collapsible">
               <summary>Signal smoothing</summary>
-              <div class="group-body">
+              <div class="group-body form-grid">
                 <label>Method
                   <select id="amp-smooth-method">
                     <option>None</option>
@@ -233,107 +130,248 @@
               </div>
             </details>
 
-            <details class="collapsible" open>
-              <summary>Calibration windows</summary>
-              <div class="group-body">
-                <fieldset class="group">
-                  <legend>Auto-detect step times from trace</legend>
-                  <label>Channel <select id="amp-autodetect-channel"></select></label>
-                  <label>Sensitivity <input id="amp-autodetect-sensitivity" type="number" value="1.0" step="0.1" min="0.3" max="3.0" /></label>
-                  <label>Min. seconds between steps <input id="amp-autodetect-mingap" type="number" value="30" min="1" /></label>
-                  <label>Expected step count (0 = keep all) <input id="amp-autodetect-maxsteps" type="number" value="0" min="0" /></label>
-                  <label><input id="amp-autodetect-baseline" type="checkbox" checked /> Leading Baseline row (0 → first step)</label>
-                  <button id="amp-autodetect-btn">Detect</button>
-                  <div id="amp-autodetect-result" class="hint"></div>
-                  <button id="amp-autodetect-apply-btn">Apply detected edges &mdash; replaces the table below</button>
-                </fieldset>
-                <h4>Calibration Points</h4>
-                <div id="amp-cal-table"></div>
-              </div>
-            </details>
-
             <details class="collapsible">
               <summary>Channel assignment</summary>
               <div class="group-body">
                 <div id="amp-channel-assignment"></div>
-                <button id="amp-apply-channels-btn">Apply channel assignment</button>
-              </div>
-            </details>
-
-            <details class="collapsible">
-              <summary>Effective concentration calculator (serial dilution)</summary>
-              <div class="group-body">
-                <label>Initial volume <input id="amp-initial-volume" type="number" step="0.01" value="1.0" /></label>
-                <label>Volume unit <input id="amp-vol-unit" type="text" value="µL" /></label>
-                <button id="amp-effconc-btn">Preview: update Concentration &amp; t start</button>
+                <button id="amp-apply-channels-btn" class="primary">Apply channel assignment</button>
               </div>
             </details>
           </div>
         </div>
       </div>
 
-      <!-- Tab 3: Calibration Results -->
+      <!-- ③ Calibration -->
       <div class="tab-page" data-tab-page="results">
+        <p class="empty-note needs-data">Load data in ① Import first.</p>
         <fieldset class="group">
-          <legend>Analysis Settings</legend>
-          <p class="hint">Channels analysed = the checked traces in ② Time Series &amp; Windows.</p>
-          <label>Fit type
-            <select id="amp-fit-type">
-              <option>Linear</option>
-              <option>Segmented Linear</option>
-            </select>
-          </label>
-          <label>Segments <input id="amp-n-seg" type="number" value="2" min="2" max="4" disabled /></label>
-          <label><input id="amp-show-avg" type="checkbox" /> Add channel average trace</label>
+          <legend>Analysis settings</legend>
+          <p class="hint">Channels analysed = the ticked traces in ② Time Series &amp; Windows.</p>
+          <div class="form-grid">
+            <label>Fit type
+              <select id="amp-fit-type">
+                <option>Linear</option>
+                <option>Segmented Linear</option>
+              </select>
+            </label>
+            <label>Segments <input id="amp-n-seg" type="number" value="2" min="2" max="4" disabled /></label>
+            <label class="inline"><input id="amp-show-avg" type="checkbox" /> Add channel-average trace</label>
+          </div>
         </fieldset>
-        <button id="amp-compute-btn">Compute Calibration</button>
+        <button id="amp-compute-btn" class="primary">Compute calibration</button>
         <div id="amp-cal-status" class="status"></div>
-        <div id="amp-cal-plot" class="plot"></div>
+        <div id="amp-cal-plot" class="plot empty"></div>
         <table id="amp-stats-table" class="stats-table"></table>
       </div>
 
-      <!-- Tab 4: Export -->
+      <!-- ④ Export -->
       <div class="tab-page" data-tab-page="export">
-        <fieldset class="group">
-          <legend>Export options</legend>
-          <label>Format
-            <select id="amp-export-fmt">
-              <option value="png">PNG</option>
-              <option value="svg">SVG</option>
-              <option value="pdf">PDF</option>
-              <option value="tiff">TIFF</option>
-            </select>
-          </label>
-          <label>DPI
-            <select id="amp-export-dpi">
-              <option>150</option>
-              <option selected>300</option>
-              <option>600</option>
-            </select>
-          </label>
-          <label>Style
-            <select id="amp-export-style">
-              <option value="default">Default</option>
-              <option value="origin">Origin</option>
-              <option value="minimal">Minimal</option>
-            </select>
-          </label>
-          <label>Width (in, blank = auto) <input id="amp-export-width" type="number" step="0.1" /></label>
-          <label>Height (in, blank = auto) <input id="amp-export-height" type="number" step="0.1" /></label>
+        <div class="two-col">
+          <div>
+            <fieldset class="group">
+          <legend>Image export options</legend>
+          <div class="form-grid">
+            <label>Format <select id="amp-export-fmt"><option value="png" selected>PNG</option><option value="svg">SVG</option><option value="pdf">PDF</option><option value="tiff">TIFF</option></select></label>
+            <label>DPI <select id="amp-export-dpi"><option>150</option><option selected>300</option><option>600</option></select></label>
+            <label>Style
+              <select id="amp-export-style">
+                <option value="default">Default</option>
+                <option value="origin">Origin</option>
+                <option value="minimal">Minimal</option>
+              </select>
+            </label>
+            <label>Width (in) <input id="amp-export-width" type="number" step="0.1" min="1" placeholder="auto" /></label>
+            <label>Height (in) <input id="amp-export-height" type="number" step="0.1" min="1" placeholder="auto" /></label>
+          </div>
         </fieldset>
-        <div class="row">
-          <button id="amp-export-curve-btn">Export calibration curve</button>
-          <button id="amp-export-ts-btn">Export time series</button>
-          <button id="amp-export-csv-btn">Export calibration summary CSV</button>
+            <fieldset class="group">
+              <legend>Downloads</legend>
+              <div class="button-grid">
+                <button id="amp-export-curve-btn" class="primary">Calibration curve image</button>
+                <button id="amp-preview-curve-btn">Preview</button>
+                <button id="amp-export-ts-btn" class="primary">Time-series image</button>
+                <button id="amp-preview-ts-btn">Preview</button>
+                <button id="amp-export-csv-btn">Calibration data (CSV)</button>
+              </div>
+              <p class="hint">The calibration curve and CSV need ③ Calibration to have been computed.</p>
+            </fieldset>
+          </div>
+          <div class="preview-box empty" data-message="Click a Preview button to see the exported image here.">
+          <img id="amp-preview-img" alt="Export preview" />
+        </div>
         </div>
       </div>
 
-      <!-- Tab 5: Compare Files -->
+      <!-- ⑤ Compare Files -->
       <div class="tab-page" data-tab-page="compare">
-        <p class="hint">A quick independent linear fit per loaded file (first channel only) overlaid on one chart.</p>
+        <p class="hint">An independent linear fit per loaded file (first channel only), overlaid on one chart.</p>
         <button id="amp-compare-btn">Refresh comparison</button>
-        <div id="amp-compare-plot" class="plot"></div>
+        <div id="amp-compare-status" class="status"></div>
+        <div id="amp-compare-plot" class="plot empty"></div>
         <table id="amp-compare-table" class="stats-table"></table>
+      </div>
+    </section>
+
+    <section id="mode-solid_state" class="mode-page">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="import">① Import</button>
+        <button class="tab-btn" data-tab="windows">② Time Series &amp; Windows</button>
+        <button class="tab-btn" data-tab="results">③ Calibration</button>
+        <button class="tab-btn" data-tab="export">④ Export</button>
+        <button class="tab-btn" data-tab="compare">⑤ Compare Files</button>
+      </div>
+
+      <!-- ① Import -->
+      <div class="tab-page active" data-tab-page="import">
+        <div class="two-col">
+          <div>
+            <div class="row">
+              <label for="ss-file-input" class="button-like primary">Browse files&hellip;</label>
+              <input id="ss-file-input" type="file" multiple accept=".csv,.txt,.tsv,.pssession" hidden />
+              <button id="ss-sample-btn">Load sample data</button>
+            </div>
+            <p class="hint">A synthetic potentiometric (ISE-style) run with a two-regime response.</p>
+            <div id="ss-dropzone" class="dropzone">Drop CSV / TXT / .pssession files here</div>
+            <fieldset class="group">
+              <legend>Units</legend>
+              <div class="form-grid">
+                <label>Concentration <input id="ss-conc-unit" type="text" size="8" /></label>
+                <label>Potential <input id="ss-signal-unit" type="text" size="8" /></label>
+              </div>
+            </fieldset>
+          </div>
+          <div>
+            <div class="row spread">
+              <h3>Loaded files</h3>
+              <button id="ss-clear-btn" class="danger" hidden>Remove all</button>
+            </div>
+            <ul id="ss-files-list" class="files-list"></ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- ② Time Series & Windows -->
+      <div class="tab-page" data-tab-page="windows">
+        <p class="empty-note needs-data">Load data in ① Import first.</p>
+        <div class="windows-layout">
+          <div class="plot-col">
+            <div id="ss-channel-checklist" class="checklist"></div>
+            <div id="ss-plot" class="plot empty"></div>
+          </div>
+          <div class="side-col">
+            <label class="dataset-pick">File being edited <select id="ss-dataset-select"></select></label>
+
+            <details class="collapsible" open>
+              <summary>Calibration windows</summary>
+              <div class="group-body">
+                <p class="hint">Each row averages the trace between t start and t end (or only the last <em>avg last</em> seconds, if set).</p>
+                <div id="ss-cal-table" class="table-scroll"></div>
+                <details class="sub-collapsible">
+                  <summary>Auto-detect step times from the trace</summary>
+                  <div class="form-grid">
+                    <label>Channel <select id="ss-autodetect-channel"></select></label>
+                    <label>Sensitivity <input id="ss-autodetect-sensitivity" type="number" value="1.0" step="0.1" min="0.3" max="3.0" /></label>
+                    <label>Min. gap (s) <input id="ss-autodetect-mingap" type="number" value="30" min="1" /></label>
+                    <label>Expected steps <input id="ss-autodetect-maxsteps" type="number" value="0" min="0" title="0 = keep all" /></label>
+                  </div>
+                  
+                  <div class="row">
+                    <button id="ss-autodetect-btn">Detect</button>
+                    <button id="ss-autodetect-apply-btn" disabled>Use detected steps (replaces table)</button>
+                  </div>
+                  <div id="ss-autodetect-result" class="hint"></div>
+                </details>
+              </div>
+            </details>
+
+            <details class="collapsible">
+              <summary>Signal smoothing</summary>
+              <div class="group-body form-grid">
+                <label>Method
+                  <select id="ss-smooth-method">
+                    <option>None</option>
+                    <option>Moving average</option>
+                    <option>Savitzky-Golay</option>
+                  </select>
+                </label>
+                <label>Window (samples) <input id="ss-smooth-window" type="number" value="11" min="3" step="2" /></label>
+                <label>Polynomial order <input id="ss-smooth-polyorder" type="number" value="2" min="1" max="5" /></label>
+              </div>
+            </details>
+
+            <details class="collapsible">
+              <summary>Channel assignment</summary>
+              <div class="group-body">
+                <div id="ss-channel-assignment"></div>
+                <button id="ss-apply-channels-btn" class="primary">Apply channel assignment</button>
+              </div>
+            </details>
+          </div>
+        </div>
+      </div>
+
+      <!-- ③ Calibration -->
+      <div class="tab-page" data-tab-page="results">
+        <p class="empty-note needs-data">Load data in ① Import first.</p>
+        <fieldset class="group">
+          <legend>Analysis settings</legend>
+          <p class="hint">Channels analysed = the ticked traces in ② Time Series &amp; Windows.</p>
+          <div class="form-grid">
+            <label>Ion charge |z| <input id="ss-ion-charge" type="number" value="1" min="1" max="4" /></label>
+            <label>Lab temperature (°C) <input id="ss-lab-temp" type="number" value="25" step="0.5" /></label>
+          </div>
+        </fieldset>
+        <button id="ss-compute-btn" class="primary">Compute calibration</button>
+        <div id="ss-cal-status" class="status"></div>
+        <div id="ss-cal-plot" class="plot empty"></div>
+        <table id="ss-stats-table" class="stats-table"></table>
+      </div>
+
+      <!-- ④ Export -->
+      <div class="tab-page" data-tab-page="export">
+        <div class="two-col">
+          <div>
+            <fieldset class="group">
+          <legend>Image export options</legend>
+          <div class="form-grid">
+            <label>Format <select id="ss-export-fmt"><option value="png" selected>PNG</option><option value="svg">SVG</option><option value="pdf">PDF</option><option value="tiff">TIFF</option></select></label>
+            <label>DPI <select id="ss-export-dpi"><option>150</option><option selected>300</option><option>600</option></select></label>
+            <label>Style
+              <select id="ss-export-style">
+                <option value="default">Default</option>
+                <option value="origin">Origin</option>
+                <option value="minimal">Minimal</option>
+              </select>
+            </label>
+            <label>Width (in) <input id="ss-export-width" type="number" step="0.1" min="1" placeholder="auto" /></label>
+            <label>Height (in) <input id="ss-export-height" type="number" step="0.1" min="1" placeholder="auto" /></label>
+          </div>
+        </fieldset>
+            <fieldset class="group">
+              <legend>Downloads</legend>
+              <div class="button-grid">
+                <button id="ss-export-curve-btn" class="primary">Calibration curve image</button>
+                <button id="ss-preview-curve-btn">Preview</button>
+                <button id="ss-export-ts-btn" class="primary">Time-series image</button>
+                <button id="ss-preview-ts-btn">Preview</button>
+                <button id="ss-export-csv-btn">Calibration data (CSV)</button>
+              </div>
+              <p class="hint">The calibration curve and CSV need ③ Calibration to have been computed.</p>
+            </fieldset>
+          </div>
+          <div class="preview-box empty" data-message="Click a Preview button to see the exported image here.">
+          <img id="ss-preview-img" alt="Export preview" />
+        </div>
+        </div>
+      </div>
+
+      <!-- ⑤ Compare Files -->
+      <div class="tab-page" data-tab-page="compare">
+        <p class="hint">An independent Nernstian fit per loaded file (first channel only), overlaid on one chart.</p>
+        <button id="ss-compare-btn">Refresh comparison</button>
+        <div id="ss-compare-status" class="status"></div>
+        <div id="ss-compare-plot" class="plot empty"></div>
+        <table id="ss-compare-table" class="stats-table"></table>
       </div>
     </section>
 
@@ -345,159 +383,326 @@
         <button class="tab-btn" data-tab="export">④ Export</button>
       </div>
 
-      <!-- Tab 1: Import -->
+      <!-- ① Import -->
       <div class="tab-page active" data-tab-page="import">
-        <fieldset class="group">
-          <legend>Units</legend>
-          <label>Potential unit <input id="cv-volt-unit" type="text" value="V" /></label>
-          <label>Current unit <input id="cv-cur-unit" type="text" value="µA" /></label>
-          <label>Scan rate unit <input id="cv-sr-unit" type="text" value="mV/s" /></label>
-        </fieldset>
-
-        <div class="row">
-          <label for="cv-file-input" class="button-like">Browse CV Files&hellip;</label>
-          <input id="cv-file-input" type="file" multiple accept=".csv,.txt" style="display:none" />
+        <div class="two-col">
+          <div>
+            <div class="row">
+              <label for="cv-file-input" class="button-like primary">Browse CV files&hellip;</label>
+              <input id="cv-file-input" type="file" multiple accept=".csv,.txt,.tsv" hidden />
+            </div>
+            <p class="hint">One file per scan rate. The scan rate is guessed from the last number in the file name (e.g. <code>run_50mVs.csv</code> → 50).</p>
+            <div id="cv-dropzone" class="dropzone">Drop CV CSV files here</div>
+            <fieldset class="group">
+              <legend>Units</legend>
+              <div class="form-grid">
+                <label>Potential <input id="cv-volt-unit" type="text" size="6" value="V" /></label>
+                <label>Current <input id="cv-cur-unit" type="text" size="6" value="µA" /></label>
+                <label>Scan rate <input id="cv-sr-unit" type="text" size="6" value="mV/s" /></label>
+              </div>
+            </fieldset>
+            <details class="collapsible">
+              <summary>File format &mdash; only needed if auto-detection guesses wrong</summary>
+              <div class="group-body form-grid">
+                <label>Format
+                  <select id="cv-fmt">
+                    <option value="standard">Standard CSV</option>
+                    <option value="multichannel">Multi-channel instrument</option>
+                  </select>
+                </label>
+                <label>Delimiter
+                  <select id="cv-delim">
+                    <option value="auto">Auto-detect</option>
+                    <option value="comma">Comma</option>
+                    <option value="tab">Tab</option>
+                    <option value="semicolon">Semicolon</option>
+                    <option value="space">Space</option>
+                  </select>
+                </label>
+                <label>Rows to skip <input id="cv-skip-rows" type="number" value="0" min="0" /></label>
+              </div>
+            </details>
+          </div>
+          <div>
+            <div class="row spread">
+              <h3>Loaded runs</h3>
+              <button id="cv-clear-btn" class="danger" hidden>Remove all</button>
+            </div>
+            <p class="empty-note needs-data">No runs loaded yet.</p>
+            <table id="cv-runs-table" class="editable-table"></table>
+            <details class="collapsible">
+              <summary>Channel assignment</summary>
+              <div class="group-body">
+                <label>Run <select id="cv-channel-run-select"></select></label>
+                <div id="cv-channel-assignment"></div>
+                <button id="cv-apply-channels-btn" class="primary">Apply channel assignment</button>
+              </div>
+            </details>
+          </div>
         </div>
-        <div id="cv-dropzone" class="dropzone">Drop CV CSV files here</div>
-
-        <details class="collapsible">
-          <summary>Column mapping &mdash; only needed if auto-detection guesses wrong</summary>
-          <div class="group-body">
-            <label>File format
-              <select id="cv-fmt">
-                <option value="standard">Standard CSV</option>
-                <option value="multichannel">Multi-channel instrument</option>
-              </select>
-            </label>
-            <label>Delimiter
-              <select id="cv-delim">
-                <option value="auto">Auto-detect</option>
-                <option value="comma">Comma</option>
-                <option value="tab">Tab</option>
-                <option value="semicolon">Semicolon</option>
-                <option value="space">Space</option>
-              </select>
-            </label>
-            <label>Rows to skip <input id="cv-skip-rows" type="number" value="0" min="0" /></label>
-          </div>
-        </details>
-
-        <div id="cv-status" class="status"></div>
-        <h3>Loaded runs</h3>
-        <table id="cv-runs-table" class="editable-table"></table>
-
-        <details class="collapsible">
-          <summary>Channel assignment</summary>
-          <div class="group-body">
-            <label>Run:
-              <select id="cv-channel-run-select"></select>
-            </label>
-            <div id="cv-channel-assignment"></div>
-            <button id="cv-apply-channels-btn">Apply channel assignment</button>
-          </div>
-        </details>
       </div>
 
-      <!-- Tab 2: Plot & Peaks -->
+      <!-- ② Plot & Peaks -->
       <div class="tab-page" data-tab-page="plot">
+        <p class="empty-note needs-data">Load data in ① Import first.</p>
         <div class="windows-layout">
           <div class="plot-col">
-            <h4>Scan rates</h4>
+            <div class="checklist-label">Scan rates</div>
             <div id="cv-sr-checklist" class="checklist"></div>
-            <h4>Channels</h4>
+            <div class="checklist-label">Channels</div>
             <div id="cv-ch-checklist" class="checklist"></div>
-            <div id="cv-plot" class="plot"></div>
+            <div id="cv-plot" class="plot empty"></div>
           </div>
           <div class="side-col">
             <details class="collapsible" open>
               <summary>Peak detection</summary>
               <div class="group-body">
-                <label>Prominence <input id="cv-prom" type="number" step="0.001" value="0.1" /></label>
-                <label>Min distance (points) <input id="cv-dist" type="number" value="10" min="1" /></label>
-                <label>Min width (points, blank = none) <input id="cv-width" type="number" min="0" /></label>
-                <label>Min |Ip| (blank = none) <input id="cv-height" type="number" step="0.001" min="0" /></label>
-                <h5>Channels to analyse</h5>
+                <div class="form-grid">
+                  <label>Prominence <input id="cv-prom" type="number" step="any" value="0.1" /></label>
+                  <label>Min distance (pts) <input id="cv-dist" type="number" value="10" min="1" /></label>
+                  <label>Min width (pts) <input id="cv-width" type="number" min="0" placeholder="none" /></label>
+                  <label>Min |Ip| <input id="cv-height" type="number" step="any" min="0" placeholder="none" /></label>
+                </div>
+                <div class="checklist-label">Channels to analyse</div>
                 <div id="cv-peak-channels" class="checklist"></div>
-                <button id="cv-find-peaks-btn">Find Peaks in All Runs</button>
+                <button id="cv-find-peaks-btn" class="primary">Find peaks in all runs</button>
                 <div id="cv-peak-status" class="hint"></div>
               </div>
             </details>
-            <h4>All detected peaks</h4>
-            <table id="cv-peaks-table" class="stats-table"></table>
+            <h4>Detected peaks</h4>
+            <div class="table-scroll tall"><table id="cv-peaks-table" class="stats-table"></table></div>
           </div>
         </div>
       </div>
 
-      <!-- Tab 3: Scan Rate Analysis -->
+      <!-- ③ Scan Rate Analysis -->
       <div class="tab-page" data-tab-page="scanrate">
-        <h4>Channels</h4>
+        <div class="checklist-label">Channels</div>
         <div id="cv-sranalysis-channels" class="checklist"></div>
-        <h4>Peak Current vs Scan Rate</h4>
-        <div id="cv-plot-ip-nu" class="plot"></div>
-        <h4>Randles–Ševčík Plot (Ip vs √ν)</h4>
-        <div id="cv-plot-ip-sqrt" class="plot"></div>
+        <div id="cv-sr-status" class="status"></div>
+        <div class="plot-grid">
+          <div><h4>Peak current vs scan rate</h4><div id="cv-plot-ip-nu" class="plot small empty"></div></div>
+          <div><h4>Randles–Ševčík (Ip vs √ν)</h4><div id="cv-plot-ip-sqrt" class="plot small empty"></div></div>
+          <div><h4>Peak potential vs scan rate</h4><div id="cv-plot-ep-nu" class="plot small empty"></div></div>
+          <div><h4>Peak separation ΔEp vs scan rate</h4><div id="cv-plot-dep-nu" class="plot small empty"></div></div>
+        </div>
+        <h4>Randles–Ševčík fits</h4>
         <table id="cv-sr-stats-table" class="stats-table"></table>
-        <h4>Peak Potential vs Scan Rate</h4>
-        <div id="cv-plot-ep-nu" class="plot"></div>
-        <h4>Peak Separation (ΔEp) vs Scan Rate</h4>
-        <div id="cv-plot-dep-nu" class="plot"></div>
       </div>
 
-      <!-- Tab 4: Export -->
+      <!-- ④ Export -->
       <div class="tab-page" data-tab-page="export">
-        <fieldset class="group">
-          <legend>Export options (applies to plot exports below)</legend>
-          <label>Format
-            <select id="cv-export-fmt">
-              <option value="png">PNG</option>
-              <option value="svg">SVG</option>
-              <option value="pdf">PDF</option>
-              <option value="tiff">TIFF</option>
-            </select>
-          </label>
-          <label>DPI
-            <select id="cv-export-dpi">
-              <option>150</option>
-              <option selected>300</option>
-              <option>600</option>
-            </select>
-          </label>
-          <label>Style
-            <select id="cv-export-style">
-              <option value="default">Default</option>
-              <option value="origin">Origin</option>
-              <option value="minimal">Minimal</option>
-            </select>
-          </label>
-          <label>Width (in, blank = auto) <input id="cv-export-width" type="number" step="0.1" /></label>
-          <label>Height (in, blank = auto) <input id="cv-export-height" type="number" step="0.1" /></label>
-        </fieldset>
-
-        <fieldset class="group">
-          <legend>CSV exports</legend>
-          <div class="row">
-            <button id="cv-export-peaks-csv-btn">Export all peaks CSV</button>
-            <button id="cv-export-sr-csv-btn">Export scan-rate analysis CSV</button>
-            <button id="cv-export-raw-btn">Export raw data (ZIP, one CSV per run)</button>
+        <div class="two-col">
+          <div>
+            <fieldset class="group">
+          <legend>Image export options</legend>
+          <div class="form-grid">
+            <label>Format <select id="cv-export-fmt"><option value="png" selected>PNG</option><option value="svg">SVG</option><option value="pdf">PDF</option><option value="tiff">TIFF</option></select></label>
+            <label>DPI <select id="cv-export-dpi"><option>150</option><option selected>300</option><option>600</option></select></label>
+            <label>Style
+              <select id="cv-export-style">
+                <option value="default">Default</option>
+                <option value="origin">Origin</option>
+                <option value="minimal">Minimal</option>
+              </select>
+            </label>
+            <label>Width (in) <input id="cv-export-width" type="number" step="0.1" min="1" placeholder="auto" /></label>
+            <label>Height (in) <input id="cv-export-height" type="number" step="0.1" min="1" placeholder="auto" /></label>
           </div>
         </fieldset>
+            <fieldset class="group">
+              <legend>Images</legend>
+              <div class="button-grid">
+                <button id="cv-export-plot-btn" class="primary">CV plot</button>
+                <button id="cv-preview-plot-btn">Preview</button>
+                <button id="cv-export-ipnu-btn">Ip vs ν</button>
+                <button id="cv-export-ipsqrt-btn">Ip vs √ν</button>
+                <button id="cv-export-epnu-btn">Ep vs ν</button>
+                <button id="cv-export-depnu-btn">ΔEp vs ν</button>
+              </div>
+              <div class="row">
+                <select id="cv-preview-sr-kind">
+                  <option value="ip_nu">Ip vs ν</option>
+                  <option value="ip_sqrt_nu">Ip vs √ν</option>
+                  <option value="ep_nu">Ep vs ν</option>
+                  <option value="delta_ep">ΔEp vs ν</option>
+                </select>
+                <button id="cv-preview-sr-btn">Preview</button>
+              </div>
+            </fieldset>
+            <fieldset class="group">
+              <legend>Data</legend>
+              <div class="button-grid">
+                <button id="cv-export-peaks-csv-btn">All peaks (CSV)</button>
+                <button id="cv-export-sr-csv-btn">Scan-rate analysis (CSV)</button>
+                <button id="cv-export-raw-btn">Raw data (ZIP of CSVs)</button>
+              </div>
+            </fieldset>
+          </div>
+          <div class="preview-box empty" data-message="Click a Preview button to see the exported image here.">
+          <img id="cv-preview-img" alt="Export preview" />
+        </div>
+        </div>
+      </div>
+    </section>
 
-        <fieldset class="group">
-          <legend>Plot exports</legend>
-          <div class="row">
-            <button id="cv-export-plot-btn">Export CV plot</button>
-            <button id="cv-export-ipnu-btn">Export Ip vs ν plot</button>
-            <button id="cv-export-ipsqrt-btn">Export Ip vs √ν plot</button>
-            <button id="cv-export-epnu-btn">Export Ep vs ν plot</button>
-            <button id="cv-export-depnu-btn">Export ΔEp vs ν plot</button>
+    <section id="mode-assay" class="mode-page">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="import">① Import</button>
+        <button class="tab-btn" data-tab="standards">② Standards</button>
+        <button class="tab-btn" data-tab="curve">③ Standard Curve</button>
+        <button class="tab-btn" data-tab="results">④ Results &amp; Export</button>
+      </div>
+
+      <!-- ① Import -->
+      <div class="tab-page active" data-tab-page="import">
+        <div class="two-col">
+          <div>
+            <div class="row">
+              <label for="assay-file-input" class="button-like primary">Browse plate file&hellip;</label>
+              <input id="assay-file-input" type="file" accept=".csv,.txt,.tsv" hidden />
+              <button id="assay-sample-btn">Load sample plate</button>
+              <button id="assay-clear-btn" class="danger" hidden>Clear plate</button>
+            </div>
+            <p class="hint">96-well grid exports with rows labelled A–H (TECAN, Synergy, generic CSV/TSV).</p>
+            <div id="assay-dropzone" class="dropzone">Drop a plate-reader file here</div>
+            <details class="collapsible">
+              <summary>Paste from Excel / plate-reader software</summary>
+              <div class="group-body">
+                <textarea id="assay-paste" rows="5" placeholder="Copy the 8×12 block of values (with or without the A–H / 1–12 labels) and paste it here"></textarea>
+                <button id="assay-paste-btn">Load pasted values</button>
+              </div>
+            </details>
+            <fieldset class="group">
+              <legend>Units</legend>
+              <div class="form-grid">
+                <label>Signal <input id="assay-sig-unit" type="text" size="8" title="e.g. Abs, RFU, RLU" /></label>
+                <label>Concentration <input id="assay-conc-unit" type="text" size="8" title="e.g. µM, nM, mg/L" /></label>
+              </div>
+            </fieldset>
+            <div id="assay-plate-status" class="hint"></div>
+          </div>
+          <div>
+            <h3>Plate map</h3>
+            <p class="empty-note needs-data">Load or type in plate data to see the plate map.</p>
+            <div id="assay-plate-map" class="plot plate empty"></div>
+          </div>
+        </div>
+        <details class="collapsible">
+          <summary>Edit values by hand</summary>
+          <div class="group-body">
+            <div class="table-scroll"><table id="assay-grid" class="plate-grid"></table></div>
+            <button id="assay-grid-apply-btn" class="primary" disabled>Apply manual values</button>
+          </div>
+        </details>
+      </div>
+
+      <!-- ② Standards -->
+      <div class="tab-page" data-tab-page="standards">
+        <div class="two-col">
+          <div>
+            <h3>Standards</h3>
+            <p class="hint">One row per concentration level. <strong>The first row is the blank</strong>: its mean signal is subtracted from every well. Enter the well for each of up to 3 replicate sets; leave a cell blank if that set doesn't include the level.</p>
+            <div id="assay-std-table" class="table-scroll"></div>
+            <button id="assay-std-add-btn">+ Level</button>
+            <h3>Sample labels <span class="hint">(optional)</span></h3>
+            <p class="hint">Every well with data that isn't a standard is treated as a sample. Name them here to label the results.</p>
+            <div id="assay-sample-table" class="table-scroll"></div>
+            <button id="assay-sample-add-btn">+ Sample</button>
+            <div class="row sticky-actions">
+              <button id="assay-layout-apply-btn" class="primary">Apply layout</button>
+              <button id="assay-layout-reset-btn">Discard changes</button>
+              <span id="assay-layout-dirty" class="dirty-badge" hidden>unsaved changes</span>
+            </div>
+            <ul id="assay-layout-problems" class="problems"></ul>
+          </div>
+          <div>
+            <h3>Layout preview</h3>
+            <p class="hint">Tip: click a well cell in the tables, then click wells here to fill them in.</p>
+            <p class="empty-note needs-data">Import plate data in ① first.</p>
+            <div id="assay-layout-map" class="plot plate empty"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ③ Standard Curve -->
+      <div class="tab-page" data-tab-page="curve">
+        <p class="empty-note needs-data">Import plate data in ① first.</p>
+        <div class="row">
+          <label>Fit type <select id="assay-fit-type"></select></label>
+          <label class="inline"><input id="assay-show-reps" type="checkbox" checked /> Show individual replicates</label>
+          <button id="assay-compute-btn" class="primary">Compute standard curve</button>
+        </div>
+        <div id="assay-curve-status" class="status"></div>
+        <div id="assay-equation" class="equation"></div>
+        <div id="assay-curve-plot" class="plot empty"></div>
+        <h4>Standards</h4>
+        <div class="table-scroll"><table id="assay-standards-table" class="stats-table"></table></div>
+      </div>
+
+      <!-- ④ Results & Export -->
+      <div class="tab-page" data-tab-page="results">
+        <div id="assay-results-status" class="status"></div>
+        <div class="two-col">
+          <div>
+            <h3>Sample results</h3>
+            <p class="hint">Highlighted rows fall outside the standard range (extrapolated) or couldn't be back-calculated.</p>
+            <div class="table-scroll tall"><table id="assay-results-table" class="stats-table"></table></div>
+          </div>
+          <div>
+            <h3>Results plate map</h3>
+            <p class="hint">Sample wells show back-calculated concentration.</p>
+            <div id="assay-results-map" class="plot plate empty"></div>
+          </div>
+        </div>
+        <div class="two-col">
+          <div>
+            <fieldset class="group">
+              <legend>Data</legend>
+              <div class="button-grid">
+                <button id="assay-export-results-btn" class="primary">Sample results (CSV)</button>
+                <button id="assay-export-standards-btn">Standard-curve data (CSV)</button>
+              </div>
+            </fieldset>
+            <fieldset class="group">
+          <legend>Image export options</legend>
+          <div class="form-grid">
+            <label>Format <select id="assay-export-fmt"><option value="png" selected>PNG</option><option value="svg">SVG</option><option value="pdf">PDF</option><option value="tiff">TIFF</option></select></label>
+            <label>DPI <select id="assay-export-dpi"><option>150</option><option selected>300</option><option>600</option></select></label>
+            <label>Style
+              <select id="assay-export-style">
+                <option value="default">Default</option>
+                <option value="origin">Origin</option>
+                <option value="minimal">Minimal</option>
+              </select>
+            </label>
+            <label>Width (in) <input id="assay-export-width" type="number" step="0.1" min="1" placeholder="auto" /></label>
+            <label>Height (in) <input id="assay-export-height" type="number" step="0.1" min="1" placeholder="auto" /></label>
           </div>
         </fieldset>
+            <fieldset class="group">
+              <legend>Standard-curve image</legend>
+              <div class="button-grid">
+                <button id="assay-export-curve-btn" class="primary">Download image</button>
+                <button id="assay-preview-curve-btn">Preview</button>
+              </div>
+            </fieldset>
+          </div>
+          <div class="preview-box empty" data-message="Click a Preview button to see the exported image here.">
+          <img id="assay-preview-img" alt="Export preview" />
+        </div>
+        </div>
       </div>
     </section>
   </main>
+
+  <div id="toasts" aria-live="polite"></div>
+
   <script src="/js/app.js"></script>
-  <script src="/js/solid_state.js"></script>
+  <script src="/js/trace_mode.js"></script>
   <script src="/js/amperometry.js"></script>
+  <script src="/js/solid_state.js"></script>
   <script src="/js/cyclic_voltammetry.js"></script>
+  <script src="/js/assay.js"></script>
 </body>
 </html>

@@ -1,7 +1,6 @@
-# Runtime dependencies for the local (localhost) web app (web_app/).
-# Kept separate from the top-level requirements.txt so installing the
-# Streamlit app is never affected by these, and vice versa — same
-# isolation rationale macos_app/requirements-macos.txt already used.
+# Runtime dependencies for the local (localhost) web app (web_app/), installed
+# on top of requirements.txt. Kept separate so installing the Streamlit app
+# is never affected by these.
 fastapi>=0.110.0
 uvicorn>=0.27.0
 python-multipart>=0.0.9
@@ -11,11 +10,8 @@ plotly>=5.18.0
 scipy>=1.11.0
 matplotlib>=3.7.0
 
-# Not used interactively — web_app/ reuses pure functions straight out of
-# modes/solid_state.py, modes/amperometry.py, modes/cyclic_voltammetry.py,
-# core/shared_tabs.py, and core/constants.py (fit math, PNG-export
-# builders) rather than duplicating them. Those files do `import streamlit
-# as st` at module level (even though the specific reused functions never
-# call st.*), so importing them at all requires streamlit installed — same
-# situation macos_app/requirements-macos.txt already documented.
+# web_app/ reuses pure functions from modes/*.py and core/*.py (fit math,
+# parsers, export builders) instead of duplicating them. Those modules do
+# `import streamlit as st` at the top, so streamlit must be importable even
+# though the web app never runs a Streamlit server.
 streamlit>=1.32.0

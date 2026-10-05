@@ -1,131 +1,97 @@
 # Sensor Calibration Studio
 
-A lab tool for importing multi-channel electrochemical sensor data (amperometry, potentiometric/solid-state, cyclic voltammetry) and microplate assay data, defining calibration windows, fitting calibration curves, and exporting results/plots.
+A lab tool for importing multi-channel electrochemical sensor data (amperometry, potentiometric/solid-state, cyclic voltammetry) and 96-well microplate assay data, defining calibration windows, fitting calibration curves, and exporting results and publication-quality plots.
 
-There are **three independent UIs** built on the same computation core:
+There are **two UIs** built on the same computation core (`core/` + the fit math in `modes/`), and both cover all four modes:
 
-- **Streamlit app** (`app.py`) — runs in a browser, zero install beyond Python. Covers all four modes (Amperometry, Solid-State, Cyclic Voltammetry, Assay). Best for quick use on any machine.
-- **Native macOS app** (`macos_app/`) — a PySide6/Qt desktop app with multi-window sessions, undo/redo, drag-and-drop import, publication-quality export with format/DPI/style options, and a cross-file comparison view. Covers Amperometry, Solid-State, and Cyclic Voltammetry (Assay is Streamlit-only). Best for regular day-to-day use on a Mac.
-- **Local web app** (`web_app/`) — a FastAPI + Plotly app that runs a small localhost-only server and opens in your default browser. Covers Amperometry, Solid-State, and Cyclic Voltammetry (Assay is Streamlit-only). No auth, binds to `127.0.0.1` only — a lighter-weight alternative to the Streamlit app, not a hosted/multi-user service.
+- **Streamlit app** (`app.py`): runs in a browser via `streamlit run`. It has the optional Google Drive "Cloud Sessions" and local-Ollama "AI Insights" extras.
+- **Local web app** (`web_app/`): a FastAPI + Plotly app that runs a small localhost-only server and opens in your default browser. It is snappier than Streamlit for large files. It also adds drag-and-drop import, per-file remove, live export previews, pasting an assay plate straight from Excel, and click-to-assign wells on the plate map.
 
-All three read/write the same Export/Import JSON session format, so a session saved from one opens in either of the others (Assay data round-trips through the Streamlit app only, since neither the macOS nor web app supports that mode).
+Both read and write the same **Export/Import Session** JSON, so a session saved in one opens in the other.
 
-This file covers installing and running all three. For architecture/contributor notes, see [`.claude/CLAUDE.md`](.claude/CLAUDE.md).
+For architecture/contributor notes, see [`.claude/CLAUDE.md`](.claude/CLAUDE.md).
+
+---
+
+## Local web app
+
+Requires Python 3.10+.
+
+```bash
+python -m venv .venv-web
+source .venv-web/bin/activate
+pip install -r requirements.txt -r requirements-web.txt
+python -m web_app.main
+```
+
+This starts a server on `http://127.0.0.1:8000` and opens it in your browser. If port 8000 is busy, the next free port is used and printed in the terminal. Everything runs on your machine: there is no remote server and no data leaves it. Stop the server with `Ctrl-C`.
+
+Options (environment variables):
+
+| Variable | Effect |
+|---|---|
+| `WEB_APP_PORT=8123` | Preferred port |
+| `WEB_APP_NO_BROWSER=1` | Don't open a browser tab automatically |
+| `WEB_APP_IDLE_SHUTDOWN_MIN=15` | Exit after this many minutes with no open tab (the Mac app sets it) |
+
+Running it again while it's already running just opens a new tab on the existing server.
+
+### Installing it as a Mac app
+
+To open it from your Applications folder, Launchpad or Spotlight like any other app:
+
+```bash
+./packaging/build_mac_app.sh          # builds and installs /Applications/Sensor Calibration Studio.app
+```
+
+The app is self-contained: it holds its own copy of the code and its own Python environment, about 600 MB. Moving or deleting this repo folder doesn't affect it. It's built against this Mac's Python, so build it on each Mac where you want it rather than copying the `.app` across. The first build takes a few minutes. After you change the code, run the script again to update the app; this takes seconds, because the Python environment is reused.
+
+Using it:
+- **Opening the app** starts the server and opens a browser tab. While it runs it shows in the Dock. Opening it again, or clicking its Dock icon, opens a fresh tab on the same session.
+- **To stop it**, press ⌘Q on the app, or use the **Quit** button in the page header. It also stops itself 15 minutes after the last tab is closed. Use **Export session** first if you want to keep your work, because data is held in memory only.
+- **Logs** are in `~/Library/Logs/Sensor Calibration Studio.log`. To uninstall, drag the app to the Bin.
+
+### Modes
+
+- **Amperometry / Solid-State.** ① Import (browse, drag-and-drop, or sample data) → ② Time Series & Windows (plot, pick channels, edit or auto-detect calibration windows, smoothing, channel mapping; Amperometry also has the serial-dilution calculator) → ③ Calibration (linear/segmented fits with sensitivity, R², LOD, LOQ; Nernstian fit for Solid-State) → ④ Export (PNG/SVG/PDF/TIFF with DPI, style, and size options, plus a live preview) → ⑤ Compare Files.
+- **Cyclic Voltammetry.** ① Import (one file per scan rate, guessed from the file name and editable) → ② Plot & Peaks → ③ Scan Rate Analysis (Ip vs ν, Randles–Ševčík, Ep, ΔEp) → ④ Export.
+- **Assay (Microplate).** ① Import (plate-reader file, sample plate, paste from Excel, or type values in) → ② Standards (concentration levels × up to 3 replicate wells, optional sample labels; click wells on the plate map to fill them in) → ③ Standard Curve (Linear, Quadratic, or 4PL; the first row is the blank and is subtracted from every well) → ④ Results & Export (back-calculated concentrations with out-of-range flags, results plate map, CSV and image export).
+
+Use **Export session** / **Import session** in the header to save your work. The server keeps sessions in memory only, so they are cleared when it stops.
 
 ---
 
 ## Streamlit app
-
-Requires Python 3.10+.
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Opens at `http://localhost:8501`. All data stays local to your browser session — there is no backend/database. Optional features (Google Drive "Cloud Sessions", local-Ollama "AI Insights") are disabled unless configured; see `.streamlit/secrets.toml.example`.
+This opens at `http://localhost:8501`. Optional features (Google Drive "Cloud Sessions", local-Ollama "AI Insights") stay disabled unless configured; see `.streamlit/secrets.toml.example`.
 
-### Running the tests
+---
+
+## Running the tests
 
 ```bash
 pip install -r requirements-dev.txt
 pytest              # everything
-pytest tests/unit   # fast, no browser involved
+pytest tests/unit   # fast, pure-function tests
+pytest tests/web    # web app API tests (FastAPI TestClient)
 ```
-
----
-
-## macOS app
-
-### Run from source (any platform with Python 3.10+, for development)
-
-```bash
-pip install -r macos_app/requirements-macos.txt
-python -m macos_app.main
-```
-
-This launches the Qt app directly — no packaging step needed for day-to-day development.
-
-### Using the app
-
-Amperometry and Solid-State each follow the same 3-step pipeline, one tab per step:
-
-1. **① Import** — browse for files, drag-and-drop them onto the window, or load the built-in sample data. Channel names/columns are auto-detected; there's no separate "apply" step before you can see the trace. Selecting a file shows its raw parsed CSV in a table alongside the loaded-files list.
-2. **② Time Series & Calibration** — the trace is plotted immediately, with a checklist to choose which channels are visible (this same checklist is what "Compute Calibration" analyses below). Fine-tune channel assignment, mark calibration windows (spike start/end, concentration, spike volume), and auto-detect step edges from the trace, in collapsible side panels next to the plot — Amperometry also has the effective-concentration (serial dilution) calculator here. Below that, in the same tab: pick a fit type, click Compute Calibration, and see the fitted curve with sensitivity/R²/LOD/LOQ statistics.
-3. **③ Export** — CSV summary, plus a calibration-curve/time-series image export with a Format (PNG/SVG/PDF/TIFF), DPI, Style (Default/Origin/Minimal), and figure-size dialog, and a live preview of the exported image that updates as you change those options.
-
-A 4th **④ Compare Files** tab overlays fits from multiple loaded files. Cyclic Voltammetry follows a similar shape (① Import → ② Plot & Peaks → ③ Scan Rate Analysis → ④ Export) without the calibration-window concept, since peak detection there plays the same role.
-
-Every plot in the app is a native chart (scroll to zoom, drag to pan, hover for a crosshair readout) rather than an embedded web view.
-
-### Building an installable `.app` / `.dmg`
-
-Packaging **must be done on an actual Mac** — PyInstaller does not cross-compile, and this can't be built from Linux/Windows.
-
-1. Install the runtime and build dependencies:
-
-   ```bash
-   pip install -r macos_app/requirements-macos.txt -r macos_app/packaging/requirements-build.txt
-   ```
-
-2. Run the build script from the repo root:
-
-   ```bash
-   ./macos_app/packaging/build_macos.sh
-   ```
-
-   This runs PyInstaller, strips unused Qt plugin categories the PySide6 hooks bundle unconditionally (SQL drivers, Qt3D, Bluetooth, multimedia, QML tooling, etc. — this app uses none of them), ad-hoc code-signs the bundle, and packages it as a `.dmg`. Output lands in `dist/`:
-   - `dist/SensorCalibrationStudio.app`
-   - `dist/SensorCalibrationStudio-<version>.dmg`
-
-   The script prints bundle size before/after the plugin cleanup and after signing, so you can sanity-check the result.
-
-### Installing the built app
-
-1. Open the `.dmg` (double-click it in Finder).
-2. Drag **Sensor Calibration Studio** into the **Applications** shortcut shown in the window.
-3. Eject the `.dmg` and launch the app from `/Applications`.
-
-### Gatekeeper warning on first launch
-
-The app is **ad-hoc signed**, not signed with a paid Apple Developer ID and not notarized (that requires a $99/yr Apple Developer Program membership). Ad-hoc signing satisfies Apple Silicon's requirement that every executable be signed, so the app runs — but macOS Gatekeeper will still flag it as being from an "unidentified developer" the first time you open it. This is expected; do one of:
-
-- **Right-click (or Control-click) the app → Open → Open**, in the dialog that appears, *or*
-- Try to open it normally, then go to **System Settings → Privacy & Security**, scroll to the blocked-app notice near the bottom, and click **Open Anyway**.
-
-This is a one-time step per machine. There is no way to avoid it without a paid Apple Developer account and notarization — if that's ever added, `macos_app/packaging/build_macos.sh`'s header comment documents the upgrade path (replace the ad-hoc `codesign` call with a Developer ID identity, add `notarytool submit` + `stapler staple` steps).
-
-### Checking for updates
-
-The app checks GitHub Releases for this repo on startup and shows a dialog if a newer version is tagged (Help → Check for Updates to check manually). This is a notification only, not an auto-updater — downloading and installing a new version still means repeating the steps above.
-
----
-
-## Web app
-
-Requires Python 3.10+. Runs on any platform (not Mac-only, unlike the packaged macOS app).
-
-```bash
-pip install -r requirements.txt -r requirements-web.txt
-python -m web_app.main
-```
-
-Starts a Uvicorn server on `http://127.0.0.1:8000` and opens it in your default browser automatically (set `WEB_APP_NO_BROWSER=1` to skip that and open the URL yourself). Everything runs locally on your machine — there's no remote server and no data leaves it.
-
-Amperometry, Solid-State, and Cyclic Voltammetry each get their own tab in the page, covering the same import → time-series/calibration → export flow as the macOS app. Use the **Export Session** / **Import Session** buttons in the header to move a session between this app, the Streamlit app, and the macOS app.
-
-To stop the server, `Ctrl-C` the terminal it's running in (or `lsof -ti:8000 | xargs kill` if it's running in the background).
 
 ---
 
 ## Repository layout
 
 ```
-app.py, modes/, core/     # Streamlit app + shared computation core
-macos_app/                 # Native macOS app (PySide6/Qt), see macos_app section above
-web_app/                    # Local FastAPI + Plotly web app, see web_app section above
-tests/                      # pytest suite (unit/e2e/regression) covering core/ and modes/
-sample_data/                 # Example CSVs for trying out each mode
+app.py, modes/        # Streamlit app (one module per mode)
+core/                 # Shared parsing, fitting, plotting, persistence helpers
+web_app/              # Local FastAPI + Plotly web app
+packaging/            # build_mac_app.sh: wraps web_app/ as a macOS .app
+  api/                #   one router per mode + session export/import
+  static/             #   index.html, css/, js/ (one script per mode)
+tests/                # pytest: unit/, e2e/ + regression/ (Streamlit), web/ (web app)
+sample_data/          # Example data for every mode's "Load sample" button
 ```
-
-See [`.claude/CLAUDE.md`](.claude/CLAUDE.md) for the full architecture breakdown of both UIs.

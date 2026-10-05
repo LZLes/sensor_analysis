@@ -1,11 +1,9 @@
 """
-Cyclic Voltammetry mode API — ports macos_app/ui/modes/cyclic_voltammetry_view.py's
-logic to HTTP endpoints. CV stays self-contained (inline CSV parsing, not
-core/shared_tabs.py) for the same reason that view gave: modes/cyclic_voltammetry.py's
-own docstring calls the duplication "pre-existing, not part of scope" to fix.
+Cyclic Voltammetry mode API. CV stays self-contained (inline CSV parsing,
+not core/shared_tabs.py), as modes/cyclic_voltammetry.py itself is; the peak
+finder (find_cv_peaks) is imported from there unmodified.
 
-Import is a single step here rather than macos_app's preview-then-load flow:
-a browser file upload can't be cheaply re-read the way a local path can, so
+Import is a single step (no preview-then-load): a browser file upload can't be cheaply re-read the way a local path can, so
 files are parsed with best-guess defaults immediately and usable right away,
 matching the "import now, refine channel assignment after" model the other
 two modes already use — refining channel mapping happens via a follow-up
@@ -13,8 +11,7 @@ endpoint instead of a second upload.
 
 _render_cv_plot_png/_render_sr_plot_png are new matplotlib builders (not
 imports from modes/cyclic_voltammetry.py, whose real closures aren't
-importable) — same reasoning and same code shape as the ones already
-proven out in macos_app/ui/modes/cyclic_voltammetry_view.py.
+importable), styled with core/plotting.py's shared export presets.
 """
 
 from __future__ import annotations
@@ -23,19 +20,20 @@ import io
 import re
 import zipfile
 from collections import Counter
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.constants import PAL
 from core.numeric import lin_reg, to_num
 from core.parsing import parse_potentiostat_csv
 from core.plotting import _ORIGIN_RC, _MINIMAL_RC, _apply_spine_style
 from modes.cyclic_voltammetry import find_cv_peaks
-from web_app.api.common import figure_json, png_response
+from web_app.api.common import ExportFmt, ExportStyle, export_media_type, figure_json, png_response, require_file_index
 from web_app.deps import get_session
 from web_app.session import SessionData
 
@@ -88,6 +86,36 @@ def _fallback_cv_channels(columns: list[str]) -> list[dict]:
     )
 
 
+def _build_channels(df: pd.DataFrame, specs: list[dict]) -> list[dict]:
+    """Channel specs ({name, vc, ic_cols | ic}) -> stored channel dicts. A
+    channel with several current columns is averaged into a synthetic
+    __avg_<name>_ic column; ic_cols is kept on the channel so the mapping
+    can be shown and edited again later."""
+    channels = []
+    for spec in specs:
+        ic_cols = list(spec.get("ic_cols") or ([spec["ic"]] if spec.get("ic") else []))
+        ic_cols = [c for c in ic_cols if c in df.columns]
+        if not ic_cols:
+            continue
+        if len(ic_cols) == 1:
+            ic_col, is_avg = ic_cols[0], False
+        else:
+            ic_arrs = [to_num(df[c]).to_numpy(dtype=float, na_value=np.nan) for c in ic_cols]
+            max_len = max(len(a) for a in ic_arrs)
+            mat = np.full((len(ic_arrs), max_len), np.nan)
+            for j, arr in enumerate(ic_arrs):
+                mat[j, :len(arr)] = arr
+            ic_col = f"__avg_{spec['name']}_ic"
+            df[ic_col] = np.nanmean(mat, axis=0)
+            is_avg = True
+        channels.append({"name": spec["name"], "vc": spec["vc"], "ic": ic_col, "is_avg": is_avg, "ic_cols": ic_cols})
+    return channels
+
+
+def _sr_label(scan_rate: float, sr_unit: str) -> str:
+    return f"{scan_rate:g} {sr_unit}"
+
+
 def _guess_scan_rate(filename: str) -> float:
     nums = re.findall(r"\d+\.?\d*", filename.rsplit(".", 1)[0])
     return max(float(nums[-1]), 0.001) if nums else 10.0
@@ -130,8 +158,9 @@ def set_units(body: UnitsBody, session: SessionData = Depends(get_session)) -> d
         session.volt_unit = body.volt_unit
     if body.cur_unit is not None:
         session.cv_cur_unit = body.cur_unit
-    if body.sr_unit is not None:
+    if body.sr_unit is not None and body.sr_unit != session.cv_sr_unit:
         session.cv_sr_unit = body.sr_unit
+        session.cv_runs = [{**r, "label": _sr_label(r["scan_rate"], body.sr_unit)} for r in session.cv_runs]
     return _state(session)
 
 
@@ -144,7 +173,7 @@ async def upload_files(
     skip_rows: int = Form(0),
     session: SessionData = Depends(get_session),
 ) -> dict:
-    existing_peaks = {(r["filename"], r["scan_rate"]): r["peaks"] for r in session.cv_runs}
+    existing = {r["filename"]: r for r in session.cv_runs}
     new_runs = []
     errors = []
     for upload in files:
@@ -154,32 +183,22 @@ async def upload_files(
             raw = _decode_text(raw_bytes)
             df, auto_channels = _parse_cv_csv(raw, fmt, delimiter, skip_rows)
             channels_spec = auto_channels or _fallback_cv_channels(list(df.columns))
-            channels = []
-            for spec in channels_spec:
-                ic_cols = spec.get("ic_cols") or ([spec["ic"]] if "ic" in spec else [])
-                if not ic_cols:
-                    continue
-                if len(ic_cols) == 1:
-                    ic_col = ic_cols[0]
-                    is_avg = False
-                else:
-                    ic_arrs = [to_num(df[c]).to_numpy(dtype=float, na_value=np.nan) for c in ic_cols if c in df.columns]
-                    max_len = max((len(a) for a in ic_arrs), default=0)
-                    mat = np.full((len(ic_arrs), max_len), np.nan)
-                    for j, arr in enumerate(ic_arrs):
-                        mat[j, :len(arr)] = arr
-                    ic_col = f"__avg_{spec['name']}_ic"
-                    df[ic_col] = np.nanmean(mat, axis=0)
-                    is_avg = True
-                channels.append({"name": spec["name"], "vc": spec["vc"], "ic": ic_col, "is_avg": is_avg})
-            sr_val = _guess_scan_rate(filename)
+            channels = _build_channels(df, channels_spec)
+            if not channels:
+                raise ValueError("no potential/current column pair found — check Column mapping")
+            # A re-uploaded file keeps any scan rate the user already corrected;
+            # old peaks are dropped since they belong to the previous data.
+            prev = existing.get(filename)
+            sr_val = prev["scan_rate"] if prev else _guess_scan_rate(filename)
             new_runs.append({
-                "scan_rate": sr_val, "label": f"{sr_val:g} {session.cv_sr_unit}", "filename": filename,
-                "df": df, "channels": channels, "peaks": existing_peaks.get((filename, sr_val), {}),
+                "scan_rate": sr_val, "label": _sr_label(sr_val, session.cv_sr_unit), "filename": filename,
+                "df": df, "channels": channels, "peaks": {},
             })
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{filename}: {exc}")
-    all_runs = session.cv_runs + new_runs
+    # Re-uploading a file replaces its earlier run rather than duplicating it.
+    replaced = {r["filename"] for r in new_runs}
+    all_runs = [r for r in session.cv_runs if r["filename"] not in replaced] + new_runs
     all_runs.sort(key=lambda r: r["scan_rate"])
     session.cv_runs = all_runs
     result = _state(session)
@@ -194,10 +213,24 @@ class ScanRateBody(BaseModel):
 
 @router.post("/runs/{index}/scan-rate")
 def set_scan_rate(index: int, body: ScanRateBody, session: SessionData = Depends(get_session)) -> dict:
-    if not (0 <= index < len(session.cv_runs)):
-        raise HTTPException(status_code=404, detail=f"No run at index {index}")
-    run = session.cv_runs[index]
-    session.cv_runs[index] = {**run, "scan_rate": body.scan_rate, "label": f"{body.scan_rate:g} {session.cv_sr_unit}"}
+    run = require_file_index(session.cv_runs, index)
+    if not (np.isfinite(body.scan_rate) and body.scan_rate > 0):
+        raise HTTPException(status_code=400, detail="Scan rate must be a positive number.")
+    session.cv_runs[index] = {**run, "scan_rate": body.scan_rate, "label": _sr_label(body.scan_rate, session.cv_sr_unit)}
+    session.cv_runs = sorted(session.cv_runs, key=lambda r: r["scan_rate"])
+    return _state(session)
+
+
+@router.delete("/runs/{index}")
+def remove_run(index: int, session: SessionData = Depends(get_session)) -> dict:
+    require_file_index(session.cv_runs, index)
+    session.cv_runs = [r for i, r in enumerate(session.cv_runs) if i != index]
+    return _state(session)
+
+
+@router.delete("/runs")
+def clear_runs(session: SessionData = Depends(get_session)) -> dict:
+    session.cv_runs = []
     return _state(session)
 
 
@@ -207,36 +240,25 @@ class ChannelsBody(BaseModel):
 
 @router.post("/runs/{index}/channels")
 def set_channels(index: int, body: ChannelsBody, session: SessionData = Depends(get_session)) -> dict:
-    if not (0 <= index < len(session.cv_runs)):
-        raise HTTPException(status_code=404, detail=f"No run at index {index}")
-    run = session.cv_runs[index]
+    run = require_file_index(session.cv_runs, index)
     df = run["df"]
-    channels = []
     for spec in body.channels:
-        ic_cols = spec.get("ic_cols") or []
-        if not ic_cols:
-            continue
-        if len(ic_cols) == 1:
-            ic_col, is_avg = ic_cols[0], False
-        else:
-            ic_arrs = [to_num(df[c]).to_numpy(dtype=float, na_value=np.nan) for c in ic_cols if c in df.columns]
-            max_len = max((len(a) for a in ic_arrs), default=0)
-            mat = np.full((len(ic_arrs), max_len), np.nan)
-            for j, arr in enumerate(ic_arrs):
-                mat[j, :len(arr)] = arr
-            ic_col = f"__avg_{spec['name']}_ic"
-            df[ic_col] = np.nanmean(mat, axis=0)
-            is_avg = True
-        channels.append({"name": spec["name"], "vc": spec["vc"], "ic": ic_col, "is_avg": is_avg})
+        missing = [c for c in [spec.get("vc"), *(spec.get("ic_cols") or [])] if c not in df.columns]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Column(s) not in this file: {', '.join(map(str, missing))}")
+    channels = _build_channels(df, body.channels)
+    if not channels:
+        raise HTTPException(status_code=400, detail="Each channel needs at least one current column.")
     session.cv_runs[index] = {**run, "df": df, "channels": channels}
     return _state(session)
 
 
 @router.get("/runs/{index}/columns")
 def get_columns(index: int, session: SessionData = Depends(get_session)) -> dict:
-    if not (0 <= index < len(session.cv_runs)):
-        raise HTTPException(status_code=404, detail=f"No run at index {index}")
-    return {"columns": list(session.cv_runs[index]["df"].columns), "channels": session.cv_runs[index]["channels"]}
+    run = require_file_index(session.cv_runs, index)
+    columns = [c for c in run["df"].columns if not str(c).startswith("__avg_")]
+    channels = [{**c, "ic_cols": c.get("ic_cols") or ([] if c.get("is_avg") else [c["ic"]])} for c in run["channels"]]
+    return {"columns": columns, "channels": channels}
 
 
 # -- CV plot ----------------------------------------------------------------------
@@ -291,6 +313,22 @@ class PeaksBody(BaseModel):
     visible_chs: list[str] = []
 
 
+def _peak_rows(runs: list[dict]) -> list[dict]:
+    rows = []
+    for r in runs:
+        for ch_name, pk in r["peaks"].items():
+            for kind in ("anodic", "cathodic"):
+                for p in pk.get(kind, []):
+                    rows.append({"Scan rate": r["scan_rate"], "Channel": ch_name, "Type": kind.capitalize(),
+                                 "Ep": p["Ep"], "Ip": p["Ip"]})
+    return rows
+
+
+@router.get("/peaks")
+def get_peaks(session: SessionData = Depends(get_session)) -> dict:
+    return {"peaks": _peak_rows(session.cv_runs)}
+
+
 @router.post("/peaks/detect")
 def detect_peaks(body: PeaksBody, session: SessionData = Depends(get_session)) -> dict:
     if not body.channels:
@@ -309,13 +347,7 @@ def detect_peaks(body: PeaksBody, session: SessionData = Depends(get_session)) -
         new_runs.append(new_run)
     session.cv_runs = new_runs
 
-    rows = []
-    for r in session.cv_runs:
-        for ch_name, pk in r["peaks"].items():
-            for p in pk.get("anodic", []):
-                rows.append({"Scan rate": r["scan_rate"], "Channel": ch_name, "Type": "Anodic", "Ep": p["Ep"], "Ip": p["Ip"]})
-            for p in pk.get("cathodic", []):
-                rows.append({"Scan rate": r["scan_rate"], "Channel": ch_name, "Type": "Cathodic", "Ep": p["Ep"], "Ip": p["Ip"]})
+    rows = _peak_rows(session.cv_runs)
 
     vis_srs = set(body.visible_srs) or {r["label"] for r in session.cv_runs}
     vis_chs = set(body.visible_chs) or {c["name"] for r in session.cv_runs for c in r["channels"]}
@@ -515,9 +547,9 @@ def _render_sr_plot_png(kind, ch_data, volt_unit, cur_unit, sr_unit, dpi=150, fm
 class ExportPlotBody(BaseModel):
     visible_srs: list[str]
     visible_chs: list[str]
-    fmt: str = "png"
-    dpi: int = 150
-    style: str = "default"
+    fmt: ExportFmt = "png"
+    dpi: int = Field(150, ge=50, le=1200)
+    style: ExportStyle = "default"
     figsize: tuple[float, float] | None = None
 
 
@@ -529,16 +561,16 @@ def export_plot(body: ExportPlotBody, session: SessionData = Depends(get_session
         session.cv_runs, set(body.visible_srs), set(body.visible_chs), session.volt_unit, session.cv_cur_unit,
         dpi=body.dpi, fmt=body.fmt, figsize=body.figsize, style=body.style,
     )
-    media_type = {"svg": "image/svg+xml", "pdf": "application/pdf", "tiff": "image/tiff"}.get(body.fmt, "image/png")
+    media_type = export_media_type(body.fmt)
     return png_response(png_bytes, f"cv_plot.{body.fmt}", media_type)
 
 
 class ExportScanRatePlotBody(BaseModel):
-    kind: str
+    kind: Literal["ip_nu", "ip_sqrt_nu", "ep_nu", "delta_ep"]
     channels: list[str]
-    fmt: str = "png"
-    dpi: int = 150
-    style: str = "default"
+    fmt: ExportFmt = "png"
+    dpi: int = Field(150, ge=50, le=1200)
+    style: ExportStyle = "default"
     figsize: tuple[float, float] | None = None
 
 
@@ -551,19 +583,13 @@ def export_scan_rate_plot(body: ExportScanRatePlotBody, session: SessionData = D
         body.kind, ch_data, session.volt_unit, session.cv_cur_unit, session.cv_sr_unit,
         dpi=body.dpi, fmt=body.fmt, figsize=body.figsize, style=body.style,
     )
-    media_type = {"svg": "image/svg+xml", "pdf": "application/pdf", "tiff": "image/tiff"}.get(body.fmt, "image/png")
+    media_type = export_media_type(body.fmt)
     return png_response(png_bytes, f"cv_{body.kind}.{body.fmt}", media_type)
 
 
 @router.get("/export/peaks-csv")
 def export_peaks_csv(session: SessionData = Depends(get_session)):
-    rows = []
-    for r in session.cv_runs:
-        for ch_name, pk in r["peaks"].items():
-            for p in pk.get("anodic", []):
-                rows.append({"Scan rate": r["scan_rate"], "Channel": ch_name, "Type": "Anodic", "Ep": p["Ep"], "Ip": p["Ip"]})
-            for p in pk.get("cathodic", []):
-                rows.append({"Scan rate": r["scan_rate"], "Channel": ch_name, "Type": "Cathodic", "Ep": p["Ep"], "Ip": p["Ip"]})
+    rows = _peak_rows(session.cv_runs)
     if not rows:
         raise HTTPException(status_code=400, detail="No peaks detected yet.")
     csv_text = pd.DataFrame(rows).to_csv(index=False)
