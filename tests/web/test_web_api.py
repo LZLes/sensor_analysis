@@ -163,7 +163,7 @@ def test_assay_layout_flags_duplicate_and_invalid_wells(client):
                             json={"std_rows": rows, "sample_rows": [{"Well": "d1", "Label": "P1"}]}))
     probs = " ".join(state["layout_problems"])
     assert "A1 is used twice" in probs and "Z99" in probs
-    assert state["sample_rows"] == [{"Well": "D1", "Label": "P1"}]
+    assert state["sample_rows"] == [{"Well": "D1", "Label": "P1", "Subject": "", "Timepoint": ""}]
 
 
 def test_assay_manual_grid_edit(client):
@@ -229,3 +229,68 @@ def test_cross_site_and_rebinding_requests_are_blocked(client):
     assert client.post("/api/assay/units", json={"sig_unit": "Abs"},
                        headers={"Origin": "http://127.0.0.1:8000"}).status_code == 200
     assert client.get("/api/assay/state", headers={"Host": "localhost:8000"}).status_code == 200
+
+
+# -- Assay: plate layout, per-sample summary, normalisation ----------------------------------
+def test_assay_assign_layout_summary_and_normalise(client):
+    plate = client.post("/api/assay/plate/sample")
+    assert _ok(plate)["subjects"] == ["P01", "P02", "P03", "P04", "P05"]
+    # Standards A1:C8, list mode, preview first (no mutation)
+    wells = [f"{r}{c}" for r in "ABC" for c in range(1, 9)]
+    body = {"wells": wells, "direction": "across", "mode": "list", "concs_text": "0 1 2 5 10 20 50 100"}
+    prev = _ok(client.post("/api/assay/assign/standards", json={**body, "preview": True}))
+    assert len(prev["preview"]) == 24 and "8 level(s) × 3" in prev["message"]
+    st = _ok(client.post("/api/assay/assign/standards", json=body))
+    assert st["std_rows"][0]["Label"] == "Blank" and st["layout_problems"] == []
+    # Relabel row D as 3 subjects × 2 timepoints in duplicate
+    dw = [f"D{c}" for c in range(1, 13)]
+    sb = {"wells": dw, "subjects": "S1-S3", "timepoints": "pre, post", "replicates": 2}
+    assert "12 wells; 12 selected" in _ok(client.post("/api/assay/assign/samples", json={**sb, "preview": True}))["message"]
+    st = _ok(client.post("/api/assay/assign/samples", json=sb))
+    d = {w["well"]: w for w in st["wells"]}
+    assert (d["D3"]["subject"], d["D3"]["timepoint"]) == ("S1", "post")
+    # Bad requests are 400s; a bad preview is a message, not an error
+    assert client.post("/api/assay/assign/blank", json={"wells": ["H1", "H2", "H3", "H4"]}).status_code == 400
+    assert client.post("/api/assay/assign/samples", json={"wells": ["Z9"], "subjects": "x"}).status_code == 400
+    assert _ok(client.post("/api/assay/assign/standards", json={**body, "concs_text": "1 2", "preview": True}))["error"]
+
+    _ok(client.post("/api/assay/compute", json={"fit_type": "4-Parameter Logistic (4PL)"}))
+    r = _ok(client.get("/api/assay/results"))
+    groups = {(g["Subject"], g["Timepoint"]): g for g in r["groups"]}
+    assert groups[("S1", "pre")]["n"] == 2 and groups[("S1", "pre")]["Wells"] == "D1, D2"
+    # Row D (P01's row in the demo layout) now holds S1–S3; order follows the plate.
+    assert [t["name"] for t in r["group_figure"]["data"]] == ["S1", "S2", "S3", "P02", "P03", "P04", "P05"]
+    wide = client.get("/api/assay/export/summary-csv?wide=true").text
+    assert wide.splitlines()[0] == "Subject,pre,post,D0,D3,D7,D14"
+
+    n = _ok(client.get("/api/assay/normalise"))
+    assert n["n_samples"] == len(r["groups"])
+    rows = [{**row, "Area": 2, "Volume": 10} for row in n["inputs"]]
+    n = _ok(client.post("/api/assay/normalise", json={"area_unit": "cm²", "vol_unit": "µL", "rows": rows}))
+    assert n["units"]["per_area"] == "pmol/cm²" and n["figure"]
+    assert client.post("/api/assay/normalise", json={"rows": [{**rows[0], "Area": -1}]}).status_code == 400
+    csv = client.get("/api/assay/export/normalised-csv").text
+    assert "Per area (pmol/cm²)" in csv.splitlines()[0] and "# Readout: Absorbance, 450 nm" in csv
+
+
+def test_assay_layout_paste_and_clear(client):
+    text = "Blank\tStd 1\tStd 5\tA_t0\nBlank\tStd 1\tStd 5\tA_t0\n"
+    st = _ok(client.post("/api/assay/layout/paste", json={"text": text}))
+    assert [r["Label"] for r in st["std_rows"]] == ["Blank", "Std 1", "Std 5"]
+    assert {(r["Well"], r["Subject"], r["Timepoint"]) for r in st["sample_rows"]} == {("A4", "A", "t0"), ("B4", "A", "t0")}
+    st = _ok(client.post("/api/assay/assign/clear", json={"wells": ["A4", "A3"]}))
+    assert [r["Well"] for r in st["sample_rows"]] == ["B4"]
+    assert st["std_rows"][2]["S1"] == "" and st["std_rows"][2]["S2"] == "B3"
+
+
+def test_assay_readout_switches_default_unit_and_round_trips(client):
+    st = _ok(client.post("/api/assay/readout", json={"type": "fluorescence", "ex": "485", "em": "528"}))
+    assert st["sig_unit"] == "RFU" and st["readout_text"] == "Fluorescence, Ex 485 / Em 528 nm"
+    _ok(client.post("/api/assay/units", json={"sig_unit": "counts"}))
+    st = _ok(client.post("/api/assay/readout", json={"type": "luminescence"}))
+    assert st["sig_unit"] == "counts"   # a custom unit isn't overwritten
+    bundle = client.get("/api/session/export").content
+    with TestClient(app, base_url="http://127.0.0.1") as other:
+        other.get("/api/session/ping")
+        _ok(other.post("/api/session/import", files={"file": ("s.json", bundle, "application/json")}))
+        assert _ok(other.get("/api/assay/state"))["readout"]["type"] == "luminescence"

@@ -22,7 +22,8 @@ from fastapi.responses import Response
 from core.calibration_table import _cpdf_from_records, _solid_cpdf_from_records
 from core.persistence import _jsonify, _plate_df_from_csv, _plate_df_to_csv
 from web_app.deps import get_session
-from web_app.session import SessionData, default_assay_sample_df, default_assay_std_df
+from web_app.session import (SessionData, default_assay_norm, default_assay_readout, default_assay_sample_df,
+                              default_assay_std_df)
 
 router = APIRouter(prefix="/api/session", tags=["session"])
 
@@ -59,6 +60,9 @@ def _build_bundle(session: SessionData) -> dict:
     d["assay_std_df"] = _jsonify(session.assay_std_df.to_dict(orient="records"))
     d["assay_sample_df"] = _jsonify(session.assay_sample_df.to_dict(orient="records"))
     d["assay_std_res"] = _jsonify(session.assay_std_res)
+    # Web-only extras: the Streamlit app ignores keys it doesn't know.
+    d["assay_norm"] = _jsonify(session.assay_norm)
+    d["assay_readout"] = dict(session.assay_readout)
     return d
 
 
@@ -112,6 +116,13 @@ def _apply_bundle(session: SessionData, d: dict) -> None:
         session.assay_sample_df = pd.DataFrame(d["assay_sample_df"]) if d["assay_sample_df"] else default_assay_sample_df()
     if "assay_std_res" in d:
         session.assay_std_res = d["assay_std_res"]
+    if "assay_plate" in d or "assay_norm" in d:
+        norm = d.get("assay_norm") or {}
+        session.assay_norm = {**default_assay_norm(), **{k: norm[k] for k in ("area_unit", "vol_unit", "rows") if k in norm}}
+        if not isinstance(session.assay_norm["rows"], list):
+            raise ValueError("assay_norm.rows must be a list")
+    if "assay_plate" in d or "assay_readout" in d:
+        session.assay_readout = {**default_assay_readout(), **(d.get("assay_readout") or {})}
 
     # Autodetect previews belong to the previous file set.
     session.ts_ui = {}

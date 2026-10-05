@@ -5,7 +5,7 @@ A lab tool for importing multi-channel electrochemical sensor data (amperometry,
 There are **two UIs** built on the same computation core (`core/` + the fit math in `modes/`), and both cover all four modes:
 
 - **Streamlit app** (`app.py`): runs in a browser via `streamlit run`. It has the optional Google Drive "Cloud Sessions" and local-Ollama "AI Insights" extras.
-- **Local web app** (`web_app/`): a FastAPI + Plotly app that runs a small localhost-only server and opens in your default browser. It is snappier than Streamlit for large files. It also adds drag-and-drop import, per-file remove, live export previews, pasting an assay plate straight from Excel, and click-to-assign wells on the plate map.
+- **Local web app** (`web_app/`): a FastAPI + Plotly app that runs a small localhost-only server and opens in your default browser. It is snappier than Streamlit for large files. It also adds drag-and-drop import, per-file remove and live export previews. For assays it adds pasting a plate straight from Excel, a selectable plate for labelling standards and subject/timepoint samples, per-sample summaries, and normalisation by area.
 
 Both read and write the same **Export/Import Session** JSON, so a session saved in one opens in the other.
 
@@ -55,7 +55,22 @@ Using it:
 
 - **Amperometry / Solid-State.** ① Import (browse, drag-and-drop, or sample data) → ② Time Series & Windows (plot, pick channels, edit or auto-detect calibration windows, smoothing, channel mapping; Amperometry also has the serial-dilution calculator) → ③ Calibration (linear/segmented fits with sensitivity, R², LOD, LOQ; Nernstian fit for Solid-State) → ④ Export (PNG/SVG/PDF/TIFF with DPI, style, and size options, plus a live preview) → ⑤ Compare Files.
 - **Cyclic Voltammetry.** ① Import (one file per scan rate, guessed from the file name and editable) → ② Plot & Peaks → ③ Scan Rate Analysis (Ip vs ν, Randles–Ševčík, Ep, ΔEp) → ④ Export.
-- **Assay (Microplate).** ① Import (plate-reader file, sample plate, paste from Excel, or type values in) → ② Standards (concentration levels × up to 3 replicate wells, optional sample labels; click wells on the plate map to fill them in) → ③ Standard Curve (Linear, Quadratic, or 4PL; the first row is the blank and is subtracted from every well) → ④ Results & Export (back-calculated concentrations with out-of-range flags, results plate map, CSV and image export).
+- **Assay (Microplate).** Colourimetric, fluorescent or luminescent; set the readout and wavelength(s) on ①, and they're recorded in the exports.
+  - **① Import.** Paste the 8×12 block from Excel (⌘V anywhere on the tab), drop a plate-reader file, or type values in.
+  - **② Plate Layout.** Select wells on the plate by clicking, dragging, shift-clicking, or clicking a row or column header, then assign them:
+    - **Standards:** a serial dilution (top concentration and factor) or a typed list, with up to 3 replicates per level.
+    - **Blank:** subtracted from every well.
+    - **Samples:** subjects × timepoints, e.g. `P01-P12` and `D0, D3, D7`, with a replicate count and fill order. A live preview shows on the plate before you apply.
+
+    You can also paste a whole layout from Excel (`Blank`, `Std 10`, `P01_D7`, …) or edit the layout as tables.
+  - **③ Standard Curve.** Linear, Quadratic or 4PL.
+  - **④ Results.** Mean ± SD and CV per subject and timepoint, with a time-course chart, plus per-well concentrations with out-of-range flags.
+  - **⑤ Normalise & Export.** Per sample, enter dilution, volume and area:
+    - sample conc = well conc × dilution
+    - amount = sample conc × volume, with units worked out (e.g. µM × µL → pmol)
+    - per area = amount ÷ area
+
+    Exports cover the summary CSV (long, or subjects × timepoints for Prism/Excel), normalised, per-well and standard-curve CSVs, and the curve image.
 
 Use **Export session** / **Import session** in the header to save your work. The server keeps sessions in memory only, so they are cleared when it stops.
 

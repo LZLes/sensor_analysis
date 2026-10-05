@@ -35,7 +35,19 @@ def default_assay_std_df() -> pd.DataFrame:
 
 
 def default_assay_sample_df() -> pd.DataFrame:
-    return pd.DataFrame({"Well": pd.Series([], dtype=str), "Label": pd.Series([], dtype=str)})
+    # Streamlit's default has only Well/Label; Subject/Timepoint are extra
+    # columns it carries along untouched (see web_app/api/assay_layout.py).
+    return pd.DataFrame({c: pd.Series([], dtype=str) for c in ("Well", "Label", "Subject", "Timepoint")})
+
+
+def default_assay_norm() -> dict:
+    """Web-only normalisation inputs (per sample dilution/volume/area)."""
+    return {"area_unit": "cm²", "vol_unit": "µL", "rows": []}
+
+
+def default_assay_readout() -> dict:
+    """Web-only description of how the plate was read; shown in exports."""
+    return {"type": "absorbance", "wavelength": "450", "ex": "", "em": ""}
 
 
 @dataclass
@@ -70,6 +82,8 @@ class SessionData:
     assay_std_df: pd.DataFrame = field(default_factory=default_assay_std_df)
     assay_sample_df: pd.DataFrame = field(default_factory=default_assay_sample_df)
     assay_std_res: dict | None = None
+    assay_norm: dict = field(default_factory=default_assay_norm)
+    assay_readout: dict = field(default_factory=default_assay_readout)
 
     # Per-file-list UI state (autodetect preview edges etc.), namespaced by
     # files_key ("amp_files"/"solid_files").

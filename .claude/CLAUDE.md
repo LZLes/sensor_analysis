@@ -74,12 +74,21 @@ Tests (`tests/`) exercise this code via Streamlit's `AppTest` harness rather tha
 - `session.py`: `SessionData`, an in-memory per-browser session keyed by an httponly cookie. Field names mirror `core/state.py`'s keys. `SessionStore.get_or_create` reuses an unknown-but-well-formed cookie id, so after a server restart the page's parallel requests land in one fresh session. `static/js/app.js` also pings `/api/session/ping` before any mode loads, for the same reason.
 - `api/common.py`: shared helpers. `records_to_df` coerces edited table cells (non-text columns become numeric, NaN on garbage), so typos can't reach fit code as strings. `guess_channels` maps every numeric column of a plain CSV to a channel. `ExportFmt`/`ExportStyle` are `Literal`s, so a bad export format is a 422, not a matplotlib 500.
 - `api/amperometry.py`, `api/solid_state.py`, `api/cyclic_voltammetry.py`, `api/assay.py`: one router per mode. Every mutating endpoint returns the mode's full `_state()`, and the frontend re-renders from it.
-- `api/session.py`: Tier 2 Export/Import JSON with **the same keys and shape as `core/persistence.py`'s `_build_session_bundle`** (assay included), so sessions move between the two apps both ways. It reuses `_jsonify`/`_plate_df_to_csv`/`_plate_df_from_csv` and `core/calibration_table.py`'s record parsers. Import applies to a deep copy and swaps in only on success.
+- `api/assay_layout.py`: pure Assay helpers with no FastAPI or session code, unit-tested in `tests/web/test_assay_layout.py`:
+  - selection → standards/blank/samples assignment;
+  - subject/timepoint name-list expansion (`P01-P12`, `Day 0 - Day 14 by 7`);
+  - pasted layout grids, per-sample grouping, normalisation, and amount-unit conversion.
+
+  The Assay layout stays Streamlit-compatible:
+  - Standards live in `assay_std_df` (row 0 = blank, ≤3 replicate sets).
+  - Samples live in `assay_sample_df`, with extra `Subject`/`Timepoint` columns Streamlit carries along; `Label` is composed from them when blank.
+  - The normalisation inputs (`assay_norm`) and readout (`assay_readout`) are web-only bundle keys, which Streamlit's import ignores.
+- `api/session.py`: Tier 2 Export/Import JSON with **the same keys and shape as `core/persistence.py`'s `_build_session_bundle`** (assay included, plus the web-only `assay_norm`/`assay_readout` keys), so sessions move between the two apps both ways. It reuses `_jsonify`/`_plate_df_to_csv`/`_plate_df_from_csv` and `core/calibration_table.py`'s record parsers. Import applies to a deep copy and swaps in only on success.
 
 **Frontend (`web_app/static/`)**, no build step:
 - `index.html` holds all four modes' markup, and element ids are the contract with the scripts.
 - `js/app.js` holds the mode/tab switching and shared helpers: `apiCall`, `onClick` (errors become toasts), `download`, `drawPlot`, `renderChecklist` (labels never seen before start checked, so adding a file never blanks a plot), `exportOptions`, and `previewExport`. Plots drawn into a hidden tab are resized when the tab is shown.
-- `js/trace_mode.js` contains `createTraceMode(cfg)`, the shared UI for Amperometry and Solid-State (the web counterpart of `core/shared_tabs.py`). `js/amperometry.js` and `js/solid_state.js` are thin configs. `js/cyclic_voltammetry.js` and `js/assay.js` are standalone.
+- `js/trace_mode.js` contains `createTraceMode(cfg)`, the shared UI for Amperometry and Solid-State (the web counterpart of `core/shared_tabs.py`). `js/amperometry.js` and `js/solid_state.js` are thin configs. `js/cyclic_voltammetry.js` and `js/assay.js` are standalone. `assay.js` builds the ② Plate Layout plate as HTML (not Plotly) so wells can be drag-selected, and gets assignment previews from the server (`preview: true` on the `/assign/*` endpoints) so the labelling rules exist only in Python.
 
 **Lifecycle (`web_app/main.py`):** single instance. The running server's port/pid goes in `~/Library/Application Support/Sensor Calibration Studio/server.json`, and a second launch detects it via `/api/app/info` and just opens the browser. `/api/app/quit` (the header's Quit button) stops uvicorn. Pages POST `/api/app/heartbeat` every 60 s, which drives the optional `WEB_APP_IDLE_SHUTDOWN_MIN` auto-exit.
 

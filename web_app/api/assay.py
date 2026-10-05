@@ -1,6 +1,9 @@
 """
-Assay (96-well microplate) mode API — Import → Standards → Standard Curve →
-Results & Export, matching modes/assay.py's four tabs.
+Assay (96-well microplate) mode API — Import → Layout → Standard Curve →
+Results & Export → Normalise. The first four match modes/assay.py's tabs;
+the plate-layout tools (select wells → standards/blank/samples with subject +
+timepoint labels), per-sample summaries and normalisation are web-only and
+live in web_app/api/assay_layout.py as pure functions.
 
 The pure pieces of modes/assay.py are imported unmodified (parse_plate_csv,
 _plate_get, _well_rc, _fit_4pl, _4pl_inv, render_assay_curve). The standard-
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import os
 import warnings as warnings_mod
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -26,6 +30,7 @@ from pydantic import BaseModel, Field
 from core.constants import _SAMPLE_DATA_DIR, PAL, fmt
 from core.numeric import lin_reg
 from modes.assay import _4pl_inv, _PLATE_ROWS, _fit_4pl, _plate_get, _well_rc, parse_plate_csv, render_assay_curve
+from web_app.api import assay_layout as lay
 from web_app.api.common import ExportFmt, ExportStyle, df_records, export_media_type, figure_json, png_response, records_to_df
 from web_app.deps import get_session
 from web_app.session import SessionData
@@ -33,7 +38,7 @@ from web_app.session import SessionData
 router = APIRouter(prefix="/api/assay", tags=["assay"])
 
 _STD_COLUMNS = ["Label", "Conc", "S1", "S2", "S3"]
-_SAMPLE_COLUMNS = ["Well", "Label"]
+_SAMPLE_COLUMNS = lay.SAMPLE_COLUMNS
 FIT_TYPES = ["Linear", "Quadratic", "4-Parameter Logistic (4PL)"]
 SAMPLE_PLATE = os.path.join(_SAMPLE_DATA_DIR, "assay_plate.csv")
 
@@ -62,13 +67,14 @@ def std_wells_map(std_df: pd.DataFrame) -> dict:
     return m
 
 
+def sample_meta(sample_df: pd.DataFrame) -> dict:
+    """{well: {Label, Subject, Timepoint}} for valid sample wells."""
+    return {r["Well"]: {"Label": r["Label"], "Subject": r["Subject"], "Timepoint": r["Timepoint"]}
+            for r in lay.normalize_sample_df(sample_df).to_dict(orient="records") if _well_rc(r["Well"])}
+
+
 def sample_map(sample_df: pd.DataFrame) -> dict:
-    m: dict = {}
-    for _, r in sample_df.iterrows():
-        w = _norm_well(r.get("Well"))
-        if w and _well_rc(w):
-            m[w] = str(r.get("Label") or w)
-    return m
+    return {w: (m["Label"] or w) for w, m in sample_meta(sample_df).items()}
 
 
 def layout_problems(std_df: pd.DataFrame, sample_df: pd.DataFrame) -> list[str]:
@@ -97,6 +103,11 @@ def layout_problems(std_df: pd.DataFrame, sample_df: pd.DataFrame) -> list[str]:
             problems.append(f"Sample well '{w}' is not a valid well (A1–H12).")
         elif w in seen:
             problems.append(f"Sample well {w} is already used by {seen[w]}.")
+    if len(std_df):
+        c0 = pd.to_numeric(std_df["Conc"].iloc[0], errors="coerce") if "Conc" in std_df else np.nan
+        if pd.notna(c0) and c0 != 0:
+            problems.append(f"The first standards row is used as the blank but has concentration {c0:g}, "
+                            "not 0. Mark the blank wells with Mark as blank.")
     return problems
 
 
@@ -219,8 +230,9 @@ def back_calc(dy: float, fit: dict) -> float:
     return _4pl_inv(dy, fit)
 
 
-def sample_results(plate: pd.DataFrame, res: dict, samples: dict) -> list[dict]:
+def sample_results(plate: pd.DataFrame, res: dict, samples: dict, meta: dict | None = None) -> list[dict]:
     """One row per non-standard well with signal: back-calculated conc + range flag."""
+    meta = meta or {}
     fit = res["fit"]
     blank = float(res["blank_mean"])
     concs = _as_float_array(res["concs"])
@@ -245,7 +257,9 @@ def sample_results(plate: pd.DataFrame, res: dict, samples: dict) -> list[dict]:
                 flag = "> range"
             else:
                 flag = ""
-            rows.append({"Well": well, "Label": samples.get(well, ""), "Signal": sig, "ΔSignal": dy,
+            m = meta.get(well, {})
+            rows.append({"Well": well, "Label": samples.get(well, ""), "Subject": m.get("Subject", ""),
+                         "Timepoint": m.get("Timepoint", ""), "Signal": sig, "ΔSignal": dy,
                          "Conc": conc if np.isfinite(conc) else None, "Flag": flag})
     return rows
 
@@ -389,18 +403,59 @@ def _results_by_well(session: SessionData) -> dict | None:
     return {r["Well"]: r for r in rows}
 
 
+READOUT_UNITS = {"absorbance": "Abs", "fluorescence": "RFU", "luminescence": "RLU"}
+
+
+def readout_text(r: dict) -> str:
+    """'Absorbance, 450 nm' / 'Fluorescence, Ex 485 / Em 528 nm' / 'Luminescence'."""
+    kind = (r.get("type") or "").strip()
+    name = kind.capitalize() if kind else "Signal"
+    if kind == "absorbance" and lay.txt(r.get("wavelength")):
+        return f"{name}, {lay.txt(r['wavelength'])} nm"
+    if kind == "fluorescence" and (lay.txt(r.get("ex")) or lay.txt(r.get("em"))):
+        parts = [f"Ex {lay.txt(r['ex'])}" if lay.txt(r.get("ex")) else "", f"Em {lay.txt(r['em'])}" if lay.txt(r.get("em")) else ""]
+        return f"{name}, {' / '.join(p for p in parts if p)} nm"
+    return name
+
+
+def well_layout(plate: pd.DataFrame | None, std_df: pd.DataFrame, sample_df: pd.DataFrame) -> list[dict]:
+    """One entry per well (A1…H12) for the Layout tab's clickable plate."""
+    stds = std_wells_map(std_df)
+    meta = sample_meta(sample_df)
+    out = []
+    for ri, row_lbl in enumerate(_PLATE_ROWS):
+        for ci in range(12):
+            well = f"{row_lbl}{ci + 1}"
+            v = _plate_get(plate, well)
+            cell = {"well": well, "value": float(v) if np.isfinite(v) else None, "role": "data" if np.isfinite(v) else "empty"}
+            if well in stds:
+                info = stds[well]
+                cell.update(role="blank" if info["is_blank"] else "std", set=info["set"], conc=info["conc"], label=info["label"])
+            elif well in meta:
+                cell.update(role="sample", label=meta[well]["Label"], subject=meta[well]["Subject"],
+                            timepoint=meta[well]["Timepoint"])
+            out.append(cell)
+    return out
+
+
 def _state(session: SessionData) -> dict:
     stds = std_wells_map(session.assay_std_df)
     samples = sample_map(session.assay_sample_df)
     plate = session.assay_plate
     res = session.assay_std_res
+    sdf = lay.normalize_sample_df(session.assay_sample_df)
     return {
         "sig_unit": session.assay_sig_unit,
         "conc_unit": session.assay_conc_unit,
+        "readout": session.assay_readout,
+        "readout_text": readout_text(session.assay_readout),
+        "wells": well_layout(plate, session.assay_std_df, session.assay_sample_df),
+        "subjects": lay.ordered_unique(x for x in sdf["Subject"] if x),
+        "timepoints": lay.ordered_unique(x for x in sdf["Timepoint"] if x),
         "plate": _plate_grid(plate),
         "n_wells": int(plate.notna().sum().sum()) if plate is not None else 0,
         "std_rows": df_records(session.assay_std_df.reindex(columns=_STD_COLUMNS)),
-        "sample_rows": df_records(session.assay_sample_df.reindex(columns=_SAMPLE_COLUMNS)),
+        "sample_rows": df_records(sdf),
         "layout_problems": layout_problems(session.assay_std_df, session.assay_sample_df),
         "plate_figure": figure_json(plate_figure(plate, stds, samples, session.assay_conc_unit,
                                                  session.assay_sig_unit)) if plate is not None else None,
@@ -440,9 +495,14 @@ def load_sample(session: SessionData = Depends(get_session)) -> dict:
     with open(SAMPLE_PLATE, encoding="utf-8") as fh:
         _set_plate(session, parse_plate_csv(fh.read()))
     # The sample plate is laid out to match the default standards table.
-    from web_app.session import default_assay_sample_df, default_assay_std_df
+    from web_app.session import default_assay_norm, default_assay_sample_df, default_assay_std_df
     session.assay_std_df = default_assay_std_df()
-    session.assay_sample_df = default_assay_sample_df()
+    # Demo labelling: subjects P01–P05 (one per row D–H), timepoints D0–D14
+    # in duplicate across columns 1–8.
+    wells = [f"{r}{c}" for r in "DEFGH" for c in range(1, 9)]
+    plan, _ = lay.plan_samples(wells, lay.parse_name_list("P01-P05"), ["D0", "D3", "D7", "D14"], 2, "rows", "subject")
+    _, session.assay_sample_df = lay.assign_samples(session.assay_std_df, default_assay_sample_df(), plan, wells)
+    session.assay_norm = default_assay_norm()
     return _state(session)
 
 
@@ -481,6 +541,25 @@ def set_units(body: UnitsBody, session: SessionData = Depends(get_session)) -> d
     return _state(session)
 
 
+class ReadoutBody(BaseModel):
+    type: Literal["absorbance", "fluorescence", "luminescence", "other"] = "absorbance"
+    wavelength: str = ""
+    ex: str = ""
+    em: str = ""
+
+
+@router.post("/readout")
+def set_readout(body: ReadoutBody, session: SessionData = Depends(get_session)) -> dict:
+    """Changing the readout kind also switches the signal unit to its usual
+    one (Abs/RFU/RLU) — unless the user had typed a custom unit."""
+    old_unit = READOUT_UNITS.get(session.assay_readout.get("type"))
+    if body.type != session.assay_readout.get("type") and body.type in READOUT_UNITS \
+            and session.assay_sig_unit in (old_unit, *READOUT_UNITS.values()):
+        session.assay_sig_unit = READOUT_UNITS[body.type]
+    session.assay_readout = body.model_dump()
+    return _state(session)
+
+
 # -- Standards / layout ------------------------------------------------------------------
 class LayoutBody(BaseModel):
     std_rows: list[dict]
@@ -492,13 +571,130 @@ def set_layout(body: LayoutBody, session: SessionData = Depends(get_session)) ->
     std = records_to_df(body.std_rows, _STD_COLUMNS, text_cols=("Label", "S1", "S2", "S3"))
     for c in ("S1", "S2", "S3"):
         std[c] = std[c].map(_norm_well)
-    samples = records_to_df(body.sample_rows, _SAMPLE_COLUMNS, text_cols=("Well", "Label"))
-    samples["Well"] = samples["Well"].map(_norm_well)
-    samples = samples[samples["Well"] != ""].reset_index(drop=True)
+    samples = records_to_df(body.sample_rows, _SAMPLE_COLUMNS, text_cols=tuple(_SAMPLE_COLUMNS))
+    samples = lay.normalize_sample_df(samples)
     session.assay_std_df = std
     session.assay_sample_df = samples
     session.assay_std_res = None
     return _state(session)
+
+
+class AssignStandardsBody(BaseModel):
+    wells: list[str]
+    direction: Literal["across", "down"] = "across"
+    mode: Literal["serial", "list"] = "serial"
+    top: float | None = None
+    factor: float | None = None
+    include_blank: bool = True
+    lowest_first: bool = False
+    concs_text: str = ""
+    preview: bool = False
+
+
+class AssignSamplesBody(BaseModel):
+    wells: list[str]
+    subjects: str = ""
+    timepoints: str = ""
+    replicates: int = Field(1, ge=1, le=96)
+    order: Literal["rows", "columns"] = "rows"
+    nesting: Literal["subject", "timepoint"] = "subject"
+    preview: bool = False
+
+
+class WellsBody(BaseModel):
+    wells: list[str]
+
+
+class PasteLayoutBody(BaseModel):
+    text: str
+    sep: str = "auto"
+
+
+def _set_layout(session: SessionData, std: pd.DataFrame, samples: pd.DataFrame, message: str) -> dict:
+    session.assay_std_df = std
+    session.assay_sample_df = samples
+    session.assay_std_res = None
+    return {**_state(session), "message": message}
+
+
+def _bad_request(exc: ValueError):
+    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _standards_concs(body: AssignStandardsBody, n_levels: int) -> list[float]:
+    if body.mode == "list":
+        return lay.parse_conc_list(body.concs_text)
+    return lay.serial_concs(n_levels, float(body.top if body.top is not None else np.nan),
+                            float(body.factor if body.factor is not None else np.nan),
+                            body.include_blank, body.lowest_first)
+
+
+@router.post("/assign/standards")
+def assign_standards(body: AssignStandardsBody, session: SessionData = Depends(get_session)) -> dict:
+    try:
+        wells = lay.clean_wells(body.wells)
+        levels = lay.group_levels(wells, body.direction)
+        concs = _standards_concs(body, len(levels))
+        if body.preview:
+            if len(concs) != len(levels):
+                raise ValueError(f"{len(levels)} level(s) selected but {len(concs)} concentration(s) given.")
+            prev = [{"well": w, "role": "blank" if c == 0 else "std", "text": "Blank" if c == 0 else lay.fmt_conc(c),
+                     "sub": f"S{i + 1}"} for c, lv in zip(concs, levels) for i, w in enumerate(lv)]
+            reps = max(len(lv) for lv in levels)
+            return {"preview": prev, "message": f"{len(levels)} level(s) × {reps} replicate(s): "
+                    + ", ".join(lay.fmt_conc(c) for c in concs) + f" {session.assay_conc_unit}"
+                    + ("" if reps <= 3 else " — at most 3 replicates per level are supported.")}
+        std, samples, msg = lay.assign_standards(session.assay_std_df, session.assay_sample_df, wells,
+                                                 body.direction, concs)
+    except ValueError as exc:
+        if body.preview:
+            return {"preview": [], "message": str(exc), "error": True}
+        _bad_request(exc)
+    return _set_layout(session, std, samples, msg)
+
+
+@router.post("/assign/blank")
+def assign_blank(body: WellsBody, session: SessionData = Depends(get_session)) -> dict:
+    try:
+        std, samples, msg = lay.assign_blank(session.assay_std_df, session.assay_sample_df, body.wells)
+    except ValueError as exc:
+        _bad_request(exc)
+    return _set_layout(session, std, samples, msg)
+
+
+@router.post("/assign/samples")
+def assign_samples(body: AssignSamplesBody, session: SessionData = Depends(get_session)) -> dict:
+    try:
+        plan, msg = lay.plan_samples(body.wells, lay.parse_name_list(body.subjects), lay.parse_name_list(body.timepoints),
+                                     body.replicates, body.order, body.nesting)
+        if body.preview:
+            return {"preview": [{"well": p["Well"], "role": "sample", "text": p["Subject"], "sub": p["Timepoint"],
+                                 "subject": p["Subject"]} for p in plan], "message": msg}
+        std, samples = lay.assign_samples(session.assay_std_df, session.assay_sample_df, plan, body.wells)
+    except ValueError as exc:
+        if body.preview:
+            return {"preview": [], "message": str(exc), "error": True}
+        _bad_request(exc)
+    return _set_layout(session, std, samples, f"Labelled {len(plan)} well(s). " + msg)
+
+
+@router.post("/assign/clear")
+def clear_assignment(body: WellsBody, session: SessionData = Depends(get_session)) -> dict:
+    try:
+        std, samples = lay.clear_wells(session.assay_std_df, session.assay_sample_df, body.wells)
+    except ValueError as exc:
+        _bad_request(exc)
+    return _set_layout(session, std, samples, f"Cleared {len(lay.clean_wells(body.wells))} well(s).")
+
+
+@router.post("/layout/paste")
+def paste_layout(body: PasteLayoutBody, session: SessionData = Depends(get_session)) -> dict:
+    try:
+        cells = lay.parse_layout_grid(body.text)
+        std, samples, msg = lay.apply_layout_grid(session.assay_std_df, cells, body.sep)
+    except ValueError as exc:
+        _bad_request(exc)
+    return _set_layout(session, std, samples, msg)
 
 
 # -- Standard curve ----------------------------------------------------------------------
@@ -547,35 +743,200 @@ def _require_result(session: SessionData) -> dict:
     return session.assay_std_res
 
 
+def _well_rows(session: SessionData) -> list[dict]:
+    res = _require_result(session)
+    return sample_results(session.assay_plate, res, sample_map(session.assay_sample_df),
+                          sample_meta(session.assay_sample_df))
+
+
+def summary_figure(groups: list[dict], y: str, sd: str, y_title: str) -> go.Figure:
+    """Mean ± SD per sample. With timepoints: one line per subject across
+    timepoints (in layout order); otherwise one bar per sample."""
+    fig = go.Figure()
+    tps = lay.ordered_unique(g["Timepoint"] for g in groups if g["Timepoint"])
+    if tps:
+        for i, subj in enumerate(lay.ordered_unique(g["Subject"] for g in groups)):
+            gs = sorted((g for g in groups if g["Subject"] == subj and g["Timepoint"]),
+                        key=lambda g: tps.index(g["Timepoint"]))
+            if not gs:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[g["Timepoint"] for g in gs], y=[_nan_none(g[y]) for g in gs], name=subj or "(no subject)",
+                mode="lines+markers", line=dict(color=PAL[i % len(PAL)], width=2), marker=dict(size=8),
+                error_y=dict(type="data", array=[_nan_none(g[sd]) or 0 for g in gs], visible=True, thickness=1.2, width=4),
+            ))
+        fig.update_xaxes(type="category", categoryorder="array", categoryarray=tps, title="Timepoint")
+    else:
+        fig.add_trace(go.Bar(x=[g["Subject"] for g in groups], y=[_nan_none(g[y]) for g in groups],
+                             marker_color="#4c96d7",
+                             error_y=dict(type="data", array=[_nan_none(g[sd]) or 0 for g in groups], visible=True)))
+        fig.update_xaxes(type="category", title="Sample")
+    fig.update_layout(yaxis_title=y_title, height=420, template="plotly_white", hovermode="closest",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=40))
+    return fig
+
+
+def _nan_none(v):
+    return None if v is None or not np.isfinite(v) else float(v)
+
+
+def _summary_rows_display(groups: list[dict], cu: str) -> list[dict]:
+    return [{"Subject": g["Subject"], "Timepoint": g["Timepoint"], "n": g["n"],
+             f"Mean ({cu})": fmt(g["Mean"]), f"SD ({cu})": fmt(g["SD"]), "CV (%)": fmt(g["CV"], 3),
+             "Wells": g["Wells"], "Flag": g["Flag"]} for g in groups]
+
+
 @router.get("/results")
 def results(session: SessionData = Depends(get_session)) -> dict:
-    res = _require_result(session)
+    rows = _well_rows(session)
     samples = sample_map(session.assay_sample_df)
-    rows = sample_results(session.assay_plate, res, samples)
     by_well = {r["Well"]: r for r in rows}
     fig = plate_figure(session.assay_plate, std_wells_map(session.assay_std_df), samples,
                        session.assay_conc_unit, session.assay_sig_unit, results=by_well)
     n_flagged = sum(1 for r in rows if r["Flag"])
+    groups = lay.group_results([r for r in rows if r["Well"] in samples])
+    cu = session.assay_conc_unit
     return {
         "rows": [{**r, "Signal": fmt(r["Signal"]), "ΔSignal": fmt(r["ΔSignal"]),
                   "Conc": fmt(r["Conc"]) if r["Conc"] is not None else "—"} for r in rows],
-        "summary": f"{len(rows)} sample well(s); {n_flagged} outside the standard range or undefined.",
+        "summary": f"{len(rows)} sample well(s) ({len(groups)} labelled sample(s)); "
+                   f"{n_flagged} well(s) outside the standard range or undefined.",
+        "groups": _summary_rows_display(groups, cu),
+        "group_figure": figure_json(summary_figure(groups, "Mean", "SD", f"Concentration ({cu})")) if groups else None,
         "figure": figure_json(fig),
-        "sig_unit": session.assay_sig_unit, "conc_unit": session.assay_conc_unit,
+        "sig_unit": session.assay_sig_unit, "conc_unit": cu,
     }
 
 
+# -- Normalise -----------------------------------------------------------------------------
+class NormaliseBody(BaseModel):
+    area_unit: str = "cm²"
+    vol_unit: str = "µL"
+    rows: list[dict] = []
+
+
+def _norm_inputs(session: SessionData, groups: list[dict]) -> list[dict]:
+    """The stored per-sample inputs, one row per current sample (new samples
+    get blank inputs; inputs for samples no longer on the plate are kept in
+    the session but not shown)."""
+    stored = {(lay.txt(r.get("Subject")), lay.txt(r.get("Timepoint"))): r for r in session.assay_norm.get("rows", [])}
+    out = []
+    for g in groups:
+        r = stored.get((g["Subject"], g["Timepoint"]), {})
+        out.append({"Subject": g["Subject"], "Timepoint": g["Timepoint"],
+                    **{c: _nan_none(lay._num(r.get(c))) for c in ("Dilution", "Volume", "Area")}})
+    return out
+
+
+def _norm_payload(session: SessionData) -> dict:
+    rows = _well_rows(session)
+    samples = sample_map(session.assay_sample_df)
+    groups = lay.group_results([r for r in rows if r["Well"] in samples])
+    norm = session.assay_norm
+    inputs = _norm_inputs(session, groups)
+    out, units = lay.normalise(groups, inputs, session.assay_conc_unit, norm["vol_unit"], norm["area_unit"])
+    cu = session.assay_conc_unit
+    table = []
+    for r, g in zip(out, groups):
+        row = {"Subject": r["Subject"], "Timepoint": r["Timepoint"], "n": r["n"],
+               f"Well conc ({cu})": fmt(g["Mean"]), "Dilution": fmt(r["Dilution"]),
+               f"Sample conc ({cu})": fmt(r["SampleConc"]), f"SD ({cu})": fmt(r["SampleSD"])}
+        if np.isfinite(r["Amount"]) or units["needs_volume"] or any(np.isfinite(x["Amount"]) for x in out):
+            row[f"Amount ({units['amount']})"] = fmt(r["Amount"])
+        row[f"Per area ({units['per_area']})"] = fmt(r["PerArea"])
+        row[f"SD per area ({units['per_area']})"] = fmt(r["PerAreaSD"])
+        row["Flag"] = r["Flag"]
+        table.append(row)
+    has_area = any(np.isfinite(r["PerArea"]) for r in out)
+    fig = summary_figure(out, "PerArea", "PerAreaSD", f"Per area ({units['per_area']})") if has_area else None
+    notes = []
+    if units["needs_volume"]:
+        notes.append("Some samples have a volume and others don't: per-area values are only given where the "
+                     "volume is filled in, so all are in the same units.")
+    if not has_area and groups:
+        notes.append("Enter an area for each sample to get per-area values.")
+    return {"area_unit": norm["area_unit"], "vol_unit": norm["vol_unit"], "conc_unit": cu, "units": units,
+            "inputs": inputs, "table": table, "figure": figure_json(fig) if fig else None, "notes": notes,
+            "n_samples": len(groups)}
+
+
+@router.get("/normalise")
+def get_normalise(session: SessionData = Depends(get_session)) -> dict:
+    return _norm_payload(session)
+
+
+@router.post("/normalise")
+def set_normalise(body: NormaliseBody, session: SessionData = Depends(get_session)) -> dict:
+    df = records_to_df(body.rows, lay.NORM_COLUMNS, text_cols=("Subject", "Timepoint"))
+    bad = [f"{r.Subject} {r.Timepoint}".strip() for r in df.itertuples() if np.isfinite(r.Area) and r.Area <= 0]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Area must be positive (check {', '.join(bad)}).")
+    # Merge into the stored rows so inputs for samples not currently shown survive.
+    stored = {(lay.txt(r.get("Subject")), lay.txt(r.get("Timepoint"))): r for r in session.assay_norm.get("rows", [])}
+    for rec in df_records(df):
+        stored[(rec["Subject"], rec["Timepoint"])] = rec
+    session.assay_norm = {"area_unit": body.area_unit.strip() or "cm²", "vol_unit": body.vol_unit.strip() or "µL",
+                          "rows": list(stored.values())}
+    return _norm_payload(session)
+
+
 # -- Export --------------------------------------------------------------------------------
+def _csv_response(df: pd.DataFrame, filename: str, session: SessionData, extra: str = "") -> object:
+    text = df.to_csv(index=False) + f"\n# Readout: {readout_text(session.assay_readout)}\n" + extra
+    return png_response(text.encode("utf-8"), filename, "text/csv")
+
+
 @router.get("/export/results-csv")
 def export_results_csv(session: SessionData = Depends(get_session)):
-    res = _require_result(session)
-    rows = sample_results(session.assay_plate, res, sample_map(session.assay_sample_df))
+    rows = _well_rows(session)
     if not rows:
         raise HTTPException(status_code=400, detail="No sample wells found (every well with data is a standard).")
     su, cu = session.assay_sig_unit, session.assay_conc_unit
-    df = pd.DataFrame([{"Well": r["Well"], "Label": r["Label"], f"Signal ({su})": r["Signal"],
-                        f"ΔSignal ({su})": r["ΔSignal"], f"Conc ({cu})": r["Conc"], "Flag": r["Flag"]} for r in rows])
-    return png_response(df.to_csv(index=False).encode("utf-8"), "assay_results.csv", "text/csv")
+    df = pd.DataFrame([{"Well": r["Well"], "Label": r["Label"], "Subject": r["Subject"], "Timepoint": r["Timepoint"],
+                        f"Signal ({su})": r["Signal"], f"ΔSignal ({su})": r["ΔSignal"], f"Conc ({cu})": r["Conc"],
+                        "Flag": r["Flag"]} for r in rows])
+    return _csv_response(df, "assay_results.csv", session)
+
+
+def _groups(session: SessionData) -> list[dict]:
+    samples = sample_map(session.assay_sample_df)
+    groups = lay.group_results([r for r in _well_rows(session) if r["Well"] in samples])
+    if not groups:
+        raise HTTPException(status_code=400, detail="No labelled samples — label sample wells on ② Layout first.")
+    return groups
+
+
+@router.get("/export/summary-csv")
+def export_summary_csv(wide: bool = False, session: SessionData = Depends(get_session)):
+    """Per-sample mean/SD/CV. wide=true: subjects × timepoints of the mean
+    (the shape GraphPad Prism / Excel charts want)."""
+    groups = _groups(session)
+    cu = session.assay_conc_unit
+    if wide:
+        tps = lay.ordered_unique(g["Timepoint"] for g in groups)
+        subjects = lay.ordered_unique(g["Subject"] for g in groups)
+        means = {(g["Subject"], g["Timepoint"]): g["Mean"] for g in groups}
+        df = pd.DataFrame([{"Subject": s, **{(t or "Mean"): means.get((s, t), np.nan) for t in tps}} for s in subjects])
+        return _csv_response(df, "assay_summary_wide.csv", session, f"# Values: mean concentration ({cu})\n")
+    df = pd.DataFrame([{"Subject": g["Subject"], "Timepoint": g["Timepoint"], "n": g["n"], f"Mean ({cu})": g["Mean"],
+                        f"SD ({cu})": g["SD"], "CV (%)": g["CV"], "Wells": g["Wells"], "Flag": g["Flag"]} for g in groups])
+    return _csv_response(df, "assay_summary.csv", session)
+
+
+@router.get("/export/normalised-csv")
+def export_normalised_csv(session: SessionData = Depends(get_session)):
+    _groups(session)
+    p = _norm_payload(session)
+    out, units = lay.normalise(lay.group_results([r for r in _well_rows(session) if r["Well"] in sample_map(session.assay_sample_df)]),
+                               p["inputs"], p["conc_unit"], p["vol_unit"], p["area_unit"])
+    cu, au, pu = p["conc_unit"], units["amount"], units["per_area"]
+    df = pd.DataFrame([{"Subject": r["Subject"], "Timepoint": r["Timepoint"], "n": r["n"], "Dilution": r["Dilution"],
+                        f"Volume ({p['vol_unit']})": r["Volume"], f"Area ({p['area_unit']})": r["Area"],
+                        f"Sample conc ({cu})": r["SampleConc"], f"SD ({cu})": r["SampleSD"],
+                        f"Amount ({au})": r["Amount"], f"Amount SD ({au})": r["AmountSD"],
+                        f"Per area ({pu})": r["PerArea"], f"Per area SD ({pu})": r["PerAreaSD"], "Flag": r["Flag"]}
+                       for r in out])
+    return _csv_response(df, "assay_normalised.csv", session)
 
 
 @router.get("/export/standards-csv")
@@ -587,8 +948,8 @@ def export_standards_csv(session: SessionData = Depends(get_session)):
         f"Set 1 ({su})": res["raw_arr"][i][0], f"Set 2 ({su})": res["raw_arr"][i][1], f"Set 3 ({su})": res["raw_arr"][i][2],
         f"Mean Δ ({su})": res["means"][i], f"SD ({su})": res["sds"][i],
     } for i in range(len(res["concs"]))]
-    text = pd.DataFrame(rows).to_csv(index=False) + f"\n# Fit: {fit_equation(res['fit'])}\n# Blank mean: {res['blank_mean']:.6g} {su}\n"
-    return png_response(text.encode("utf-8"), "standard_curve_data.csv", "text/csv")
+    return _csv_response(pd.DataFrame(rows), "standard_curve_data.csv", session,
+                         f"# Fit: {fit_equation(res['fit'])}\n# Blank mean: {res['blank_mean']:.6g} {su}\n")
 
 
 class ExportCurveBody(BaseModel):
