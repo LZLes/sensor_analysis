@@ -72,16 +72,23 @@ def parse_plate_csv(raw: str) -> pd.DataFrame:
                     oversize_rows.add(om.group(1).upper())
             continue
         letter = m.group(1).upper()
-        parts  = _re.split(r'[,;\t]+', line.strip())
-        if len(parts) < 2:
-            parts = line.strip().split()
+        # Split on ONE delimiter (not a run of them) so an empty well keeps
+        # its column position — "A,0.1,,0.3" is A1=0.1, A2=empty, A3=0.3,
+        # not A2=0.3. Semicolon before comma: semicolon-delimited exports
+        # use comma decimals.
+        stripped = line.strip()
+        delim = next((d for d in ("\t", ";", ",") if d in stripped), None)
+        parts = stripped.split(delim) if delim else stripped.split()
+        cells = parts[1:]
+        while cells and not _is_plate_num(cells[-1]):   # trailing delimiters / row labels
+            cells.pop()
         nums: list[float] = []
-        for p in parts[1:]:
+        for p in cells:
             try:
                 nums.append(float(p.strip().replace(",", ".")))
             except ValueError:
-                continue
-        if nums:
+                nums.append(np.nan)   # blank / "OVER" / text: keep the slot
+        if any(np.isfinite(nums)):
             if len(nums) > 12:
                 raise ValueError(
                     f"Row {letter} has {len(nums)} numeric columns — this parser "
@@ -674,7 +681,7 @@ def render() -> None:
                                 f"Mean Δ ({SS['assay_sig_unit']})":     fmt(_my3[_ki3]),
                                 f"SD ({SS['assay_sig_unit']})":         _sd_cell(_sy3[_ki3], _nrep3),
                                 "CV (%)": fmt(abs(_sy3[_ki3] / _my3[_ki3]) * 100
-                                              if np.isfinite(_my3[_ki3]) and _my3[_ki3] != 0 else np.nan, 2),
+                                              if _ki3 > 0 and np.isfinite(_my3[_ki3]) and _my3[_ki3] != 0 else np.nan, 2),
                             })
                         st.dataframe(pd.DataFrame(_a3_tbl_mid),
                                      use_container_width=True, hide_index=True)
@@ -695,7 +702,7 @@ def render() -> None:
                             f"SD ({SS['assay_sig_unit']})": (fmt(_sy3[_ki3]) if np.isfinite(_sy3[_ki3])
                                                               else ("n=1" if _nrep3s == 1 else "—")),
                             "CV (%)": fmt(abs(_sy3[_ki3] / _my3[_ki3]) * 100
-                                          if np.isfinite(_my3[_ki3]) and _my3[_ki3] != 0 else np.nan, 2),
+                                          if _ki3 > 0 and np.isfinite(_my3[_ki3]) and _my3[_ki3] != 0 else np.nan, 2),
                         })
                     st.dataframe(pd.DataFrame(_a3_tbl), use_container_width=True, hide_index=True)
     

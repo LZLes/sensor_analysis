@@ -76,11 +76,11 @@ def render() -> None:
     
         def _render_cv_plot(figsize, fmt, dpi, rc, style):
             """All-runs CV plot (Viridis by scan rate, dash by channel)."""
-            import matplotlib.cm as _mcm
             with matplotlib.rc_context(rc):
                 _fg, _ax = plt.subplots(figsize=figsize)
                 _n = len(SS.cv_runs)
-                _cm = _mcm.get_cmap("viridis", max(1, _n))
+                # matplotlib.cm.get_cmap was removed in Matplotlib 3.9.
+                _cm = matplotlib.colormaps["viridis"].resampled(max(1, _n))
                 for _ri, _rn in enumerate(SS.cv_runs):
                     _cl = _cm(_ri / max(1, _n - 1))
                     for _ci, _ch in enumerate(_rn["channels"]):

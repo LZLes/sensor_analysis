@@ -281,7 +281,7 @@ def _parse_one_file(_up, _fi: int, key_prefix: str = "amp") -> tuple[pd.DataFram
     return _df, []
 
 
-# ── Non-Streamlit callers (e.g. macos_app/) ─────────────────────────────────
+# ── Non-Streamlit callers (e.g. web_app/) ─────────────────────────────────────
 # Added alongside _parse_one_file rather than refactoring it, so the
 # Streamlit UI above is untouched. Same parsing behavior, format/delimiter/
 # skip-rows passed in directly instead of read from st widgets.
