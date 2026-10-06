@@ -1,97 +1,130 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for working in this repo. `README.md` has end-user install/run instructions; this file covers the rules that aren't visible from the code, how to check your work, and where things live. When the code and this file disagree, trust the code and fix this file.
 
 ## What this is
 
-Sensor Calibration Studio — importing multi-channel electrochemical sensor data (amperometry, potentiometric/solid-state, cyclic voltammetry) and microplate assay data, defining calibration windows, fitting calibration curves, and exporting results/plots. Single-user lab tool, no backend/database.
+Sensor Calibration Studio is a single-user lab tool. It imports electrochemical sensor data (amperometry, potentiometric/solid-state, cyclic voltammetry) and 96-well microplate assays, fits calibration curves, and exports results and plots. There is no backend database and no auth.
 
-There are **two independent UIs sharing the same `core/` computation layer**, and both cover all four modes (Amperometry, Solid-State, Cyclic Voltammetry, Assay):
-- The **Streamlit app** (`app.py` + `modes/`): all state lives in the Streamlit session and the user's browser. See "Streamlit app architecture" below.
-- A **local web app** (`web_app/`): FastAPI + plain JS + Plotly.js, localhost-only. It reuses `core/`'s pure functions and each mode's fit math directly rather than duplicating them. See "Local web app" below.
+It has two independent UIs over one computation layer, and both cover all four modes:
+- **Streamlit app**: `app.py` plus `modes/<mode>.py`. Each module has a `render()`, dispatched from `MODES` in `app.py`.
+- **Local web app**: `web_app/`. FastAPI on 127.0.0.1, plain JS and Plotly.js, no build step. It runs without Streamlit installed.
+- **Shared code** in `core/`. The fit maths for every mode is in `core/analysis/`, which never imports Streamlit.
 
-See `README.md` for end-user install/run instructions for both. This file is architecture guidance for working in the code.
+## Environment and commands
 
-## Commands
+The dev environment is `.venv-web/` (Python 3.13), which has everything installed: Streamlit, the web app, pytest, ruff and Playwright.
 
 ```bash
-# Streamlit app
-pip install -r requirements.txt
-streamlit run app.py                 # runs on localhost:8501
-
-# Tests (exercise core/ and modes/ via Streamlit's AppTest harness — see tests/conftest.py)
-pip install -r requirements-dev.txt
-pytest tests/unit                    # fast, no browser/AppTest involved
-pytest tests/e2e tests/regression    # AppTest-driven, slower
-pytest                               # everything
-
-# Local web app (http://127.0.0.1:8000, next free port if busy)
-pip install -r requirements.txt -r requirements-web.txt
-python -m web_app.main
-pytest tests/web                     # FastAPI TestClient tests for web_app/
+.venv-web/bin/ruff check .                     # lint (config in pyproject.toml)
+.venv-web/bin/python -m pytest -q              # everything (~200 tests, ~20 s)
+.venv-web/bin/python -m pytest tests/unit      # pure functions
+.venv-web/bin/python -m pytest tests/web       # web app API (FastAPI TestClient)
+.venv-web/bin/python -m pytest tests/browser   # real Chromium via Playwright; skipped if not installed
+.venv-web/bin/python -m web_app.main           # web app on http://127.0.0.1:8000 (next free port if busy)
+.venv-web/bin/python -m streamlit run app.py   # Streamlit app on :8501
+./packaging/build_mac_app.sh                   # rebuild /Applications/Sensor Calibration Studio.app
 ```
 
-There is no linter or build step configured for the Streamlit app.
+CI (`.github/workflows/tests.yml`) runs four jobs: lint, the full suite on 3.11 and 3.13, the web tests with only `requirements-web.txt` installed (no Streamlit), and the browser tests.
 
-The devcontainer (`.devcontainer/devcontainer.json`) runs the same `streamlit run` command with CORS/XSRF disabled for Codespaces preview.
+## Rules, and why
 
-## Streamlit app architecture
+1. **Sessions must move between the two apps both ways.**
+   - The Export/Import JSON bundle uses the keys of `core/persistence.py`'s `_build_session_bundle`. The web app writes them from each mode's `ModeSpec.export_bundle`.
+   - Web-only data goes under extra keys, which Streamlit ignores: `assay_norm`, `assay_readout`, `assay_plates`, `assay_active`.
+   - Never change the shape of an existing key.
+   - The assay's flat keys describe the active plate in Streamlit's schema: standards columns S1–S3 only, and `assay_std_res` set to `None` when that fit can't be expressed there (more than 3 replicates, or a borrowed curve).
+   - Tests in `tests/web/test_assay_features.py` pin this behaviour.
+2. **Don't refactor the Streamlit `render()` functions to suit the web app.**
+   - When the web app needs logic that is tangled with Streamlit widgets, write a pure version in `core/analysis/`.
+   - Pure top-level helpers moved out of `modes/` stay importable from there through re-exports (`from core.analysis.x import (...)  # noqa: F401`), so tests and old imports keep working.
+   - Bug fixes to shared pure functions are welcome. Run the full suite afterwards.
+3. **`core/analysis/`, `core/serialization.py` and all of `web_app/` must not import Streamlit or `modes/`.**
+   - `tests/web/test_shell.py` blocks the import and checks this.
+   - `web_app/__init__.py` sets Matplotlib to `Agg`. Exports are drawn in worker threads, and the default macOS backend crashes there. Streamlit used to set this as a side effect.
+4. **Business rules live in Python only.**
+   - Labelling, fitting, grouping and normalisation rules are not re-implemented in JS.
+   - The page asks the server, e.g. the `/assign/*` endpoints with `preview: true` return the result without saving it.
+5. **Every web endpoint that changes data returns the mode's full state.** The page re-renders from that state.
+   - Decorate an endpoint with `@tracked(mode_id, UNDO_FIELDS)` (`web_app/history.py`) when users would expect to undo what it does.
+   - Don't decorate previews, exports or plate switching.
+6. **Keep the Streamlit app working.** It has features the web app doesn't: Google Drive "Cloud Sessions", Ollama "AI Insights" and browser-localStorage settings.
 
-**Entry point:** [app.py](app.py) only handles page chrome shared across all modes — sidebar (mode switcher + the three persistence mechanisms below) and dispatch to whichever mode is selected in `SS.mode`. All actual feature code lives in `core/` (shared infrastructure) and `modes/` (one file per analysis mode, each with a `render()` entry point that `app.py` calls).
+## Architecture
 
-**The four modes** (`modes/amperometry.py`, `modes/solid_state.py`, `modes/cyclic_voltammetry.py`, `modes/assay.py`) are largely independent verticals — each owns its own tabs, calibration-table schema, and fit math. `amperometry.py` and `solid_state.py` are the most similar (both are trace-based, time-windowed calibrations) and share their Import/Time-Series tab code via `core/shared_tabs.py`; don't duplicate logic between them that could live there instead. Key differences called out in their module docstrings: Amperometry does baseline subtraction, segmented-linear fits, and has the effective-concentration dilution calculator; Solid-State does Nernstian (E vs log-concentration) fits and has neither. `cyclic_voltammetry.py` and `assay.py` (4PL microplate curves) are standalone.
+**`core/`**
+- `analysis/` holds the per-mode maths: `amperometry`, `solid_state`, `cv`, `assay`, `assay_layout` and `traces`.
+  - Each module holds that mode's fits, sample data and Matplotlib export builders.
+  - `assay_layout.py` holds the web-only plate-layout editing, grouping and normalisation.
+- `parsing.py`, `step_detection.py`, `calibration_table.py`, `numeric.py`, `plotting.py` and `constants.py` are pure helpers shared by both apps. `_plot_theme()` and `_parse_one_file()` import Streamlit lazily.
+- `state.py`, `persistence.py`, `shared_tabs.py`, `drive.py` and `ai_insights.py` are Streamlit-only.
+- The Streamlit app persists data in three tiers, documented in the `persistence.py` docstring: browser localStorage settings, Export/Import JSON, and Google Drive.
 
-**`core/` modules and their roles:**
-- `state.py` — single flat dict of session-state defaults for *all* modes, initialized once at startup. Centralized deliberately so switching `SS.mode` never `KeyError`s on a key only another mode's file defines.
-- `parsing.py` — file ingestion: standard CSV, multi-channel potentiostat exports (Bio-Logic/CH Instruments-style, with metadata/channel-label/units header rows), and PalmSens `.pssession` (zipped XML, tries 3 layouts).
-- `step_detection.py` — pure/mode-agnostic derivative-based edge detection to auto-suggest calibration window boundaries from a trace, instead of the user reading start/end times off the chart by eye.
-- `calibration_table.py` — the amperometry calibration-table (`cpdf`) schema/builders; lives in `core/` rather than `modes/amperometry.py` specifically so `core/persistence.py` can use it without a `modes → core → modes` import cycle.
-- `persistence.py` — three separate persistence tiers, each with a different payload (see below).
-- `drive.py` — optional Google Drive "Cloud Sessions" backend; degrades to disabled (not a crash) if Drive libs are missing/broken or secrets aren't configured — notably catches `BaseException` on import since a broken crypto backend can raise a non-`Exception` pyo3 panic.
-- `ai_insights.py` — optional local-Ollama "AI Insights" panel shared by Amperometry/Solid-State; sends only computed fit statistics, never raw trace data, to a locally-running model.
-- `numeric.py`, `plotting.py`, `constants.py` — generic signal/regression helpers, shared matplotlib export presets (`origin`/`minimal`/`default` styles used across every mode's PNG export), and shared color palette/theme/formatting helpers.
+**`web_app/`**
+- **Mode registry.**
+  - `registry.py` lists the modes.
+  - `modespec.py` defines `ModeSpec`: id, label, router, `state()`, bundle export/apply, `summary()`, `undo_fields`, `report()` and shared scripts.
+  - Nothing outside a mode's own files names a mode. `main.py` mounts the routers from the registry, and the page builds its nav from `/api/app/modes`.
+- **Session.**
+  - `session.py`'s `SessionData` is in-memory and keyed by an httponly cookie. Its field names mirror `core/state.py`.
+  - New modes keep their state in `session.mode_state(id, factory)`, unless it must round-trip with Streamlit.
+  - `SessionStore` reuses an unknown but well-formed cookie id. After a server restart, the page's parallel requests then share one fresh session.
+- **Shell modules.**
+  - `history.py`: undo/redo stacks per mode. Snapshots copy the fields but share the raw imported trace frames (`"df"` keys).
+  - `autosave.py`: writes `autosave.json` a few seconds after any change. On startup the previous file is rotated to `autosave-previous.json`, and an empty session is offered it to restore.
+  - `report.py`: printable HTML built from `ModeSpec.report` sections.
+  - `storage.py`: the data folder. `SCS_DATA_DIR` overrides it, and the tests set it.
+- **`main.py`.**
+  - Host/Origin checks against DNS rebinding and cross-site POSTs.
+  - Middleware that adds `X-Undo: <undo>,<redo>` to every mode response and marks the session dirty for autosave.
+  - Lifecycle: single instance via `server.json`, Quit, heartbeat and idle shutdown.
+- **`api/`.**
+  - One router per mode, prefixed `/api/<mode id>`. The id is the same everywhere: URL, DOM `mode-<id>`, `static/modes/<id>.html` and `static/js/<id>.js`.
+  - `api/session.py` handles Export/Import, `api/shell.py` handles modes/undo/report/autosave, and `api/common.py` holds request coercion and export helpers.
+- **Assay plates.**
+  - The active plate lives in the flat `assay_*` fields, which keeps both Streamlit compatibility and the single-plate code paths.
+  - `plates(session)` returns every plate with the active one refreshed.
+  - Results and Normalise pool all plates.
+- **Frontend (`static/`).**
+  - `index.html` is only the shell.
+  - `js/app.js` boots the modes: it builds the nav and sections, loads each `modes/<id>.html` fragment, then the scripts.
+  - It also holds the shared helpers (`apiCall`, `onClick`, `download`, `drawPlot`, `renderChecklist`, `exportOptions`, `previewExport`) and undo/report/restore.
+  - Each mode script calls `registerMode(id, {refresh})`.
+  - `js/trace_mode.js` is the shared Amperometry/Solid-State UI.
+  - The Assay plate in ② is HTML rather than Plotly, so wells can be drag-selected.
 
-**Persistence has three distinct tiers with different payloads** (see `core/persistence.py` docstring) — know which one a change affects:
-1. **Save** (button in sidebar) → browser `localStorage` via `streamlit_local_storage`. Settings/units only, no raw trace data or calibration tables (keeps well under browser storage quotas). Auto-loaded on next visit to the same browser.
-2. **Export/Import JSON** → full session bundle including embedded CSV text of uploaded amperometry files and their per-file calibration tables, downloadable/shareable as one file.
-3. **Cloud Sessions** (optional, Google Drive) → same full bundle as #2, saved to a shared Drive folder (requires `gcp_service_account` + `gdrive_folder_id` in `.streamlit/secrets.toml`; see `.streamlit/secrets.toml.example` for setup steps).
+**`packaging/`.** `build_mac_app.sh` compiles a stay-open AppleScript applet. It bundles `web_app/`, `core/` and `sample_data/` plus a venv built from `requirements-web.txt` alone. The applet must keep running while the server runs, because macOS kills processes an app spawned once the app exits. See the comments in the script and in `app.applescript`.
 
-Calibration tables are **per-file**, not shared across an upload batch — each entry in `SS.amp_files`/`SS.solid_files` carries its own `cpdf` (calibration-points DataFrame). `core/persistence.py`'s docstring notes this persistence layer deliberately hardcodes each mode's keys directly rather than a generic per-mode-hook abstraction, and that `solid_unit`/multi-file solid-state data don't fully round-trip through all three tiers yet — check current behavior before assuming symmetry with amperometry.
+## Adding a mode to the web app
 
-The plotting stack is split: **Plotly** for interactive in-app charts, **Matplotlib** (headless `Agg` backend, set at the top of `app.py` before any other import touches `pyplot`) for publication-style PNG/SVG/PDF export, via the shared rc-context presets in `core/plotting.py`.
+1. Add the maths to `core/analysis/<id>.py` (pure, no Streamlit), with unit tests in `tests/unit/`.
+2. Create `web_app/api/<id>.py` containing:
+   - `router = APIRouter(prefix="/api/<id>")`;
+   - a `_state(session)`;
+   - bundle hooks, with keys namespaced `<id>_…`;
+   - `MODE = ModeSpec(...)`.
+   Add `undo_fields` and `report` if they make sense.
+3. Add `web_app/static/modes/<id>.html` (the section's markup, ids prefixed with the mode) and `web_app/static/js/<id>.js`, which ends with `registerMode("<id>", {refresh})`.
+4. Add one line to `web_app/registry.py`.
 
-Secrets (`.streamlit/secrets.toml`) are gitignored; only `.example` is committed.
+`tests/web/test_shell.py::test_every_registered_mode_has_its_files_and_hooks` checks the files and hooks exist. Add API tests in `tests/web/`, and a browser test if the mode has drag/paste/keyboard interactions.
 
-Tests (`tests/`) exercise this code via Streamlit's `AppTest` harness rather than mocking `pandas`/`numpy`/`scipy`/`streamlit` — `tests/unit/` targets `core/`/`modes/` pure functions directly, `tests/e2e/` drives each mode's `render()` through `AppTest.from_function` (bypassing `app.py`'s sidebar/localStorage-loading code, which hangs under `AppTest` — see `tests/conftest.py`'s docstring), and `tests/regression/test_known_bugs.py` pins specific fixed bugs so they can't silently reappear.
+## Checking your work
 
-## Local web app
+- Run `ruff check .` and the full `pytest` after any Python change, and always after touching `core/` or `modes/`, because both apps depend on them.
+- For UI changes, run `pytest tests/browser`. Fixtures there fail a test on any console error. For layout changes, also look at a screenshot: tests don't catch visual regressions.
+- After a change to the session bundle, export from the web app and import into Streamlit, and the reverse. A quick check: load the bundle through Streamlit's `AppTest` with `_apply_session_bundle` and render the mode.
+- To update the installed Mac app, re-run `./packaging/build_mac_app.sh`. The installed app runs its own copy of the code, so a dev server started while it's running just opens the app's tab.
 
-`web_app/` is a second UI for the same computation layer: a FastAPI server (`web_app/main.py`, bound to 127.0.0.1 only, no auth, single user) serving a static page (`web_app/static/`) that talks to a JSON API. Its runtime deps are in `requirements-web.txt`. It never runs a Streamlit server, but it imports `modes/*.py`, which import `streamlit` at module level, so streamlit must be installed.
+## Gotchas
 
-**Keep the Streamlit app working.** `web_app/` imports pure functions from `core/` and `modes/` (fit math, parsers, `step_detection.py`, `calibration_table.py`, PNG-export builders like `render_cal_png`/`render_assay_curve`, `parse_plate_csv`) unmodified. When logic it needs is tangled up with Streamlit widget calls (e.g. Assay's standard-curve fit and back-calculation live inline in `modes/assay.py`'s `render()`; anything calling `core/constants.py`'s `_plot_theme()` reads the Streamlit theme), reimplement it as pure code in the web-app router (see `web_app/api/assay.py`'s docstring). Don't refactor the Streamlit render functions to suit the web app. Bug fixes to shared pure functions are fine and benefit both UIs; run the full test suite after any change to `core/` or `modes/`.
+- **AppTest scripts:** `AppTest.from_function` scripts are run from their source text, so every import must be inside the function. Ruff's F811 auto-fix deletes those inner imports. Remove the duplicate module-level import instead.
+- **AppTest and `app.py`:** `app.py` hangs under AppTest because of the localStorage component, so the e2e tests drive `modes.<x>.render()` directly. `tests/conftest.py` also patches an AppTest segmented-control bug.
+- **CSS `[hidden]`:** the global `[hidden] { display: none !important }` rule is load-bearing. Many components set `display: flex`, which would otherwise override `hidden`.
+- **Plotly in hidden tabs:** Plotly sizes charts at draw time, so charts drawn into a hidden tab are resized when the tab is shown (`resizePlotsIn`).
+- **Running pytest:** use `python -m pytest` so the repo root is on `sys.path`. `tests/` has no `__init__.py`, and browser helpers are imported as `browser_helpers`.
 
-**Backend (`web_app/`):**
-- `session.py`: `SessionData`, an in-memory per-browser session keyed by an httponly cookie. Field names mirror `core/state.py`'s keys. `SessionStore.get_or_create` reuses an unknown-but-well-formed cookie id, so after a server restart the page's parallel requests land in one fresh session. `static/js/app.js` also pings `/api/session/ping` before any mode loads, for the same reason.
-- `api/common.py`: shared helpers. `records_to_df` coerces edited table cells (non-text columns become numeric, NaN on garbage), so typos can't reach fit code as strings. `guess_channels` maps every numeric column of a plain CSV to a channel. `ExportFmt`/`ExportStyle` are `Literal`s, so a bad export format is a 422, not a matplotlib 500.
-- `api/amperometry.py`, `api/solid_state.py`, `api/cyclic_voltammetry.py`, `api/assay.py`: one router per mode. Every mutating endpoint returns the mode's full `_state()`, and the frontend re-renders from it.
-- `api/assay_layout.py`: pure Assay helpers with no FastAPI or session code, unit-tested in `tests/web/test_assay_layout.py`:
-  - selection → standards/blank/samples assignment;
-  - subject/timepoint name-list expansion (`P01-P12`, `Day 0 - Day 14 by 7`);
-  - pasted layout grids, per-sample grouping, normalisation, and amount-unit conversion.
+## Git
 
-  The Assay layout stays Streamlit-compatible:
-  - Standards live in `assay_std_df` (row 0 = blank, ≤3 replicate sets).
-  - Samples live in `assay_sample_df`, with extra `Subject`/`Timepoint` columns Streamlit carries along; `Label` is composed from them when blank.
-  - The normalisation inputs (`assay_norm`) and readout (`assay_readout`) are web-only bundle keys, which Streamlit's import ignores.
-- `api/session.py`: Tier 2 Export/Import JSON with **the same keys and shape as `core/persistence.py`'s `_build_session_bundle`** (assay included, plus the web-only `assay_norm`/`assay_readout` keys), so sessions move between the two apps both ways. It reuses `_jsonify`/`_plate_df_to_csv`/`_plate_df_from_csv` and `core/calibration_table.py`'s record parsers. Import applies to a deep copy and swaps in only on success.
-
-**Frontend (`web_app/static/`)**, no build step:
-- `index.html` holds all four modes' markup, and element ids are the contract with the scripts.
-- `js/app.js` holds the mode/tab switching and shared helpers: `apiCall`, `onClick` (errors become toasts), `download`, `drawPlot`, `renderChecklist` (labels never seen before start checked, so adding a file never blanks a plot), `exportOptions`, and `previewExport`. Plots drawn into a hidden tab are resized when the tab is shown.
-- `js/trace_mode.js` contains `createTraceMode(cfg)`, the shared UI for Amperometry and Solid-State (the web counterpart of `core/shared_tabs.py`). `js/amperometry.js` and `js/solid_state.js` are thin configs. `js/cyclic_voltammetry.js` and `js/assay.js` are standalone. `assay.js` builds the ② Plate Layout plate as HTML (not Plotly) so wells can be drag-selected, and gets assignment previews from the server (`preview: true` on the `/assign/*` endpoints) so the labelling rules exist only in Python.
-
-**Lifecycle (`web_app/main.py`):** single instance. The running server's port/pid goes in `~/Library/Application Support/Sensor Calibration Studio/server.json`, and a second launch detects it via `/api/app/info` and just opens the browser. `/api/app/quit` (the header's Quit button) stops uvicorn. Pages POST `/api/app/heartbeat` every 60 s, which drives the optional `WEB_APP_IDLE_SHUTDOWN_MIN` auto-exit.
-
-**macOS app (`packaging/`):** `build_mac_app.sh` compiles `app.applescript` into a stay-open applet. It copies `web_app/`, `core/`, `modes/` and `sample_data/` plus a fresh venv (built from `requirements-web.txt`, reused while the requirements hash matches) into `Contents/Resources`, swaps in `AppIcon.icns`, and ad-hoc re-signs. The applet runs `start-server.sh` and must stay running while the server runs: macOS kills processes an app spawned, even setsid'd or bootstrapped launchd jobs, once the app process exits, so a launch-and-exit wrapper doesn't work. Its `idle` handler quits the applet when the server stops, and its `quit` handler stops the server. The bundle is self-contained so it never reads `~/Documents` (TCC-protected) at launch. Code changes need a re-run of the build script.
-
-Tier 1 (browser localStorage settings) and Tier 3 (Google Drive) persistence, and Ollama AI Insights, are Streamlit-only.
+Work on a feature branch. Write prose commit messages that explain why. Don't push or open PRs unless asked. Secrets (`.streamlit/secrets.toml`) are gitignored; only the `.example` file is committed.

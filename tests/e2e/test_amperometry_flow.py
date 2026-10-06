@@ -3,8 +3,6 @@ AppTest script-runner (button clicks, form submits, reruns) rather than
 calling internal functions directly — catches the class of bug unit tests
 can't (e.g. a widget kwarg removed by a Streamlit upgrade, which only
 surfaces when the widget actually renders)."""
-import numpy as np
-import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 

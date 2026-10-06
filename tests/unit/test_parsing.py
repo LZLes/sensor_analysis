@@ -1,7 +1,6 @@
 import io
 import zipfile
 
-import numpy as np
 import pytest
 
 from core.parsing import parse_potentiostat_csv, parse_pssession, _ps_unit

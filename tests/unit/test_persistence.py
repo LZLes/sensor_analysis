@@ -4,7 +4,6 @@ _build_session_bundle/_apply_session_bundle (Export/Import JSON and Cloud
 Sessions tier) — exercised here via json.dumps(..., default=str) +
 json.loads, matching exactly how app.py serializes them, so a numpy-typed
 leaf that default=str would silently stringify gets caught."""
-import json
 
 import pytest
 from streamlit.testing.v1 import AppTest

@@ -4,8 +4,6 @@ session-state keys, so configuring one mode silently leaked into the other.
 Drives both modes' render() in sequence within one session (matching how
 app.py's single script dispatches whichever mode is selected) to prove they
 no longer collide."""
-import numpy as np
-import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
