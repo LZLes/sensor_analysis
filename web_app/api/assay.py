@@ -1,24 +1,32 @@
 """
 Assay (96-well microplate) mode API — Import → Layout → Standard Curve →
-Results & Export → Normalise. The first four match modes/assay.py's tabs;
-the plate-layout tools (select wells → standards/blank/samples with subject +
-timepoint labels), per-sample summaries and normalisation are web-only and
-live in web_app/api/assay_layout.py as pure functions.
+Results → Normalise & Export. The maths lives in core/analysis/assay.py
+(curve fit, back-calculation, QC) and core/analysis/assay_layout.py (layout
+editing, grouping, normalisation); this module holds session handling,
+figures and endpoints.
 
-The pure pieces of modes/assay.py are imported unmodified (parse_plate_csv,
-_plate_get, _well_rc, _fit_4pl, _4pl_inv, render_assay_curve). The standard-
-curve fit and back-calculation live inline in that module's Streamlit
-render() (not importable), so they're reimplemented here as pure functions
-with the same rules: the FIRST standards row is the blank, its mean is
-subtracted from every well, and the blank is excluded from the fit itself.
-_plate_fig is likewise rebuilt here because the original reads the
-Streamlit theme.
+Plates. A session can hold several plates (web-only). The ACTIVE plate lives
+in the flat SessionData fields that mirror the Streamlit app's keys
+(assay_plate, assay_std_df, assay_sample_df, assay_std_res) plus the
+web-only assay_excluded / assay_plate_name / assay_plate_id /
+assay_std_source; `plates(session)` returns every plate with the active one
+refreshed from those fields. Every endpoint except Results/Normalise acts on
+the active plate; those two pool all plates, grouping replicates by
+Subject × Timepoint. A plate without standards can use another plate's
+curve (assay_std_source); its own blank is subtracted when it has one.
+
+Streamlit compatibility. The session bundle's flat assay_* keys describe the
+active plate in the Streamlit schema (standards columns S1–S3 only), so the
+Streamlit app opens it. The web-only keys assay_plates / assay_active /
+assay_norm / assay_readout carry everything else; Streamlit ignores them.
 """
 
 from __future__ import annotations
 
+import json
 import os
-import warnings as warnings_mod
+import re
+import time
 from typing import Literal
 
 import numpy as np
@@ -27,255 +35,159 @@ import plotly.graph_objects as go
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from core.constants import _SAMPLE_DATA_DIR, PAL, fmt
-from core.numeric import lin_reg
-from modes.assay import _4pl_inv, _PLATE_ROWS, _fit_4pl, _plate_get, _well_rc, parse_plate_csv, render_assay_curve
-from web_app.api import assay_layout as lay
-from web_app.api.common import ExportFmt, ExportStyle, df_records, export_media_type, figure_json, png_response, records_to_df
+from core.analysis import assay_layout as lay
+from core.analysis.assay import (  # noqa: F401  (re-exported for tests)
+    _PLATE_ROWS,
+    FIT_TYPES,
+    READOUT_UNITS,
+    SAMPLE_PLATE,
+    _as_float_array,
+    _as_float_matrix,
+    _norm_well,
+    _plate_get,
+    blank_mean,
+    compute_standard_curve,
+    effective_plate,
+    empty_plate,
+    fit_equation,
+    fit_eval,
+    layout_problems,
+    parse_plate_csv,
+    readout_text,
+    render_assay_curve,
+    sample_map,
+    sample_meta,
+    sample_results,
+    standards_table,
+    std_wells_map,
+    well_layout,
+)
+from core.constants import PAL, fmt
+from core.serialization import _jsonify, _plate_df_from_csv, _plate_df_to_csv
+from web_app import storage
+from web_app.api.common import (
+    ExportFmt,
+    ExportStyle,
+    df_records,
+    export_media_type,
+    figure_json,
+    png_response,
+    records_to_df,
+)
 from web_app.deps import get_session
-from web_app.session import SessionData
+from web_app.history import tracked
+from web_app.modespec import ModeSpec
+from web_app.session import (
+    SessionData,
+    default_assay_norm,
+    default_assay_readout,
+    default_assay_sample_df,
+    default_assay_std_df,
+)
 
 router = APIRouter(prefix="/api/assay", tags=["assay"])
 
-_STD_COLUMNS = ["Label", "Conc", "S1", "S2", "S3"]
 _SAMPLE_COLUMNS = lay.SAMPLE_COLUMNS
-FIT_TYPES = ["Linear", "Quadratic", "4-Parameter Logistic (4PL)"]
-SAMPLE_PLATE = os.path.join(_SAMPLE_DATA_DIR, "assay_plate.csv")
+# The per-plate fields; together they describe the active plate.
+PLATE_FIELDS = ("assay_plate", "assay_std_df", "assay_sample_df", "assay_std_res",
+                "assay_excluded", "assay_plate_name", "assay_plate_id", "assay_std_source")
+UNDO_FIELDS = PLATE_FIELDS + ("assay_plates", "assay_active", "assay_norm", "assay_readout",
+                              "assay_sig_unit", "assay_conc_unit")
 
 
-# -- pure helpers ------------------------------------------------------------------
-def empty_plate() -> pd.DataFrame:
-    return pd.DataFrame(np.full((8, 12), np.nan),
-                        index=pd.Index(_PLATE_ROWS, name="Row"),
-                        columns=pd.Index(range(1, 13), name="Col"))
+def _std_cols(std_df: pd.DataFrame) -> list[str]:
+    return ["Label", "Conc", *lay.rep_cols(std_df)]
 
 
-def _norm_well(w) -> str:
-    return "" if w is None or (isinstance(w, float) and np.isnan(w)) else str(w).strip().upper()
+def _empty_std_df() -> pd.DataFrame:
+    return pd.DataFrame({c: pd.Series([], dtype=object) for c in lay.STD_COLUMNS})
 
 
-def std_wells_map(std_df: pd.DataFrame) -> dict:
-    """{well: {set, conc, label, is_blank}} — row 0 is the blank."""
-    m: dict = {}
-    for i, (_, r) in enumerate(std_df.iterrows()):
-        for s_idx, s_col in [(1, "S1"), (2, "S2"), (3, "S3")]:
-            w = _norm_well(r.get(s_col))
-            if w and _well_rc(w):
-                conc = pd.to_numeric(r.get("Conc"), errors="coerce")
-                m[w] = {"set": s_idx, "conc": None if pd.isna(conc) else float(conc),
-                        "label": str(r.get("Label", "")), "is_blank": i == 0}
-    return m
+# -- plates --------------------------------------------------------------------------
+def plates(session: SessionData) -> list[dict]:
+    """Every plate, as dicts of PLATE_FIELDS, the active one refreshed."""
+    if not session.assay_plates:
+        session.assay_plates = [{}]
+        session.assay_active = 0
+    session.assay_active = min(max(session.assay_active, 0), len(session.assay_plates) - 1)
+    session.assay_plates[session.assay_active] = {f: getattr(session, f) for f in PLATE_FIELDS}
+    return session.assay_plates
 
 
-def sample_meta(sample_df: pd.DataFrame) -> dict:
-    """{well: {Label, Subject, Timepoint}} for valid sample wells."""
-    return {r["Well"]: {"Label": r["Label"], "Subject": r["Subject"], "Timepoint": r["Timepoint"]}
-            for r in lay.normalize_sample_df(sample_df).to_dict(orient="records") if _well_rc(r["Well"])}
+def _activate(session: SessionData, index: int) -> None:
+    ps = plates(session)
+    if not 0 <= index < len(ps):
+        raise HTTPException(status_code=404, detail="No such plate.")
+    for f in PLATE_FIELDS:
+        setattr(session, f, ps[index][f])
+    session.assay_active = index
 
 
-def sample_map(sample_df: pd.DataFrame) -> dict:
-    return {w: (m["Label"] or w) for w, m in sample_meta(sample_df).items()}
+def _plate_by_id(ps: list[dict], plate_id: str | None) -> dict | None:
+    return next((p for p in ps if p["assay_plate_id"] == plate_id), None) if plate_id else None
 
 
-def layout_problems(std_df: pd.DataFrame, sample_df: pd.DataFrame) -> list[str]:
-    """Human-readable warnings about the layout tables (bad/duplicate wells)."""
-    problems = []
-    seen: dict[str, str] = {}
-    for i, (_, r) in enumerate(std_df.iterrows()):
-        for s_col in ("S1", "S2", "S3"):
-            w = _norm_well(r.get(s_col))
-            if not w:
-                continue
-            label = r.get("Label")
-            label = "" if label is None or (isinstance(label, float) and np.isnan(label)) else label
-            where = f"standards row {i + 1} ({label}) {s_col}"
-            if not _well_rc(w):
-                problems.append(f"'{w}' in {where} is not a valid well (A1–H12).")
-            elif w in seen:
-                problems.append(f"{w} is used twice: {seen[w]} and {where}.")
-            else:
-                seen[w] = where
-    for _, r in sample_df.iterrows():
-        w = _norm_well(r.get("Well"))
-        if not w:
-            continue
-        if not _well_rc(w):
-            problems.append(f"Sample well '{w}' is not a valid well (A1–H12).")
-        elif w in seen:
-            problems.append(f"Sample well {w} is already used by {seen[w]}.")
-    if len(std_df):
-        c0 = pd.to_numeric(std_df["Conc"].iloc[0], errors="coerce") if "Conc" in std_df else np.nan
-        if pd.notna(c0) and c0 != 0:
-            problems.append(f"The first standards row is used as the blank but has concentration {c0:g}, "
-                            "not 0. Mark the blank wells with Mark as blank.")
-    return problems
+def _curve_for(ps: list[dict], p: dict) -> tuple[dict | None, str | None]:
+    """(standard-curve result, name of the plate it came from if borrowed)."""
+    src = _plate_by_id(ps, p["assay_std_source"])
+    if p["assay_std_source"]:
+        return (src["assay_std_res"], src["assay_plate_name"]) if src else (None, None)
+    return p["assay_std_res"], None
 
 
-def compute_standard_curve(plate: pd.DataFrame, std_df: pd.DataFrame, fit_type: str) -> tuple[dict, list[str]]:
-    """Port of modes/assay.py's Compute-standard-curve block. Raises
-    ValueError with a user-facing message when the curve can't be fitted."""
-    warnings: list[str] = []
-    if len(std_df) == 0 or pd.isna(pd.to_numeric(std_df["Conc"].iloc[0], errors="coerce")):
-        raise ValueError("The first row (the Blank) needs a Concentration value on the Standards tab.")
-    sdf = std_df.copy()
-    sdf["Conc"] = pd.to_numeric(sdf["Conc"], errors="coerce")
-    sdf = sdf.dropna(subset=["Conc"]).reset_index(drop=True)
-    if len(sdf) < 3:
-        raise ValueError("Need the blank plus at least 2 non-blank concentration levels to fit a curve.")
-
-    raw = np.array([[_plate_get(plate, _norm_well(r.get(sc))) for sc in ("S1", "S2", "S3")]
-                    for _, r in sdf.iterrows()], dtype=float)
-    if np.all(np.isnan(raw[0])):
-        raise ValueError("Blank row has no valid signal. Check its well addresses on the Standards tab.")
-    blank = float(np.nanmean(raw[0]))
-
-    delta = raw - blank
-    with warnings_mod.catch_warnings():
-        warnings_mod.simplefilter("ignore", RuntimeWarning)  # all-NaN levels / single replicates
-        means = np.nanmean(delta, axis=1)
-        sds = np.nanstd(delta, axis=1, ddof=1)
-    concs = sdf["Conc"].to_numpy(dtype=float)
-    ok = np.isfinite(concs) & np.isfinite(means)
-    ok[0] = False  # the blank is the reference, not an independent data point
-    missing = [str(sdf["Label"].iloc[i]) for i in range(1, len(sdf)) if not np.isfinite(means[i])]
-    if missing:
-        warnings.append(f"No signal found for: {', '.join(missing)} — excluded from the fit.")
-    if ok.sum() < 2:
-        raise ValueError("Fewer than 2 non-blank standards have signal — check the well addresses.")
-
-    fit: dict | None = None
-    if fit_type == "Linear":
-        lr = lin_reg(concs[ok], means[ok])
-        fit = dict(type="linear", **lr) if lr else None
-    elif fit_type == "Quadratic":
-        if ok.sum() < 3:
-            raise ValueError("Quadratic fit needs at least 3 non-blank standards with signal.")
-        coefs = np.polyfit(concs[ok], means[ok], 2)
-        yp = np.polyval(coefs, concs[ok])
-        sst = float(np.sum((means[ok] - means[ok].mean()) ** 2))
-        r2 = 1 - float(np.sum((means[ok] - yp) ** 2)) / sst if sst > 0 else 0.0
-        fit = dict(type="quad", a=float(coefs[0]), b=float(coefs[1]), c=float(coefs[2]), r2=r2)
-    elif fit_type == FIT_TYPES[2]:
-        fit = _fit_4pl(concs[ok], means[ok])
-        if fit is None:
-            warnings.append("4PL did not converge — fell back to Linear.")
-            lr = lin_reg(concs[ok], means[ok])
-            fit = dict(type="linear", **lr) if lr else None
-    else:
-        raise ValueError(f"Unknown fit type {fit_type!r}")
-    if fit is None:
-        raise ValueError("Regression failed — not enough valid data points.")
-    fit = {k: (float(v) if isinstance(v, (np.floating, float, int)) and k != "type" else v) for k, v in fit.items()}
-
-    def _clean(a):
-        return [[None if not np.isfinite(v) else float(v) for v in row] for row in a] if np.ndim(a) == 2 else \
-               [None if not np.isfinite(v) else float(v) for v in a]
-
-    res = dict(
-        fit=fit, fit_label=fit_type,
-        concs=concs.tolist(), labels=[str(x) for x in sdf["Label"].tolist()],
-        means=_clean(means), sds=_clean(sds), raw_arr=_clean(raw), delta_arr=_clean(delta),
-        blank_mean=blank, std_df=sdf.to_dict(orient="records"),
-    )
-    return res, warnings
+def _plate_rows(ps: list[dict], p: dict) -> tuple[list[dict], str | None]:
+    """Per-well results for one plate, each row tagged with the plate name."""
+    if p["assay_plate"] is None:
+        return [], None
+    res, src_name = _curve_for(ps, p)
+    if res is None:
+        return [], f"{p['assay_plate_name']}: no standard curve yet — it is left out of the results."
+    sdf = p["assay_sample_df"]
+    blank = blank_mean(effective_plate(p["assay_plate"], p["assay_excluded"]), p["assay_std_df"]) if src_name else None
+    rows = sample_results(p["assay_plate"], res, sample_map(sdf), sample_meta(sdf), excluded=p["assay_excluded"],
+                          std_wells=set(std_wells_map(p["assay_std_df"])), blank=blank)
+    for r in rows:
+        r["Plate"] = p["assay_plate_name"]
+    return rows, None
 
 
-def _as_float_array(values) -> np.ndarray:
-    return np.array([np.nan if v is None else v for v in values], dtype=float)
+def _all_rows(session: SessionData) -> tuple[list[dict], list[str]]:
+    ps = plates(session)
+    rows, notes = [], []
+    for p in ps:
+        rs, note = _plate_rows(ps, p)
+        rows += rs
+        if note and len(ps) > 1:
+            notes.append(note)
+    return rows, notes
 
 
-def _as_float_matrix(rows) -> np.ndarray:
-    return np.array([[np.nan if v is None else v for v in row] for row in rows], dtype=float)
+def _plates_summary(session: SessionData) -> list[dict]:
+    ps = plates(session)
+    out = []
+    for i, p in enumerate(ps):
+        src = _plate_by_id(ps, p["assay_std_source"])
+        out.append({"index": i, "id": p["assay_plate_id"], "name": p["assay_plate_name"],
+                    "has_data": p["assay_plate"] is not None, "has_curve": _curve_for(ps, p)[0] is not None,
+                    "own_curve": p["assay_std_res"] is not None, "std_source": p["assay_std_source"],
+                    "source_name": src["assay_plate_name"] if src else None})
+    return out
 
 
-def fit_eval(fit: dict, x: np.ndarray) -> np.ndarray:
-    if fit["type"] == "linear":
-        return fit["slope"] * x + fit["intercept"]
-    if fit["type"] == "quad":
-        return fit["a"] * x ** 2 + fit["b"] * x + fit["c"]
-    with np.errstate(all="ignore"):
-        return fit["d"] + (fit["a"] - fit["d"]) / (1 + (x / fit["c"]) ** fit["b"])
-
-
-def fit_equation(fit: dict) -> str:
-    if fit["type"] == "linear":
-        b = fit["intercept"]
-        return f"y = {fit['slope']:.4g}x {'+' if b >= 0 else '−'} {abs(b):.4g}    R² = {fit['r2']:.4f}"
-    if fit["type"] == "quad":
-        return f"y = {fit['a']:.4g}x² + {fit['b']:.4g}x + {fit['c']:.4g}    R² = {fit['r2']:.4f}"
-    return (f"4PL: a = {fit['a']:.4g}, b = {fit['b']:.4g}, c (EC50) = {fit['c']:.4g}, "
-            f"d = {fit['d']:.4g}    R² = {fit['r2']:.4f}")
-
-
-def back_calc(dy: float, fit: dict) -> float:
-    """ΔSignal → concentration. Same branch logic as modes/assay.py's _back_calc."""
-    if not np.isfinite(dy):
-        return np.nan
-    ft = fit["type"]
-    if ft == "linear":
-        s = fit["slope"]
-        return float((dy - fit["intercept"]) / s) if s != 0 else np.nan
-    if ft == "quad":
-        a, b, c = fit["a"], fit["b"], fit["c"] - dy
-        if abs(a) <= 1e-9 * max(abs(b), 1e-12):
-            return float(-c / b) if b != 0 else np.nan
-        disc = b ** 2 - 4 * a * c
-        if disc < 0:
-            return np.nan
-        roots = [(-b + np.sqrt(disc)) / (2 * a), (-b - np.sqrt(disc)) / (2 * a)]
-        pos = [r for r in roots if r >= -1e-9]
-        if a < 0 and len(pos) == 2:
-            return np.nan  # ambiguous: both roots are physically possible
-        return float(min(pos)) if pos else np.nan
-    return _4pl_inv(dy, fit)
-
-
-def sample_results(plate: pd.DataFrame, res: dict, samples: dict, meta: dict | None = None) -> list[dict]:
-    """One row per non-standard well with signal: back-calculated conc + range flag."""
-    meta = meta or {}
-    fit = res["fit"]
-    blank = float(res["blank_mean"])
-    concs = _as_float_array(res["concs"])
-    c_min, c_max = float(np.nanmin(concs)), float(np.nanmax(concs))
-    std_wells = {_norm_well(r.get(sc)) for r in res["std_df"] for sc in ("S1", "S2", "S3")} - {""}
-    rows = []
-    for row_lbl in _PLATE_ROWS:
-        for ci in range(12):
-            well = f"{row_lbl}{ci + 1}"
-            if well in std_wells:
-                continue
-            sig = _plate_get(plate, well)
-            if not np.isfinite(sig):
-                continue
-            dy = sig - blank
-            conc = back_calc(dy, fit)
-            if not np.isfinite(conc):
-                flag = "undefined"
-            elif conc < c_min - 1e-9:
-                flag = "< range"
-            elif conc > c_max + 1e-9:
-                flag = "> range"
-            else:
-                flag = ""
-            m = meta.get(well, {})
-            rows.append({"Well": well, "Label": samples.get(well, ""), "Subject": m.get("Subject", ""),
-                         "Timepoint": m.get("Timepoint", ""), "Signal": sig, "ΔSignal": dy,
-                         "Conc": conc if np.isfinite(conc) else None, "Flag": flag})
-    return rows
-
-
-# -- figures -----------------------------------------------------------------------
+# -- figures -------------------------------------------------------------------------
 _SET_COLS = {1: "rgba(70,130,220,0.85)", 2: "rgba(50,180,110,0.85)", 3: "rgba(220,80,80,0.85)"}
 _BLANK_COL = "rgba(255,152,0,0.90)"
 _SAMPLE_COL = "rgba(150,95,210,0.75)"
 _DATA_COL = "rgba(120,130,145,0.55)"
 _EMPTY_COL = "rgba(200,205,212,0.35)"
+_EXCL_COL = "rgba(255,255,255,0.9)"
 
 
 def plate_figure(plate: pd.DataFrame | None, std_wells: dict, samples: dict, conc_unit: str, sig_unit: str,
-                 results: dict | None = None) -> go.Figure:
+                 results: dict | None = None, excluded=()) -> go.Figure:
     """96-well plate map. With `results` ({well: result row}) the sample wells
     show back-calculated concentration instead of raw signal."""
+    excluded = set(excluded)
     xs, ys, txts, hovs, cols = [], [], [], [], []
     for ri, row_lbl in enumerate(_PLATE_ROWS):
         for ci in range(12):
@@ -300,6 +212,9 @@ def plate_figure(plate: pd.DataFrame | None, std_wells: dict, samples: dict, con
                 hov += f"<br>Sample: {samples[well]}"
             else:
                 col = _DATA_COL if has else _EMPTY_COL
+            if well in excluded:
+                col, text = _EXCL_COL, "excl."
+                hov += "<br><i>Excluded from calculations</i>"
             xs.append(ci + 1)
             ys.append(7 - ri)
             txts.append(text)
@@ -338,12 +253,13 @@ def curve_figure(res: dict, show_reps: bool, conc_unit: str, sig_unit: str) -> g
 
     fig = go.Figure()
     if show_reps:
-        for si in range(3):
+        for si in range(da.shape[1] if da.ndim == 2 else 0):
             ry = da[:, si]
             vr = np.isfinite(ry) & np.isfinite(cx)
             if vr.any():
                 fig.add_trace(go.Scatter(x=cx[vr], y=ry[vr], name=f"Set {si + 1}", mode="markers",
-                                         marker=dict(symbol="circle-open", size=9, color=PAL[si], line=dict(width=1.5))))
+                                         marker=dict(symbol="circle-open", size=9, color=PAL[si % len(PAL)],
+                                                     line=dict(width=1.5))))
     fig.add_trace(go.Scatter(
         x=cx[vm], y=my[vm], name="Mean ± SD", mode="markers", text=labels[vm],
         hovertemplate="%{text}<br>%{x} " + conc_unit + "<br>ΔSignal %{y:.4g}<extra></extra>",
@@ -353,40 +269,52 @@ def curve_figure(res: dict, show_reps: bool, conc_unit: str, sig_unit: str) -> g
     xp = np.linspace(max(0.0, float(cx[vm].min())), float(cx[vm].max()), 400)
     fig.add_trace(go.Scatter(x=xp, y=fit_eval(fit, xp), name="Fit", mode="lines",
                              line=dict(color="#ff9230", dash="dash", width=2.5)))
+    qc = res.get("qc") or {}
+    for key, name, dash in (("lod", "LOD", "dot"), ("loq", "LOQ", "dashdot")):
+        if qc.get(key) is not None and qc[key] <= float(cx[vm].max()):
+            fig.add_vline(x=qc[key], line=dict(color="#999", dash=dash, width=1),
+                          annotation_text=name, annotation_position="top")
     fig.update_layout(
         xaxis_title=f"Concentration ({conc_unit})", yaxis_title=f"ΔSignal ({sig_unit})",
         height=480, template="plotly_white", hovermode="closest",
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        annotations=[dict(text=fit_equation(fit), xref="paper", yref="paper", x=0.02, y=0.98,
+        annotations=[*fig.layout.annotations,
+                     dict(text=fit_equation(fit), xref="paper", yref="paper", x=0.02, y=0.98,
                           xanchor="left", yanchor="top", showarrow=False, font=dict(size=12),
                           bgcolor="rgba(255,255,255,0.85)", bordercolor="#999", borderwidth=1, borderpad=6)],
     )
     return fig
 
 
-# -- tables ------------------------------------------------------------------------
-def standards_table(res: dict, sig_unit: str, conc_unit: str) -> list[dict]:
-    """The Streamlit app's "Intermediate values" table: raw, Δ, mean, SD, CV per level."""
-    rows = []
-    means, sds = _as_float_array(res["means"]), _as_float_array(res["sds"])
-    raw_arr, delta_arr = _as_float_matrix(res["raw_arr"]), _as_float_matrix(res["delta_arr"])
-    for k, label in enumerate(res["labels"]):
-        n_reps = int(np.isfinite(delta_arr[k]).sum())
-        sd = sds[k]
-        mean = means[k]
-        # The blank's mean ΔSignal is 0 by construction, so a CV there is meaningless.
-        cv = abs(sd / mean) * 100 if k > 0 and np.isfinite(sd) and np.isfinite(mean) and mean != 0 else np.nan
-        rows.append({
-            "Label": label + (" (blank)" if k == 0 else ""),
-            f"Conc ({conc_unit})": f"{res['concs'][k]:.5g}",
-            **{f"S{s + 1} raw": fmt(raw_arr[k, s]) for s in range(3)},
-            **{f"S{s + 1} Δ": fmt(delta_arr[k, s]) for s in range(3)},
-            f"Mean Δ ({sig_unit})": fmt(mean),
-            f"SD ({sig_unit})": fmt(sd) if np.isfinite(sd) else ("n=1" if n_reps == 1 else "—"),
-            "CV (%)": fmt(cv, 3),
-            "Back-calc conc": fmt(back_calc(mean, res["fit"])) if k > 0 and np.isfinite(mean) else "—",
-        })
-    return rows
+def _nan_none(v):
+    return None if v is None or not np.isfinite(v) else float(v)
+
+
+def summary_figure(groups: list[dict], y: str, sd: str, y_title: str) -> go.Figure:
+    """Mean ± SD per sample. With timepoints: one line per subject across
+    timepoints (in layout order); otherwise one bar per sample."""
+    fig = go.Figure()
+    tps = lay.ordered_unique(g["Timepoint"] for g in groups if g["Timepoint"])
+    if tps:
+        for i, subj in enumerate(lay.ordered_unique(g["Subject"] for g in groups)):
+            gs = sorted((g for g in groups if g["Subject"] == subj and g["Timepoint"]),
+                        key=lambda g: tps.index(g["Timepoint"]))
+            if not gs:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[g["Timepoint"] for g in gs], y=[_nan_none(g[y]) for g in gs], name=subj or "(no subject)",
+                mode="lines+markers", line=dict(color=PAL[i % len(PAL)], width=2), marker=dict(size=8),
+                error_y=dict(type="data", array=[_nan_none(g[sd]) or 0 for g in gs], visible=True, thickness=1.2, width=4),
+            ))
+        fig.update_xaxes(type="category", categoryorder="array", categoryarray=tps, title="Timepoint")
+    else:
+        fig.add_trace(go.Bar(x=[g["Subject"] for g in groups], y=[_nan_none(g[y]) for g in groups],
+                             marker_color="#4c96d7",
+                             error_y=dict(type="data", array=[_nan_none(g[sd]) or 0 for g in groups], visible=True)))
+        fig.update_xaxes(type="category", title="Sample")
+    fig.update_layout(yaxis_title=y_title, height=420, template="plotly_white", hovermode="closest",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=40))
+    return fig
 
 
 # -- state ---------------------------------------------------------------------------
@@ -396,70 +324,37 @@ def _plate_grid(plate: pd.DataFrame | None) -> list[list[float | None]] | None:
     return [[None if not np.isfinite(v) else float(v) for v in plate.loc[r].to_numpy(dtype=float)] for r in _PLATE_ROWS]
 
 
-def _results_by_well(session: SessionData) -> dict | None:
-    if session.assay_std_res is None or session.assay_plate is None:
-        return None
-    rows = sample_results(session.assay_plate, session.assay_std_res, sample_map(session.assay_sample_df))
-    return {r["Well"]: r for r in rows}
-
-
-READOUT_UNITS = {"absorbance": "Abs", "fluorescence": "RFU", "luminescence": "RLU"}
-
-
-def readout_text(r: dict) -> str:
-    """'Absorbance, 450 nm' / 'Fluorescence, Ex 485 / Em 528 nm' / 'Luminescence'."""
-    kind = (r.get("type") or "").strip()
-    name = kind.capitalize() if kind else "Signal"
-    if kind == "absorbance" and lay.txt(r.get("wavelength")):
-        return f"{name}, {lay.txt(r['wavelength'])} nm"
-    if kind == "fluorescence" and (lay.txt(r.get("ex")) or lay.txt(r.get("em"))):
-        parts = [f"Ex {lay.txt(r['ex'])}" if lay.txt(r.get("ex")) else "", f"Em {lay.txt(r['em'])}" if lay.txt(r.get("em")) else ""]
-        return f"{name}, {' / '.join(p for p in parts if p)} nm"
-    return name
-
-
-def well_layout(plate: pd.DataFrame | None, std_df: pd.DataFrame, sample_df: pd.DataFrame) -> list[dict]:
-    """One entry per well (A1…H12) for the Layout tab's clickable plate."""
-    stds = std_wells_map(std_df)
-    meta = sample_meta(sample_df)
-    out = []
-    for ri, row_lbl in enumerate(_PLATE_ROWS):
-        for ci in range(12):
-            well = f"{row_lbl}{ci + 1}"
-            v = _plate_get(plate, well)
-            cell = {"well": well, "value": float(v) if np.isfinite(v) else None, "role": "data" if np.isfinite(v) else "empty"}
-            if well in stds:
-                info = stds[well]
-                cell.update(role="blank" if info["is_blank"] else "std", set=info["set"], conc=info["conc"], label=info["label"])
-            elif well in meta:
-                cell.update(role="sample", label=meta[well]["Label"], subject=meta[well]["Subject"],
-                            timepoint=meta[well]["Timepoint"])
-            out.append(cell)
-    return out
-
-
 def _state(session: SessionData) -> dict:
     stds = std_wells_map(session.assay_std_df)
     samples = sample_map(session.assay_sample_df)
     plate = session.assay_plate
-    res = session.assay_std_res
+    ps = plates(session)
+    res, src_name = _curve_for(ps, ps[session.assay_active])
     sdf = lay.normalize_sample_df(session.assay_sample_df)
+    all_sdf = [lay.normalize_sample_df(p["assay_sample_df"]) for p in ps]
     return {
         "sig_unit": session.assay_sig_unit,
         "conc_unit": session.assay_conc_unit,
         "readout": session.assay_readout,
         "readout_text": readout_text(session.assay_readout),
-        "wells": well_layout(plate, session.assay_std_df, session.assay_sample_df),
-        "subjects": lay.ordered_unique(x for x in sdf["Subject"] if x),
-        "timepoints": lay.ordered_unique(x for x in sdf["Timepoint"] if x),
+        "plates": _plates_summary(session),
+        "active": session.assay_active,
+        "wells": well_layout(plate, session.assay_std_df, session.assay_sample_df, session.assay_excluded),
+        "excluded": list(session.assay_excluded),
+        "subjects": lay.ordered_unique(x for d in all_sdf for x in d["Subject"] if x),
+        "timepoints": lay.ordered_unique(x for d in all_sdf for x in d["Timepoint"] if x),
         "plate": _plate_grid(plate),
         "n_wells": int(plate.notna().sum().sum()) if plate is not None else 0,
-        "std_rows": df_records(session.assay_std_df.reindex(columns=_STD_COLUMNS)),
+        "rep_cols": lay.rep_cols(session.assay_std_df),
+        "max_reps": lay.MAX_REPS,
+        "std_rows": df_records(session.assay_std_df.reindex(columns=_std_cols(session.assay_std_df))),
         "sample_rows": df_records(sdf),
         "layout_problems": layout_problems(session.assay_std_df, session.assay_sample_df),
-        "plate_figure": figure_json(plate_figure(plate, stds, samples, session.assay_conc_unit,
-                                                 session.assay_sig_unit)) if plate is not None else None,
-        "has_result": res is not None,
+        "plate_figure": figure_json(plate_figure(plate, stds, samples, session.assay_conc_unit, session.assay_sig_unit,
+                                                 excluded=session.assay_excluded)) if plate is not None else None,
+        "has_result": any(p["has_curve"] for p in _plates_summary(session)),
+        "has_curve": res is not None,
+        "curve_source": src_name,
         "fit_types": FIT_TYPES,
         "fit_label": (res or {}).get("fit_label"),
     }
@@ -474,9 +369,11 @@ def get_state(session: SessionData = Depends(get_session)) -> dict:
 def _set_plate(session: SessionData, plate: pd.DataFrame) -> None:
     session.assay_plate = plate
     session.assay_std_res = None  # stale fit
+    session.assay_excluded = []
 
 
 @router.post("/plate/upload")
+@tracked("assay", UNDO_FIELDS)
 async def upload_plate(file: UploadFile = File(...), session: SessionData = Depends(get_session)) -> dict:
     raw = await file.read()
     text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8", errors="replace")
@@ -488,20 +385,25 @@ async def upload_plate(file: UploadFile = File(...), session: SessionData = Depe
     return _state(session)
 
 
+def _demo_layout(session: SessionData) -> None:
+    """The sample plate is laid out to match the default standards table;
+    subjects P01–P05 (one per row D–H), timepoints D0–D14 in duplicate
+    across columns 1–8."""
+    session.assay_std_df = default_assay_std_df()
+    wells = [f"{r}{c}" for r in "DEFGH" for c in range(1, 9)]
+    plan, _ = lay.plan_samples(wells, lay.parse_name_list("P01-P05"), ["D0", "D3", "D7", "D14"], 2, "rows", "subject")
+    _, session.assay_sample_df = lay.assign_samples(session.assay_std_df, default_assay_sample_df(), plan, wells)
+
+
 @router.post("/plate/sample")
+@tracked("assay", UNDO_FIELDS)
 def load_sample(session: SessionData = Depends(get_session)) -> dict:
     if not os.path.exists(SAMPLE_PLATE):
         raise HTTPException(status_code=404, detail="Sample plate file is missing from sample_data/.")
     with open(SAMPLE_PLATE, encoding="utf-8") as fh:
         _set_plate(session, parse_plate_csv(fh.read()))
-    # The sample plate is laid out to match the default standards table.
-    from web_app.session import default_assay_norm, default_assay_sample_df, default_assay_std_df
-    session.assay_std_df = default_assay_std_df()
-    # Demo labelling: subjects P01–P05 (one per row D–H), timepoints D0–D14
-    # in duplicate across columns 1–8.
-    wells = [f"{r}{c}" for r in "DEFGH" for c in range(1, 9)]
-    plan, _ = lay.plan_samples(wells, lay.parse_name_list("P01-P05"), ["D0", "D3", "D7", "D14"], 2, "rows", "subject")
-    _, session.assay_sample_df = lay.assign_samples(session.assay_std_df, default_assay_sample_df(), plan, wells)
+    session.assay_std_source = None
+    _demo_layout(session)
     session.assay_norm = default_assay_norm()
     return _state(session)
 
@@ -511,6 +413,7 @@ class PlateBody(BaseModel):
 
 
 @router.post("/plate")
+@tracked("assay", UNDO_FIELDS)
 def set_plate(body: PlateBody, session: SessionData = Depends(get_session)) -> dict:
     if len(body.grid) != 8 or any(len(r) != 12 for r in body.grid):
         raise HTTPException(status_code=400, detail="Plate grid must be 8 rows × 12 columns.")
@@ -521,9 +424,11 @@ def set_plate(body: PlateBody, session: SessionData = Depends(get_session)) -> d
 
 
 @router.delete("/plate")
+@tracked("assay", UNDO_FIELDS)
 def clear_plate(session: SessionData = Depends(get_session)) -> dict:
     session.assay_plate = None
     session.assay_std_res = None
+    session.assay_excluded = []
     return _state(session)
 
 
@@ -560,6 +465,103 @@ def set_readout(body: ReadoutBody, session: SessionData = Depends(get_session)) 
     return _state(session)
 
 
+# -- Plates ----------------------------------------------------------------------------
+class NewPlateBody(BaseModel):
+    name: str = ""
+    copy_layout: bool = True
+
+
+class RenameBody(BaseModel):
+    name: str
+
+
+class CurveSourceBody(BaseModel):
+    source: str | None = None   # plate id, or None for the plate's own standards
+
+
+@router.post("/plates")
+@tracked("assay", UNDO_FIELDS)
+def add_plate(body: NewPlateBody, session: SessionData = Depends(get_session)) -> dict:
+    """A new, empty plate (made active). copy_layout reuses the current
+    plate's standards and sample labels, for plates run with one layout."""
+    ps = plates(session)
+    ids = {p["assay_plate_id"] for p in ps}
+    n = len(ps) + 1
+    while f"p{n}" in ids:
+        n += 1
+    std = session.assay_std_df.copy() if body.copy_layout else _empty_std_df()
+    samples = session.assay_sample_df.copy() if body.copy_layout else default_assay_sample_df()
+    ps.append({"assay_plate": None, "assay_std_df": std, "assay_sample_df": samples, "assay_std_res": None,
+               "assay_excluded": [], "assay_plate_name": body.name.strip() or f"Plate {len(ps) + 1}",
+               "assay_plate_id": f"p{n}", "assay_std_source": None})
+    _activate(session, len(ps) - 1)
+    return _state(session)
+
+
+@router.post("/plates/{index}/activate")
+def activate_plate(index: int, session: SessionData = Depends(get_session)) -> dict:
+    # Not an undo step: switching plates doesn't change any data.
+    _activate(session, index)
+    return _state(session)
+
+
+@router.post("/plates/{index}/rename")
+@tracked("assay", UNDO_FIELDS)
+def rename_plate(index: int, body: RenameBody, session: SessionData = Depends(get_session)) -> dict:
+    ps = plates(session)
+    if not 0 <= index < len(ps):
+        raise HTTPException(status_code=404, detail="No such plate.")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="A plate name can't be empty.")
+    if any(p["assay_plate_name"] == name for i, p in enumerate(ps) if i != index):
+        raise HTTPException(status_code=400, detail=f"Another plate is already called {name!r}.")
+    ps[index]["assay_plate_name"] = name
+    if index == session.assay_active:
+        session.assay_plate_name = name
+    return _state(session)
+
+
+@router.delete("/plates/{index}")
+@tracked("assay", UNDO_FIELDS)
+def delete_plate(index: int, session: SessionData = Depends(get_session)) -> dict:
+    ps = plates(session)
+    if not 0 <= index < len(ps):
+        raise HTTPException(status_code=404, detail="No such plate.")
+    if len(ps) == 1:
+        raise HTTPException(status_code=400, detail="The last plate can't be removed — use Clear on ① Import instead.")
+    gone = ps.pop(index)
+    for p in ps:
+        if p["assay_std_source"] == gone["assay_plate_id"]:
+            p["assay_std_source"] = None
+    active = session.assay_active
+    if index < active:
+        active -= 1
+    elif index == active:
+        active = min(index, len(ps) - 1)
+    session.assay_active = active
+    for f in PLATE_FIELDS:
+        setattr(session, f, ps[active][f])
+    return _state(session)
+
+
+@router.post("/plates/curve-source")
+@tracked("assay", UNDO_FIELDS)
+def set_curve_source(body: CurveSourceBody, session: SessionData = Depends(get_session)) -> dict:
+    """Use another plate's standard curve for the active plate (or its own)."""
+    if body.source:
+        ps = plates(session)
+        src = _plate_by_id(ps, body.source)
+        if src is None or src["assay_plate_id"] == session.assay_plate_id:
+            raise HTTPException(status_code=400, detail="Choose another plate.")
+        if src["assay_std_source"]:
+            raise HTTPException(status_code=400, detail=f"{src['assay_plate_name']} itself borrows a curve; "
+                                                        "choose the plate the standards were run on.")
+        session.assay_std_res = None
+    session.assay_std_source = body.source or None
+    return _state(session)
+
+
 # -- Standards / layout ------------------------------------------------------------------
 class LayoutBody(BaseModel):
     std_rows: list[dict]
@@ -567,14 +569,19 @@ class LayoutBody(BaseModel):
 
 
 @router.post("/layout")
+@tracked("assay", UNDO_FIELDS)
 def set_layout(body: LayoutBody, session: SessionData = Depends(get_session)) -> dict:
-    std = records_to_df(body.std_rows, _STD_COLUMNS, text_cols=("Label", "S1", "S2", "S3"))
-    for c in ("S1", "S2", "S3"):
+    n = max([int(k[1:]) for r in body.std_rows for k in r if re.fullmatch(r"S\d+", k)] + [3])
+    if n > lay.MAX_REPS:
+        raise HTTPException(status_code=400, detail=f"At most {lay.MAX_REPS} replicate columns are supported.")
+    cols = lay.std_columns(n)
+    reps = cols[2:]
+    std = records_to_df(body.std_rows, cols, text_cols=("Label", *reps))
+    for c in reps:
         std[c] = std[c].map(_norm_well)
     samples = records_to_df(body.sample_rows, _SAMPLE_COLUMNS, text_cols=tuple(_SAMPLE_COLUMNS))
-    samples = lay.normalize_sample_df(samples)
-    session.assay_std_df = std
-    session.assay_sample_df = samples
+    session.assay_std_df = lay.trim_reps(std)
+    session.assay_sample_df = lay.normalize_sample_df(samples)
     session.assay_std_res = None
     return _state(session)
 
@@ -630,6 +637,7 @@ def _standards_concs(body: AssignStandardsBody, n_levels: int) -> list[float]:
 
 
 @router.post("/assign/standards")
+@tracked("assay", UNDO_FIELDS)
 def assign_standards(body: AssignStandardsBody, session: SessionData = Depends(get_session)) -> dict:
     try:
         wells = lay.clean_wells(body.wells)
@@ -641,19 +649,23 @@ def assign_standards(body: AssignStandardsBody, session: SessionData = Depends(g
             prev = [{"well": w, "role": "blank" if c == 0 else "std", "text": "Blank" if c == 0 else lay.fmt_conc(c),
                      "sub": f"S{i + 1}"} for c, lv in zip(concs, levels) for i, w in enumerate(lv)]
             reps = max(len(lv) for lv in levels)
+            note = ""
+            if reps > 3:
+                note = " — the Streamlit app reads only the first 3 replicates of each level."
             return {"preview": prev, "message": f"{len(levels)} level(s) × {reps} replicate(s): "
-                    + ", ".join(lay.fmt_conc(c) for c in concs) + f" {session.assay_conc_unit}"
-                    + ("" if reps <= 3 else " — at most 3 replicates per level are supported.")}
+                    + ", ".join(lay.fmt_conc(c) for c in concs) + f" {session.assay_conc_unit}" + note}
         std, samples, msg = lay.assign_standards(session.assay_std_df, session.assay_sample_df, wells,
                                                  body.direction, concs)
     except ValueError as exc:
         if body.preview:
             return {"preview": [], "message": str(exc), "error": True}
         _bad_request(exc)
+    session.assay_std_source = None
     return _set_layout(session, std, samples, msg)
 
 
 @router.post("/assign/blank")
+@tracked("assay", UNDO_FIELDS)
 def assign_blank(body: WellsBody, session: SessionData = Depends(get_session)) -> dict:
     try:
         std, samples, msg = lay.assign_blank(session.assay_std_df, session.assay_sample_df, body.wells)
@@ -663,6 +675,7 @@ def assign_blank(body: WellsBody, session: SessionData = Depends(get_session)) -
 
 
 @router.post("/assign/samples")
+@tracked("assay", UNDO_FIELDS)
 def assign_samples(body: AssignSamplesBody, session: SessionData = Depends(get_session)) -> dict:
     try:
         plan, msg = lay.plan_samples(body.wells, lay.parse_name_list(body.subjects), lay.parse_name_list(body.timepoints),
@@ -679,6 +692,7 @@ def assign_samples(body: AssignSamplesBody, session: SessionData = Depends(get_s
 
 
 @router.post("/assign/clear")
+@tracked("assay", UNDO_FIELDS)
 def clear_assignment(body: WellsBody, session: SessionData = Depends(get_session)) -> dict:
     try:
         std, samples = lay.clear_wells(session.assay_std_df, session.assay_sample_df, body.wells)
@@ -688,6 +702,7 @@ def clear_assignment(body: WellsBody, session: SessionData = Depends(get_session
 
 
 @router.post("/layout/paste")
+@tracked("assay", UNDO_FIELDS)
 def paste_layout(body: PasteLayoutBody, session: SessionData = Depends(get_session)) -> dict:
     try:
         cells = lay.parse_layout_grid(body.text)
@@ -697,87 +712,124 @@ def paste_layout(body: PasteLayoutBody, session: SessionData = Depends(get_sessi
     return _set_layout(session, std, samples, msg)
 
 
+# -- Excluding wells ----------------------------------------------------------------------
+class ExcludeBody(BaseModel):
+    wells: list[str]
+    excluded: bool = True
+
+
+def _refit(session: SessionData) -> list[str]:
+    """Refit the active plate's own curve with its current fit type (after
+    the data under it changed). Returns warnings; drops the fit on failure."""
+    res = session.assay_std_res
+    if res is None or session.assay_plate is None:
+        return []
+    try:
+        new, warnings = compute_standard_curve(effective_plate(session.assay_plate, session.assay_excluded),
+                                               session.assay_std_df, res.get("fit_label") or "Linear")
+    except ValueError as exc:
+        session.assay_std_res = None
+        return [f"The standard curve can't be fitted any more: {exc}"]
+    session.assay_std_res = new
+    return warnings
+
+
+@router.post("/exclude")
+@tracked("assay", UNDO_FIELDS)
+def set_excluded(body: ExcludeBody, session: SessionData = Depends(get_session)) -> dict:
+    """Leave wells out of (or put them back into) every calculation: the
+    standard curve, the blank and the sample means. Refits the curve."""
+    try:
+        wells = set(lay.clean_wells(body.wells))
+    except ValueError as exc:
+        _bad_request(exc)
+    current = set(session.assay_excluded)
+    current = current | wells if body.excluded else current - wells
+    session.assay_excluded = lay.sort_wells(list(current))
+    warnings = _refit(session)
+    verb = "Excluded" if body.excluded else "Included"
+    msg = f"{verb} {', '.join(lay.sort_wells(list(wells)))}."
+    if session.assay_std_res is not None:
+        msg += " Standard curve refitted."
+    return {**_state(session), "message": msg, "warnings": warnings}
+
+
 # -- Standard curve ----------------------------------------------------------------------
 class ComputeBody(BaseModel):
     fit_type: str = "Linear"
     show_reps: bool = True
 
 
-def _curve_payload(session: SessionData, show_reps: bool, warnings: list[str] | None = None) -> dict:
-    res = session.assay_std_res
+def _qc_display(res: dict, cu: str) -> dict:
+    qc = res.get("qc") or {}
+    rec = [r for r in qc.get("recovery", []) if r is not None]
+    return {
+        "lod": f"{qc['lod']:.4g} {cu}" if qc.get("lod") is not None else "—",
+        "loq": f"{qc['loq']:.4g} {cu}" if qc.get("loq") is not None else "—",
+        "blank_sd": fmt(qc["blank_sd"]) if qc.get("blank_sd") is not None else "—",
+        "n_blank": qc.get("n_blank", 0),
+        "recovery_range": f"{min(rec):.0f}–{max(rec):.0f}%" if rec else "—",
+        "note": ("LOD/LOQ need at least 2 blank replicates." if qc.get("blank_sd") is None
+                 else "LOD/LOQ can't be read off this fit: it doesn't pass near the blank. Try another fit type."
+                 if qc.get("lod") is None else ""),
+    }
+
+
+def _curve_payload(session: SessionData, res: dict, show_reps: bool, warnings: list[str] | None = None,
+                   source: str | None = None) -> dict:
+    su, cu = session.assay_sig_unit, session.assay_conc_unit
+    ps = plates(session)
+    src = _plate_by_id(ps, session.assay_std_source)
+    excluded = src["assay_excluded"] if src else session.assay_excluded
     return {
         "warnings": warnings or [],
-        "figure": figure_json(curve_figure(res, show_reps, session.assay_conc_unit, session.assay_sig_unit)),
+        "figure": figure_json(curve_figure(res, show_reps, cu, su)),
         "equation": fit_equation(res["fit"]),
         "fit_label": res.get("fit_label"),
         "blank_mean": res["blank_mean"],
-        "standards": standards_table(res, session.assay_sig_unit, session.assay_conc_unit),
+        "qc": _qc_display(res, cu),
+        "standards": standards_table(res, su, cu, excluded),
+        "source": source,
     }
 
 
 @router.post("/compute")
+@tracked("assay", UNDO_FIELDS)
 def compute(body: ComputeBody, session: SessionData = Depends(get_session)) -> dict:
     if session.assay_plate is None:
         raise HTTPException(status_code=400, detail="Import plate data first.")
+    if session.assay_std_source:
+        raise HTTPException(status_code=400, detail="This plate uses another plate's standard curve. Switch to "
+                                                    "that plate to refit, or choose “Its own standards”.")
     try:
-        res, warnings = compute_standard_curve(session.assay_plate, session.assay_std_df, body.fit_type)
+        res, warnings = compute_standard_curve(effective_plate(session.assay_plate, session.assay_excluded),
+                                               session.assay_std_df, body.fit_type)
     except ValueError as exc:
         session.assay_std_res = None
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.assay_std_res = res
-    return _curve_payload(session, body.show_reps, warnings)
+    return _curve_payload(session, res, body.show_reps, warnings)
 
 
 @router.get("/curve")
 def get_curve(show_reps: bool = True, session: SessionData = Depends(get_session)) -> dict:
     """Re-render the stored curve (tab revisit, units change, imported session)."""
-    if session.assay_std_res is None:
-        return {"figure": None}
-    return _curve_payload(session, show_reps)
+    ps = plates(session)
+    res, src_name = _curve_for(ps, ps[session.assay_active])
+    if res is None:
+        return {"figure": None, "source": src_name}
+    return _curve_payload(session, res, show_reps, source=src_name)
 
 
 # -- Results -------------------------------------------------------------------------------
-def _require_result(session: SessionData) -> dict:
-    if session.assay_std_res is None or session.assay_plate is None:
+def _require_rows(session: SessionData) -> tuple[list[dict], list[str]]:
+    if not any(p["has_curve"] and p["has_data"] for p in _plates_summary(session)):
         raise HTTPException(status_code=400, detail="Compute the standard curve first.")
-    return session.assay_std_res
+    return _all_rows(session)
 
 
-def _well_rows(session: SessionData) -> list[dict]:
-    res = _require_result(session)
-    return sample_results(session.assay_plate, res, sample_map(session.assay_sample_df),
-                          sample_meta(session.assay_sample_df))
-
-
-def summary_figure(groups: list[dict], y: str, sd: str, y_title: str) -> go.Figure:
-    """Mean ± SD per sample. With timepoints: one line per subject across
-    timepoints (in layout order); otherwise one bar per sample."""
-    fig = go.Figure()
-    tps = lay.ordered_unique(g["Timepoint"] for g in groups if g["Timepoint"])
-    if tps:
-        for i, subj in enumerate(lay.ordered_unique(g["Subject"] for g in groups)):
-            gs = sorted((g for g in groups if g["Subject"] == subj and g["Timepoint"]),
-                        key=lambda g: tps.index(g["Timepoint"]))
-            if not gs:
-                continue
-            fig.add_trace(go.Scatter(
-                x=[g["Timepoint"] for g in gs], y=[_nan_none(g[y]) for g in gs], name=subj or "(no subject)",
-                mode="lines+markers", line=dict(color=PAL[i % len(PAL)], width=2), marker=dict(size=8),
-                error_y=dict(type="data", array=[_nan_none(g[sd]) or 0 for g in gs], visible=True, thickness=1.2, width=4),
-            ))
-        fig.update_xaxes(type="category", categoryorder="array", categoryarray=tps, title="Timepoint")
-    else:
-        fig.add_trace(go.Bar(x=[g["Subject"] for g in groups], y=[_nan_none(g[y]) for g in groups],
-                             marker_color="#4c96d7",
-                             error_y=dict(type="data", array=[_nan_none(g[sd]) or 0 for g in groups], visible=True)))
-        fig.update_xaxes(type="category", title="Sample")
-    fig.update_layout(yaxis_title=y_title, height=420, template="plotly_white", hovermode="closest",
-                      legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=40))
-    return fig
-
-
-def _nan_none(v):
-    return None if v is None or not np.isfinite(v) else float(v)
+def _groups_from(rows: list[dict]) -> list[dict]:
+    return lay.group_results([r for r in rows if r["Label"]])
 
 
 def _summary_rows_display(groups: list[dict], cu: str) -> list[dict]:
@@ -788,22 +840,30 @@ def _summary_rows_display(groups: list[dict], cu: str) -> list[dict]:
 
 @router.get("/results")
 def results(session: SessionData = Depends(get_session)) -> dict:
-    rows = _well_rows(session)
-    samples = sample_map(session.assay_sample_df)
-    by_well = {r["Well"]: r for r in rows}
-    fig = plate_figure(session.assay_plate, std_wells_map(session.assay_std_df), samples,
-                       session.assay_conc_unit, session.assay_sig_unit, results=by_well)
-    n_flagged = sum(1 for r in rows if r["Flag"])
-    groups = lay.group_results([r for r in rows if r["Well"] in samples])
+    rows, notes = _require_rows(session)
+    multi = len(plates(session)) > 1
+    active_rows = [r for r in rows if r["Plate"] == session.assay_plate_name]
+    fig = plate_figure(session.assay_plate, std_wells_map(session.assay_std_df), sample_map(session.assay_sample_df),
+                       session.assay_conc_unit, session.assay_sig_unit, results={r["Well"]: r for r in active_rows},
+                       excluded=session.assay_excluded) if session.assay_plate is not None else None
+    used = [r for r in rows if not r["Excluded"]]
+    n_flagged = sum(1 for r in used if r["Flag"])
+    groups = _groups_from(rows)
     cu = session.assay_conc_unit
+    n_excl = len(rows) - len(used)
     return {
-        "rows": [{**r, "Signal": fmt(r["Signal"]), "ΔSignal": fmt(r["ΔSignal"]),
-                  "Conc": fmt(r["Conc"]) if r["Conc"] is not None else "—"} for r in rows],
-        "summary": f"{len(rows)} sample well(s) ({len(groups)} labelled sample(s)); "
-                   f"{n_flagged} well(s) outside the standard range or undefined.",
+        "rows": [{**({"Plate": r["Plate"]} if multi else {}), "Well": r["Well"], "Label": r["Label"],
+                  "Subject": r["Subject"], "Timepoint": r["Timepoint"], "Signal": fmt(r["Signal"]),
+                  "ΔSignal": fmt(r["ΔSignal"]), "Conc": fmt(r["Conc"]) if r["Conc"] is not None else "—",
+                  "Flag": r["Flag"], "Excluded": r["Excluded"]} for r in rows],
+        "summary": f"{len(used)} sample well(s) ({len(groups)} labelled sample(s)"
+                   + (f" across {len({r['Plate'] for r in rows})} plates" if multi else "") + "); "
+                   f"{n_flagged} well(s) flagged" + (f"; {n_excl} excluded" if n_excl else "") + ".",
+        "notes": notes,
         "groups": _summary_rows_display(groups, cu),
         "group_figure": figure_json(summary_figure(groups, "Mean", "SD", f"Concentration ({cu})")) if groups else None,
-        "figure": figure_json(fig),
+        "figure": figure_json(fig) if fig else None,
+        "multi_plate": multi, "active_plate": session.assay_plate_name,
         "sig_unit": session.assay_sig_unit, "conc_unit": cu,
     }
 
@@ -828,13 +888,19 @@ def _norm_inputs(session: SessionData, groups: list[dict]) -> list[dict]:
     return out
 
 
-def _norm_payload(session: SessionData) -> dict:
-    rows = _well_rows(session)
-    samples = sample_map(session.assay_sample_df)
-    groups = lay.group_results([r for r in rows if r["Well"] in samples])
+def _normalised(session: SessionData) -> tuple[list[dict], list[dict], list[dict], dict]:
+    """(groups, inputs, normalised rows, units) over all plates."""
+    rows, _ = _require_rows(session)
+    groups = _groups_from(rows)
     norm = session.assay_norm
     inputs = _norm_inputs(session, groups)
     out, units = lay.normalise(groups, inputs, session.assay_conc_unit, norm["vol_unit"], norm["area_unit"])
+    return groups, inputs, out, units
+
+
+def _norm_payload(session: SessionData) -> dict:
+    groups, inputs, out, units = _normalised(session)
+    norm = session.assay_norm
     cu = session.assay_conc_unit
     table = []
     for r, g in zip(out, groups):
@@ -866,6 +932,7 @@ def get_normalise(session: SessionData = Depends(get_session)) -> dict:
 
 
 @router.post("/normalise")
+@tracked("assay", UNDO_FIELDS)
 def set_normalise(body: NormaliseBody, session: SessionData = Depends(get_session)) -> dict:
     df = records_to_df(body.rows, lay.NORM_COLUMNS, text_cols=("Subject", "Timepoint"))
     bad = [f"{r.Subject} {r.Timepoint}".strip() for r in df.itertuples() if np.isfinite(r.Area) and r.Area <= 0]
@@ -888,19 +955,20 @@ def _csv_response(df: pd.DataFrame, filename: str, session: SessionData, extra: 
 
 @router.get("/export/results-csv")
 def export_results_csv(session: SessionData = Depends(get_session)):
-    rows = _well_rows(session)
+    rows, _ = _require_rows(session)
     if not rows:
         raise HTTPException(status_code=400, detail="No sample wells found (every well with data is a standard).")
     su, cu = session.assay_sig_unit, session.assay_conc_unit
-    df = pd.DataFrame([{"Well": r["Well"], "Label": r["Label"], "Subject": r["Subject"], "Timepoint": r["Timepoint"],
+    multi = len(plates(session)) > 1
+    df = pd.DataFrame([{**({"Plate": r["Plate"]} if multi else {}), "Well": r["Well"], "Label": r["Label"],
+                        "Subject": r["Subject"], "Timepoint": r["Timepoint"],
                         f"Signal ({su})": r["Signal"], f"ΔSignal ({su})": r["ΔSignal"], f"Conc ({cu})": r["Conc"],
-                        "Flag": r["Flag"]} for r in rows])
+                        "Flag": r["Flag"], "Excluded": r["Excluded"]} for r in rows])
     return _csv_response(df, "assay_results.csv", session)
 
 
 def _groups(session: SessionData) -> list[dict]:
-    samples = sample_map(session.assay_sample_df)
-    groups = lay.group_results([r for r in _well_rows(session) if r["Well"] in samples])
+    groups = _groups_from(_require_rows(session)[0])
     if not groups:
         raise HTTPException(status_code=400, detail="No labelled samples — label sample wells on ② Layout first.")
     return groups
@@ -926,12 +994,11 @@ def export_summary_csv(wide: bool = False, session: SessionData = Depends(get_se
 @router.get("/export/normalised-csv")
 def export_normalised_csv(session: SessionData = Depends(get_session)):
     _groups(session)
-    p = _norm_payload(session)
-    out, units = lay.normalise(lay.group_results([r for r in _well_rows(session) if r["Well"] in sample_map(session.assay_sample_df)]),
-                               p["inputs"], p["conc_unit"], p["vol_unit"], p["area_unit"])
-    cu, au, pu = p["conc_unit"], units["amount"], units["per_area"]
+    _, _, out, units = _normalised(session)
+    norm = session.assay_norm
+    cu, au, pu = session.assay_conc_unit, units["amount"], units["per_area"]
     df = pd.DataFrame([{"Subject": r["Subject"], "Timepoint": r["Timepoint"], "n": r["n"], "Dilution": r["Dilution"],
-                        f"Volume ({p['vol_unit']})": r["Volume"], f"Area ({p['area_unit']})": r["Area"],
+                        f"Volume ({norm['vol_unit']})": r["Volume"], f"Area ({norm['area_unit']})": r["Area"],
                         f"Sample conc ({cu})": r["SampleConc"], f"SD ({cu})": r["SampleSD"],
                         f"Amount ({au})": r["Amount"], f"Amount SD ({au})": r["AmountSD"],
                         f"Per area ({pu})": r["PerArea"], f"Per area SD ({pu})": r["PerAreaSD"], "Flag": r["Flag"]}
@@ -939,17 +1006,30 @@ def export_normalised_csv(session: SessionData = Depends(get_session)):
     return _csv_response(df, "assay_normalised.csv", session)
 
 
+def _active_curve(session: SessionData) -> dict:
+    ps = plates(session)
+    res, _ = _curve_for(ps, ps[session.assay_active])
+    if res is None:
+        raise HTTPException(status_code=400, detail="Compute the standard curve first.")
+    return res
+
+
 @router.get("/export/standards-csv")
 def export_standards_csv(session: SessionData = Depends(get_session)):
-    res = _require_result(session)
+    res = _active_curve(session)
     su, cu = session.assay_sig_unit, session.assay_conc_unit
+    qc = res.get("qc") or {}
+    rec = qc.get("recovery") or []
+    raw = res["raw_arr"]
     rows = [{
         "Label": res["labels"][i], f"Conc ({cu})": res["concs"][i],
-        f"Set 1 ({su})": res["raw_arr"][i][0], f"Set 2 ({su})": res["raw_arr"][i][1], f"Set 3 ({su})": res["raw_arr"][i][2],
+        **{f"Set {s + 1} ({su})": raw[i][s] for s in range(len(raw[i]))},
         f"Mean Δ ({su})": res["means"][i], f"SD ({su})": res["sds"][i],
+        "Recovery (%)": rec[i] if i < len(rec) else None,
     } for i in range(len(res["concs"]))]
+    lim = "".join(f"# {name}: {qc[k]:.6g} {cu}\n" for k, name in (("lod", "LOD"), ("loq", "LOQ")) if qc.get(k) is not None)
     return _csv_response(pd.DataFrame(rows), "standard_curve_data.csv", session,
-                         f"# Fit: {fit_equation(res['fit'])}\n# Blank mean: {res['blank_mean']:.6g} {su}\n")
+                         f"# Fit: {fit_equation(res['fit'])}\n# Blank mean: {res['blank_mean']:.6g} {su}\n" + lim)
 
 
 class ExportCurveBody(BaseModel):
@@ -960,14 +1040,289 @@ class ExportCurveBody(BaseModel):
     show_reps: bool = True
 
 
-@router.post("/export/curve")
-def export_curve(body: ExportCurveBody, session: SessionData = Depends(get_session)):
-    res = _require_result(session)
-    media_type = export_media_type(body.fmt)
+def _curve_png(res: dict, session: SessionData, show_reps: bool = True, **kw) -> bytes:
     # render_assay_curve expects plain float arrays (NaN, not None).
     mpl_res = {**res, "concs": _as_float_array(res["concs"]).tolist(),
                "means": _as_float_array(res["means"]).tolist(), "sds": _as_float_array(res["sds"]).tolist(),
                "delta_arr": _as_float_matrix(res["delta_arr"]).tolist()}
-    content = render_assay_curve(mpl_res, body.show_reps, session.assay_conc_unit, session.assay_sig_unit,
-                                 dpi=body.dpi, fmt=body.fmt, figsize=body.figsize, style=body.style)
-    return png_response(content, f"standard_curve.{body.fmt}", media_type)
+    return render_assay_curve(mpl_res, show_reps, session.assay_conc_unit, session.assay_sig_unit, **kw)
+
+
+@router.post("/export/curve")
+def export_curve(body: ExportCurveBody, session: SessionData = Depends(get_session)):
+    res = _active_curve(session)
+    content = _curve_png(res, session, body.show_reps, dpi=body.dpi, fmt=body.fmt, figsize=body.figsize,
+                         style=body.style)
+    return png_response(content, f"standard_curve.{body.fmt}", export_media_type(body.fmt))
+
+
+# -- Layout templates ------------------------------------------------------------------------
+# A template is the reusable part of an experiment: plate layout (standards
+# and sample labels), readout, units and the normalisation units — stored as
+# JSON files in the app's data folder (web_app/storage.py).
+class TemplateBody(BaseModel):
+    name: str
+
+
+def _template_dir():
+    return storage.subdir("assay_templates")
+
+
+def _template_path(name: str):
+    slug = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" ._")[:80]
+    if not slug:
+        raise HTTPException(status_code=400, detail="Give the template a name.")
+    return _template_dir() / f"{slug}.json"
+
+
+def _template_payload(session: SessionData, name: str) -> dict:
+    return {
+        "kind": "assay-layout-template", "version": 1, "name": name, "saved_at": time.strftime("%Y-%m-%d %H:%M"),
+        "std_df": _jsonify(session.assay_std_df.reindex(columns=_std_cols(session.assay_std_df)).to_dict(orient="records")),
+        "sample_df": _jsonify(lay.normalize_sample_df(session.assay_sample_df).to_dict(orient="records")),
+        "readout": dict(session.assay_readout), "sig_unit": session.assay_sig_unit,
+        "conc_unit": session.assay_conc_unit, "area_unit": session.assay_norm.get("area_unit", "cm²"),
+        "vol_unit": session.assay_norm.get("vol_unit", "µL"),
+        "fit_type": (session.assay_std_res or {}).get("fit_label"),
+    }
+
+
+def _read_template(path) -> dict:
+    try:
+        t = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read template: {exc}") from exc
+    if not isinstance(t, dict) or t.get("kind") != "assay-layout-template":
+        raise HTTPException(status_code=400, detail="Not an assay layout template.")
+    return t
+
+
+@router.get("/templates")
+def list_templates() -> dict:
+    out = []
+    for path in sorted(_template_dir().glob("*.json")):
+        try:
+            t = _read_template(path)
+        except HTTPException:
+            continue
+        out.append({"name": t.get("name") or path.stem, "saved_at": t.get("saved_at", ""),
+                    "n_levels": len(t.get("std_df") or []), "n_samples": len(t.get("sample_df") or [])})
+    return {"templates": out}
+
+
+@router.post("/templates")
+def save_template(body: TemplateBody, session: SessionData = Depends(get_session)) -> dict:
+    name = body.name.strip()
+    storage.write_json_atomic(_template_path(name), _template_payload(session, name))
+    return {**list_templates(), "message": f"Saved template “{name}”."}
+
+
+def _apply_template(session: SessionData, t: dict) -> None:
+    rows = t.get("std_df") or []
+    n = max([int(k[1:]) for r in rows for k in r if re.fullmatch(r"S\d+", k)] + [3])
+    cols = lay.std_columns(min(n, lay.MAX_REPS))
+    std = records_to_df(rows, cols, text_cols=("Label", *cols[2:]))
+    session.assay_std_df = lay.trim_reps(std) if rows else _empty_std_df()
+    session.assay_sample_df = lay.normalize_sample_df(pd.DataFrame(t.get("sample_df") or [], columns=_SAMPLE_COLUMNS))
+    session.assay_std_res = None
+    session.assay_std_source = None
+    session.assay_excluded = []
+    if isinstance(t.get("readout"), dict):
+        session.assay_readout = {**default_assay_readout(), **t["readout"]}
+    for key, attr in (("sig_unit", "assay_sig_unit"), ("conc_unit", "assay_conc_unit")):
+        if t.get(key):
+            setattr(session, attr, str(t[key]))
+    session.assay_norm = {**session.assay_norm, **{k: str(t[k]) for k in ("area_unit", "vol_unit") if t.get(k)}}
+
+
+@router.post("/templates/apply")
+@tracked("assay", UNDO_FIELDS)
+def apply_template(body: TemplateBody, session: SessionData = Depends(get_session)) -> dict:
+    path = _template_path(body.name)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"No template called {body.name!r}.")
+    t = _read_template(path)
+    _apply_template(session, t)
+    msg = f"Applied template “{t.get('name', body.name)}” to {session.assay_plate_name}."
+    if t.get("fit_type"):
+        msg += f" It was fitted with {t['fit_type']}."
+    return {**_state(session), "message": msg, "fit_type": t.get("fit_type")}
+
+
+@router.delete("/templates/{name}")
+def delete_template(name: str) -> dict:
+    _template_path(name).unlink(missing_ok=True)
+    return list_templates()
+
+
+@router.get("/templates/{name}/download")
+def download_template(name: str):
+    path = _template_path(name)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"No template called {name!r}.")
+    return png_response(path.read_bytes(), path.name, "application/json")
+
+
+@router.post("/templates/upload")
+async def upload_template(file: UploadFile = File(...)) -> dict:
+    try:
+        t = json.loads(await file.read())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read template: {exc}") from exc
+    if not isinstance(t, dict) or t.get("kind") != "assay-layout-template":
+        raise HTTPException(status_code=400, detail="Not an assay layout template.")
+    name = str(t.get("name") or os.path.splitext(file.filename or "template")[0])
+    storage.write_json_atomic(_template_path(name), {**t, "name": name})
+    return {**list_templates(), "message": f"Added template “{name}”."}
+
+
+# -- Mode registration ---------------------------------------------------------------------
+def _plate_to_json(p: dict) -> dict:
+    return {"id": p["assay_plate_id"], "name": p["assay_plate_name"], "plate": _plate_df_to_csv(p["assay_plate"]),
+            "std_df": _jsonify(p["assay_std_df"].reindex(columns=_std_cols(p["assay_std_df"])).to_dict(orient="records")),
+            "sample_df": _jsonify(lay.normalize_sample_df(p["assay_sample_df"]).to_dict(orient="records")),
+            "std_res": _jsonify(p["assay_std_res"]), "excluded": list(p["assay_excluded"]),
+            "std_source": p["assay_std_source"]}
+
+
+def _plate_from_json(d: dict, i: int) -> dict:
+    if not isinstance(d, dict):
+        raise ValueError("assay_plates entries must be objects")
+    std_rows = d.get("std_df")
+    std = pd.DataFrame(std_rows) if std_rows else _empty_std_df()
+    return {"assay_plate": _plate_df_from_csv(d.get("plate")), "assay_std_df": std,
+            "assay_sample_df": lay.normalize_sample_df(pd.DataFrame(d.get("sample_df") or [], columns=_SAMPLE_COLUMNS)),
+            "assay_std_res": d.get("std_res"), "assay_excluded": [str(w) for w in d.get("excluded") or []],
+            "assay_plate_name": str(d.get("name") or f"Plate {i + 1}"), "assay_plate_id": str(d.get("id") or f"p{i + 1}"),
+            "assay_std_source": d.get("std_source") or None}
+
+
+def _export_bundle(session: SessionData) -> dict:
+    ps = plates(session)
+    std = session.assay_std_df
+    # The flat keys are what the Streamlit app reads: the active plate, with
+    # standards limited to its S1–S3 columns. A fit that used more replicates
+    # or another plate's standards can't be expressed there, so it is left
+    # for Streamlit to recompute.
+    portable_fit = len(lay.rep_cols(std)) <= 3 and not session.assay_std_source
+    return {
+        "assay_sig_unit": session.assay_sig_unit, "assay_conc_unit": session.assay_conc_unit,
+        "assay_plate": _plate_df_to_csv(session.assay_plate),
+        "assay_std_df": _jsonify(std.reindex(columns=lay.STD_COLUMNS).to_dict(orient="records")),
+        "assay_sample_df": _jsonify(session.assay_sample_df.to_dict(orient="records")),
+        "assay_std_res": _jsonify(session.assay_std_res) if portable_fit else None,
+        # Web-only extras: the Streamlit app ignores keys it doesn't know.
+        "assay_norm": _jsonify(session.assay_norm),
+        "assay_readout": dict(session.assay_readout),
+        "assay_plates": [_plate_to_json(p) for p in ps],
+        "assay_active": session.assay_active,
+    }
+
+
+def _apply_bundle(session: SessionData, d: dict) -> None:
+    for key in ("assay_sig_unit", "assay_conc_unit"):
+        if key in d:
+            setattr(session, key, d[key])
+    if d.get("assay_plates"):
+        if not isinstance(d["assay_plates"], list):
+            raise ValueError("assay_plates must be a list")
+        session.assay_plates = [_plate_from_json(p, i) for i, p in enumerate(d["assay_plates"])]
+        session.assay_active = min(max(int(d.get("assay_active") or 0), 0), len(session.assay_plates) - 1)
+        for f in PLATE_FIELDS:
+            setattr(session, f, session.assay_plates[session.assay_active][f])
+    else:
+        # A Streamlit bundle (or an older web one): a single plate.
+        if "assay_plate" in d:
+            session.assay_plate = _plate_df_from_csv(d["assay_plate"])
+        if "assay_std_df" in d:
+            session.assay_std_df = pd.DataFrame(d["assay_std_df"]) if d["assay_std_df"] else default_assay_std_df()
+        if "assay_sample_df" in d:
+            session.assay_sample_df = (pd.DataFrame(d["assay_sample_df"]) if d["assay_sample_df"]
+                                       else default_assay_sample_df())
+        if "assay_std_res" in d:
+            session.assay_std_res = d["assay_std_res"]
+        if "assay_plate" in d:
+            session.assay_plates, session.assay_active = [], 0
+            session.assay_excluded, session.assay_std_source = [], None
+            session.assay_plate_name, session.assay_plate_id = "Plate 1", "p1"
+    if "assay_plate" in d or "assay_norm" in d:
+        norm = d.get("assay_norm") or {}
+        session.assay_norm = {**default_assay_norm(), **{k: norm[k] for k in ("area_unit", "vol_unit", "rows") if k in norm}}
+        if not isinstance(session.assay_norm["rows"], list):
+            raise ValueError("assay_norm.rows must be a list")
+    if "assay_plate" in d or "assay_readout" in d:
+        session.assay_readout = {**default_assay_readout(), **(d.get("assay_readout") or {})}
+
+
+def _summary(session: SessionData) -> str | None:
+    n = sum(1 for p in plates(session) if p["assay_plate"] is not None)
+    return f"{n} assay plate{'s' if n != 1 else ''}" if n else None
+
+
+def _layout_grid_table(p: dict) -> list[dict]:
+    """The plate layout as an 8 × 12 table of short labels, for the report."""
+    stds = std_wells_map(p["assay_std_df"])
+    meta = sample_meta(p["assay_sample_df"])
+    excluded = set(p["assay_excluded"])
+    rows = []
+    for r in _PLATE_ROWS:
+        row = {"": r}
+        for c in range(1, 13):
+            w = f"{r}{c}"
+            if w in stds:
+                info = stds[w]
+                text = "Blank" if info["is_blank"] else f"Std {info['conc']:g}" if info["conc"] is not None else "Std"
+            elif w in meta:
+                text = meta[w]["Label"] or w
+            else:
+                text = "·" if np.isfinite(_plate_get(p["assay_plate"], w)) else ""
+            row[str(c)] = text + (" ✕" if w in excluded else "")
+        rows.append(row)
+    return rows
+
+
+def _report(session: SessionData) -> list:
+    ps = plates(session)
+    cu, su = session.assay_conc_unit, session.assay_sig_unit
+    sections: list = [("kv", "Assay", {"Readout": readout_text(session.assay_readout), "Signal unit": su,
+                                        "Concentration unit": cu, "Plates": ", ".join(p["assay_plate_name"] for p in ps)})]
+    for p in ps:
+        if p["assay_plate"] is None:
+            continue
+        title = p["assay_plate_name"]
+        sections.append(("table", f"{title} — layout", _layout_grid_table(p)))
+        res, src = _curve_for(ps, p)
+        if res is None:
+            sections.append(("note", f"{title} — standard curve", "Not fitted yet."))
+            continue
+        if src:
+            sections.append(("note", f"{title} — standard curve", f"Uses the standard curve from {src}."))
+            continue
+        q = _qc_display(res, cu)
+        sections.append(("image", f"{title} — standard curve", _curve_png(res, session, dpi=150)))
+        sections.append(("kv", f"{title} — fit and QC", {
+            "Fit": res.get("fit_label") or "", "Equation": fit_equation(res["fit"]),
+            "Blank mean": f"{res['blank_mean']:.4g} {su}", "Blank SD": f"{q['blank_sd']} (n = {q['n_blank']})",
+            "LOD (3 SD)": q["lod"], "LOQ (10 SD)": q["loq"], "Recovery of standards": q["recovery_range"],
+            "Excluded wells": ", ".join(p["assay_excluded"]) or "none"}))
+        sections.append(("table", f"{title} — standards", standards_table(res, su, cu, p["assay_excluded"])))
+    try:
+        groups, _, out, units = _normalised(session)
+    except HTTPException:
+        return sections
+    if groups:
+        sections.append(("table", "Results per sample", _summary_rows_display(groups, cu)))
+    if any(np.isfinite(r["PerArea"]) for r in out):
+        sections.append(("table", "Normalised", [
+            {"Subject": r["Subject"], "Timepoint": r["Timepoint"], "n": r["n"], "Dilution": fmt(r["Dilution"]),
+             f"Sample conc ({cu})": fmt(r["SampleConc"]), f"Amount ({units['amount']})": fmt(r["Amount"]),
+             f"Per area ({units['per_area']})": fmt(r["PerArea"]), f"SD ({units['per_area']})": fmt(r["PerAreaSD"]),
+             "Flag": r["Flag"]} for r in out]))
+    return sections
+
+
+MODE = ModeSpec(
+    id="assay", label="Assay (Microplate)", router=router, state=_state,
+    export_bundle=_export_bundle, apply_bundle=_apply_bundle, summary=_summary,
+    undo_fields=UNDO_FIELDS, report=_report,
+)

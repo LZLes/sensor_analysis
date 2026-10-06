@@ -1,7 +1,8 @@
 // Assay (96-well microplate) mode: ① Import → ② Plate Layout → ③ Standard
 // Curve → ④ Results → ⑤ Normalise & Export. ①–④ match the Streamlit app's
-// Assay tabs; the selectable plate, subject/timepoint labelling, per-sample
-// summary and normalisation are web-only (see web_app/api/assay_layout.py).
+// Assay tabs; the selectable plate, subject/timepoint labelling, excluded
+// wells, several plates, templates, per-sample summary and normalisation are
+// web-only (see web_app/api/assay.py and core/analysis/assay_layout.py).
 
 const ASSAY_API = "/api/assay";
 const ASSAY_ROWS = "ABCDEFGH".split("");
@@ -48,9 +49,110 @@ async function assayRefresh(newState, opts = {}) {
     assayState.fit_types.forEach((f) => fitSel.add(new Option(f, f)));
   }
   if (assayState.fit_label) fitSel.value = assayState.fit_label;
-  if (assayState.has_result) await assayShowCurve();
+  assayRenderPlates();
+  assayRenderCurveSource();
+  if (assayState.has_curve) await assayShowCurve();
   else assayClearCurve();
+  const tab = assayActiveTab();
+  if (tab === "results") await assayRenderResults();
+  if (tab === "normalise" && opts.resetLayout) await assayRenderNormalise();
 }
+
+// -- Plates ------------------------------------------------------------------------------
+function assayRenderPlates() {
+  const host = document.getElementById("assay-plate-chips");
+  host.innerHTML = "";
+  const multi = assayState.plates.length > 1;
+  assayState.plates.forEach((p) => {
+    const chip = document.createElement("span");
+    chip.className = `plate-chip${p.index === assayState.active ? " active" : ""}`;
+    const name = document.createElement("button");
+    name.className = "plate-chip-name";
+    name.textContent = p.name;
+    name.title = (p.has_data ? "" : "No data yet. ") + (p.source_name ? `Uses ${p.source_name}'s standard curve. ` : "")
+      + "Click to select, double-click to rename.";
+    if (!p.has_data) name.classList.add("no-data");
+    name.addEventListener("click", () => assayPlateAction(() => apiPostJson(`${ASSAY_API}/plates/${p.index}/activate`, {})));
+    name.addEventListener("dblclick", () => {
+      const n = prompt("Rename plate", p.name);
+      if (n && n.trim() && n.trim() !== p.name) {
+        assayPlateAction(() => apiPostJson(`${ASSAY_API}/plates/${p.index}/rename`, { name: n.trim() }));
+      }
+    });
+    chip.appendChild(name);
+    if (multi) {
+      const rm = document.createElement("button");
+      rm.className = "icon-btn";
+      rm.textContent = "×";
+      rm.title = `Remove ${p.name}`;
+      rm.addEventListener("click", () => {
+        if (confirm(`Remove ${p.name} and its data? (Undo brings it back.)`)) {
+          assayPlateAction(() => apiDelete(`${ASSAY_API}/plates/${p.index}`));
+        }
+      });
+      chip.appendChild(rm);
+    }
+    host.appendChild(chip);
+  });
+  document.querySelector("#assay-plates-bar .plates-hint").hidden = !multi;
+}
+
+async function assayPlateAction(call) {
+  try {
+    if (assayLayoutDirty && !confirm("Discard your unsaved table edits on ② Plate Layout?")) return;
+    assaySel.clear();
+    assayPreview = new Map();
+    await assayRefresh(await call(), { resetLayout: true });
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+document.getElementById("assay-plate-add-toggle").addEventListener("click", () => {
+  document.getElementById("assay-plate-add-form").hidden = false;
+  document.getElementById("assay-plate-add-toggle").hidden = true;
+  const inp = document.getElementById("assay-plate-add-name");
+  inp.value = `Plate ${assayState.plates.length + 1}`;
+  inp.select();
+});
+
+function assayHideAddPlate() {
+  document.getElementById("assay-plate-add-form").hidden = true;
+  document.getElementById("assay-plate-add-toggle").hidden = false;
+}
+
+document.getElementById("assay-plate-add-cancel").addEventListener("click", assayHideAddPlate);
+
+onClick("assay-plate-add-btn", async () => {
+  await assayPlateAction(() => apiPostJson(`${ASSAY_API}/plates`, {
+    name: document.getElementById("assay-plate-add-name").value,
+    copy_layout: document.getElementById("assay-plate-add-copy").checked,
+  }));
+  assayHideAddPlate();
+  showTab(document.getElementById("mode-assay"), "import");
+  toast("Plate added — paste or load its data in ① Import.", "success");
+});
+
+function assayRenderCurveSource() {
+  const row = document.getElementById("assay-curve-source-row");
+  const others = assayState.plates.filter((p) => p.index !== assayState.active && !p.std_source);
+  row.hidden = !others.length;
+  const sel = document.getElementById("assay-curve-source");
+  sel.innerHTML = "";
+  sel.add(new Option("Its own standards", ""));
+  others.forEach((p) => sel.add(new Option(`From ${p.name}`, p.id)));
+  const me = assayState.plates[assayState.active];
+  sel.value = (me && me.std_source) || "";
+  document.getElementById("assay-compute-btn").disabled = !!(me && me.std_source);
+}
+
+document.getElementById("assay-curve-source").addEventListener("change", async (e) => {
+  try {
+    await assayRefresh(await apiPostJson(`${ASSAY_API}/plates/curve-source`, { source: e.target.value || null }));
+  } catch (err) {
+    toast(err.message, "error");
+  }
+});
 
 // -- ① Import ------------------------------------------------------------------------
 function assayRenderGrid() {
@@ -274,7 +376,8 @@ function assayPaintCanvas() {
     const el = canvas.querySelector(`[data-well="${cell.well}"]`);
     const prev = assayPreview.get(cell.well);
     const role = prev ? prev.role : cell.role;
-    el.className = `well role-${role}${assaySel.has(cell.well) ? " selected" : ""}${prev ? " preview" : ""}`;
+    el.className = `well role-${role}${assaySel.has(cell.well) ? " selected" : ""}${prev ? " preview" : ""}`
+      + `${cell.excluded ? " excluded" : ""}`;
     let main = "", sub = "";
     const sig = cell.value === null ? "no data" : `${assayFmt(cell.value)} ${assayState.sig_unit}`;
     let title = `${cell.well}: ${sig}`;
@@ -299,6 +402,7 @@ function assayPaintCanvas() {
     }
     el.querySelector(".w-main").textContent = main;
     el.querySelector(".w-sub").textContent = sub;
+    if (cell.excluded) title += "\nExcluded from calculations";
     el.title = title;
     const subject = prev ? prev.subject : cell.subject;
     el.style.background = role === "sample" ? assaySubjectColor(subject, order) : "";
@@ -489,9 +593,15 @@ async function assayUpdatePreview() {
       }
     }
   } else if (assayAssignMode === "blank") {
-    message = n > 3 ? `${n} wells selected; the blank can have at most 3.` : `Mark ${n} well(s) as the blank.`;
-    kind = n > 3 ? "warn" : "info";
-    if (n <= 3) assaySortedSel().forEach((w, i) => preview.set(w, { role: "blank", text: "Blank", sub: `S${i + 1}` }));
+    const max = assayState.max_reps;
+    message = n > max ? `${n} wells selected; the blank can have at most ${max}.` : `Mark ${n} well(s) as the blank.`
+      + (n === 1 ? " With one well there's no blank SD, so no LOD/LOQ." : "");
+    kind = n > max ? "warn" : "info";
+    if (n <= max) assaySortedSel().forEach((w, i) => preview.set(w, { role: "blank", text: "Blank", sub: `S${i + 1}` }));
+  } else if (assayAssignMode === "exclude") {
+    const ex = new Set(assayState.excluded);
+    const k = assaySortedSel().filter((w) => ex.has(w)).length;
+    message = `${n} well(s) selected${k ? `, ${k} already excluded` : ""}.`;
   } else {
     message = `Clear ${n} well(s).`;
   }
@@ -524,6 +634,21 @@ onClick("assay-assign-samples-btn", () => assayAssign("samples", assaySamplesBod
 onClick("assay-assign-standards-btn", () => assayAssign("standards", assayStandardsBody(false)));
 onClick("assay-assign-blank-btn", () => assayAssign("blank", { wells: assaySortedSel() }));
 onClick("assay-assign-clear-btn", () => assayAssign("clear", { wells: assaySortedSel() }));
+
+async function assaySetExcluded(wells, excluded) {
+  if (!wells.length) throw new Error("Select wells on the plate first.");
+  const r = await apiPostJson(`${ASSAY_API}/exclude`, { wells, excluded });
+  await assayRefresh(r);
+  toast(r.message, "success");
+  // Fit-quality notes belong next to the curve; only a lost fit is an error.
+  const warnings = r.warnings || [];
+  setStatus("assay-curve-status", warnings.join("  •  "), "warn");
+  warnings.filter((w) => w.includes("can't be fitted")).forEach((w) => toast(w, "error"));
+  return r;
+}
+
+onClick("assay-exclude-btn", async () => { await assaySetExcluded(assaySortedSel(), true); assaySetSelection([]); });
+onClick("assay-include-btn", async () => { await assaySetExcluded(assaySortedSel(), false); assaySetSelection([]); });
 
 onClick("assay-layout-paste-btn", async () => {
   const text = document.getElementById("assay-layout-paste").value;
@@ -605,14 +730,30 @@ function assayEditableTable(containerId, rows, columns, opts) {
   container.appendChild(table);
 }
 
+// Replicate columns: S1–S3 always, plus any S4… in use (or added with + Replicate).
+function assayRepCols() {
+  const n = Math.max(3, ...assayStdDraft.flatMap((r) => Object.keys(r).filter((k) => /^S\d+$/.test(k)).map((k) => +k.slice(1))));
+  return Array.from({ length: n }, (_x, i) => `S${i + 1}`);
+}
+
 function assayRenderStdTable() {
   const cu = assayState ? assayState.conc_unit : "";
+  const reps = assayRepCols();
   assayEditableTable("assay-std-table", assayStdDraft, [
     ["Label", "Label"], ["Conc", `Conc (${cu})`],
-    ["S1", "Set 1 well", { placeholder: "e.g. A1" }], ["S2", "Set 2 well"], ["S3", "Set 3 well"],
+    ...reps.map((k, i) => [k, `Set ${i + 1} well`, i === 0 ? { placeholder: "e.g. A1" } : undefined]),
   ], { onEdit: () => assaySetDirty(true), rowClass: (_r, ri) => (ri === 0 ? "row-blank" : ""),
-       newRow: () => ({ Label: "", Conc: null, S1: "", S2: "", S3: "" }) });
+       newRow: () => ({ Label: "", Conc: null, ...Object.fromEntries(reps.map((k) => [k, ""])) }) });
+  document.getElementById("assay-std-addrep-btn").disabled = reps.length >= (assayState ? assayState.max_reps : 12);
 }
+
+document.getElementById("assay-std-addrep-btn").addEventListener("click", () => {
+  const next = `S${assayRepCols().length + 1}`;
+  if (!assayStdDraft.length) assayStdDraft.push({ Label: "Blank", Conc: 0 });
+  assayStdDraft.forEach((r) => { r[next] = r[next] || ""; });
+  assaySetDirty(true);
+  assayRenderStdTable();
+});
 
 function assayRenderSampleTable() {
   assayEditableTable("assay-sample-table", assaySampleDraft, [
@@ -632,7 +773,8 @@ function assayRenderProblems() {
 }
 
 document.getElementById("assay-std-add-btn").addEventListener("click", () => {
-  assayStdDraft.push({ Label: `Std ${assayStdDraft.length + 1}`, Conc: null, S1: "", S2: "", S3: "" });
+  assayStdDraft.push({ Label: `Std ${assayStdDraft.length + 1}`, Conc: null,
+    ...Object.fromEntries(assayRepCols().map((k) => [k, ""])) });
   assaySetDirty(true);
   assayRenderStdTable();
 });
@@ -667,18 +809,103 @@ async function assayApplyTables(quiet = false) {
 onClick("assay-layout-apply-btn", () => assayApplyTables());
 onClick("assay-layout-reset-btn", async () => assayRefresh(undefined, { resetLayout: true }));
 
+// -- ② Plate Layout: templates ------------------------------------------------------------
+async function assayLoadTemplates(payload) {
+  const r = payload || (await apiCall(`${ASSAY_API}/templates`));
+  const sel = document.getElementById("assay-template-select");
+  const keep = sel.value;
+  sel.innerHTML = "";
+  if (!r.templates.length) sel.add(new Option("No templates saved yet", ""));
+  r.templates.forEach((t) => sel.add(new Option(`${t.name} — ${t.n_levels} levels, ${t.n_samples} samples (${t.saved_at})`, t.name)));
+  if (r.templates.some((t) => t.name === keep)) sel.value = keep;
+  ["assay-template-apply-btn", "assay-template-download-btn", "assay-template-delete-btn"].forEach((id) => {
+    document.getElementById(id).disabled = !r.templates.length;
+  });
+}
+
+document.getElementById("assay-templates-details").addEventListener("toggle", (e) => {
+  if (e.target.open) assayLoadTemplates().catch((err) => toast(err.message, "error"));
+});
+
+onClick("assay-template-save-btn", async () => {
+  const name = document.getElementById("assay-template-name").value.trim();
+  if (!name) throw new Error("Give the template a name.");
+  if (assayLayoutDirty) await assayApplyTables(true);
+  const r = await apiPostJson(`${ASSAY_API}/templates`, { name });
+  await assayLoadTemplates(r);
+  document.getElementById("assay-template-select").value = name;
+  document.getElementById("assay-template-name").value = "";
+  toast(r.message, "success");
+});
+
+onClick("assay-template-apply-btn", async () => {
+  const name = document.getElementById("assay-template-select").value;
+  if (!name) return;
+  if (assayLayoutDirty && !confirm("Discard your unsaved table edits on ② Plate Layout?")) return;
+  const r = await apiPostJson(`${ASSAY_API}/templates/apply`, { name });
+  await assayRefresh(r, { resetLayout: true });
+  if (r.fit_type) document.getElementById("assay-fit-type").value = r.fit_type;
+  toast(r.message, "success");
+});
+
+onClick("assay-template-delete-btn", async () => {
+  const name = document.getElementById("assay-template-select").value;
+  if (!name || !confirm(`Delete the template "${name}"?`)) return;
+  await assayLoadTemplates(await apiDelete(`${ASSAY_API}/templates/${encodeURIComponent(name)}`));
+});
+
+document.getElementById("assay-template-download-btn").addEventListener("click", () => {
+  const name = document.getElementById("assay-template-select").value;
+  if (name) download(`${ASSAY_API}/templates/${encodeURIComponent(name)}/download`);
+});
+
+setupFileInput("assay-template-upload", async (files) => {
+  const form = new FormData();
+  form.append("file", files[0]);
+  try {
+    const r = await apiCall(`${ASSAY_API}/templates/upload`, { method: "POST", body: form });
+    await assayLoadTemplates(r);
+    toast(r.message, "success");
+  } catch (err) {
+    toast(err.message, "error");
+  }
+});
+
 // -- ③ Standard Curve ------------------------------------------------------------------
 function assayClearCurve() {
   drawPlot("assay-curve-plot", null);
   renderTable("assay-standards-table", []);
   setStatus("assay-equation", "");
   setStatus("assay-curve-status", "");
+  document.getElementById("assay-qc").hidden = true;
 }
 
 function assayShowCurvePayload(res) {
   drawPlot("assay-curve-plot", res.figure);
-  renderTable("assay-standards-table", res.standards, { rowClass: (r) => (String(r.Label).endsWith("(blank)") ? "row-blank" : "") });
+  renderTable("assay-standards-table", res.standards, {
+    rowClass: (r) => (String(r.Label).endsWith("(blank)") ? "row-blank" : String(r["Recovery (%)"]).includes("⚠") ? "row-flag" : ""),
+  });
   setStatus("assay-equation", res.figure ? `${res.equation}    •    blank mean = ${Number(res.blank_mean).toPrecision(4)} ${assayState.sig_unit}` : "");
+  const qc = document.getElementById("assay-qc");
+  qc.hidden = !res.qc;
+  if (res.qc) {
+    qc.innerHTML = "";
+    [["LOD (3 SD)", res.qc.lod], ["LOQ (10 SD)", res.qc.loq], ["Blank SD", `${res.qc.blank_sd} (n = ${res.qc.n_blank})`],
+     ["Recovery", res.qc.recovery_range]].forEach(([k, v]) => {
+      const item = document.createElement("span");
+      item.innerHTML = "<b></b> ";
+      item.firstChild.textContent = k;
+      item.appendChild(document.createTextNode(v));
+      qc.appendChild(item);
+    });
+    if (res.qc.note) {
+      const n = document.createElement("span");
+      n.className = "hint";
+      n.textContent = res.qc.note;
+      qc.appendChild(n);
+    }
+  }
+  if (res.source) setStatus("assay-curve-status", `Using the standard curve from ${res.source}.`);
 }
 
 async function assayShowCurve() {
@@ -713,16 +940,41 @@ async function assayRenderResults() {
     return;
   }
   const r = await apiCall(`${ASSAY_API}/results`);
-  setStatus("assay-results-status", r.summary);
+  setStatus("assay-results-status", [r.summary, ...r.notes].join("  •  "), r.notes.length ? "warn" : "info");
   renderTable("assay-groups-table", r.groups, { rowClass: (row) => (row.Flag ? "row-flag" : "") });
   drawPlot("assay-groups-plot", r.group_figure);
   const rows = r.rows.map((row) => ({
+    ...(r.multi_plate ? { Plate: row.Plate } : {}),
     Well: row.Well, Subject: row.Subject, Timepoint: row.Timepoint,
     Label: row.Subject || row.Timepoint ? "" : row.Label,
     [`Signal (${r.sig_unit})`]: row.Signal, [`ΔSignal (${r.sig_unit})`]: row["ΔSignal"],
     [`Conc (${r.conc_unit})`]: row.Conc, Flag: row.Flag,
   }));
-  renderTable("assay-results-table", rows, { rowClass: (row) => (row.Flag ? "row-flag" : "") });
+  renderTable("assay-results-table", rows, {
+    rowClass: (row) => (row.Flag === "excluded" ? "row-excluded" : row.Flag ? "row-flag" : ""),
+  });
+  // A "Use" checkbox per well on the selected plate (exclusions are per plate).
+  const table = document.getElementById("assay-results-table");
+  if (table.rows.length) {
+    const th = document.createElement("th");
+    th.textContent = "Use";
+    table.rows[0].insertBefore(th, table.rows[0].firstChild);
+    r.rows.forEach((row, i) => {
+      const td = document.createElement("td");
+      if (!r.multi_plate || row.Plate === r.active_plate) {
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = !row.Excluded;
+        cb.title = row.Excluded ? "Include this well again" : "Exclude this well from the means";
+        cb.addEventListener("change", () => {
+          // assayRefresh (inside) redraws this tab.
+          assaySetExcluded([row.Well], !cb.checked).catch((err) => toast(err.message, "error"));
+        });
+        td.appendChild(cb);
+      }
+      table.rows[i + 1].insertBefore(td, table.rows[i + 1].firstChild);
+    });
+  }
   drawPlot("assay-results-map", r.figure, { displayModeBar: false });
 }
 
@@ -817,4 +1069,5 @@ document.getElementById("assay-export-standards-btn").addEventListener("click", 
 document.getElementById("assay-export-curve-btn").addEventListener("click", () => download(`${ASSAY_API}/export/curve`, assayCurveBody()));
 document.getElementById("assay-preview-curve-btn").addEventListener("click", () => previewExport("assay-preview-img", `${ASSAY_API}/export/curve`, assayCurveBody()));
 
+registerMode("assay", { refresh: (state) => assayRefresh(state, { resetLayout: true }) });
 sessionReady.then(() => assayRefresh()).catch((err) => toast(err.message, "error"));
