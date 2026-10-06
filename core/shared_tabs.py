@@ -2,10 +2,6 @@
 Solid-State (parameterized by files_key/unit_key — do not duplicate per
 mode, see the refactor plan)."""
 
-import io
-
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -14,65 +10,12 @@ import streamlit as st
 from core.constants import PAL, _plot_theme
 from core.numeric import to_num, smooth_signal, _eff_t_start
 from core.parsing import _parse_one_file
-from core.plotting import _ORIGIN_RC, _MINIMAL_RC, _apply_spine_style
 from core.step_detection import detect_step_edges, edges_to_windows
+from core.analysis.traces import (  # noqa: F401  (re-exported)
+    _amp_label, render_ts_png,
+)
 
 SS = st.session_state
-
-
-def _amp_label(filename: str, ch_name: str, multi: bool) -> str:
-    """Composite (file, channel) label — bare channel name when only one file is loaded."""
-    return f"{filename} · {ch_name}" if multi else ch_name
-
-
-def render_ts_png(amp_files: list[dict], cur_unit: str, visible: list[str],
-                  dpi: int = 150, fmt: str = "png",
-                  figsize: tuple | None = None, style: str = "default",
-                  smooth_method: str = "None", smooth_window: int = 11,
-                  smooth_polyorder: int = 2) -> bytes:
-    _rc  = {"origin": _ORIGIN_RC, "minimal": _MINIMAL_RC}.get(style, {})
-    _lfs = 9 if style == "minimal" else 11   # axis label fontsize
-    _lgfs = 7 if style == "minimal" else 9   # legend fontsize
-    _afs = 7 if style == "minimal" else 8    # annotation fontsize
-    _multi = len(amp_files) > 1
-    _mpl_dashes = ["-", "--", ":", "-.", (0, (5, 1, 1, 1)), (0, (3, 1, 1, 1, 1, 1))]
-    with matplotlib.rc_context(_rc):
-        fig, ax = plt.subplots(figsize=figsize or (13, 5))
-        for fi, frec in enumerate(amp_files):
-            for ci, ch in enumerate(frec["channels"]):
-                lbl = _amp_label(frec["filename"], ch["name"], _multi)
-                if lbl not in visible:
-                    continue
-                x   = to_num(frec["df"][ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
-                _yr = to_num(frec["df"][ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
-                y   = smooth_signal(_yr, smooth_method, smooth_window, smooth_polyorder)
-                _col = PAL[(fi if _multi else ci) % len(PAL)]
-                _ls = _mpl_dashes[ci % len(_mpl_dashes)] if _multi else "-"
-                if smooth_method != "None":
-                    ax.plot(x, _yr, color=_col, linewidth=0.6, linestyle=_ls, alpha=0.30)
-                ax.plot(x, y, color=_col, label=lbl, linewidth=1.4, linestyle=_ls)
-        for frec in amp_files:
-            for _, row in frec.get("cpdf", pd.DataFrame()).iterrows():
-                _ets_png = _eff_t_start(row)
-                if _ets_png is not None and pd.notna(row.get("t_end")):
-                    clr = "darkorange" if row.get("Baseline") else "steelblue"
-                    ax.axvspan(_ets_png, row["t_end"], alpha=0.10, color=clr)
-                    ylim = ax.get_ylim()
-                    _lbl_txt = (f"{frec['filename']}: {row['Label']}"
-                                if _multi else str(row["Label"]))
-                    ax.text(_ets_png + 0.5, ylim[1],
-                            _lbl_txt, fontsize=_afs, va="top", color=clr)
-        ax.set_xlabel("Time (s)", fontsize=_lfs)
-        ax.set_ylabel(f"Current ({cur_unit})", fontsize=_lfs)
-        ax.legend(fontsize=_lgfs, loc="upper left",
-                  bbox_to_anchor=(1.02, 1), borderaxespad=0)
-        _apply_spine_style(ax, style)
-        fig.tight_layout()
-        buf = io.BytesIO()
-        fig.savefig(buf, format=fmt, dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
 
 
 def _render_import_tab(

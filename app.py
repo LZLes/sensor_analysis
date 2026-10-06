@@ -28,6 +28,14 @@ import modes.assay
 import modes.cyclic_voltammetry
 import modes.solid_state
 
+# Section name -> render(). Adding a Streamlit mode is one entry here.
+MODES = {
+    "Amperometry": modes.amperometry.render,
+    "Solid-State": modes.solid_state.render,
+    "Cyclic Voltammetry": modes.cyclic_voltammetry.render,
+    "Assay": modes.assay.render,
+}
+
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Sensor Analysis Studio", layout="wide")
 # Larger tap targets for touchscreen use — purely cosmetic, no behavior change.
@@ -84,7 +92,7 @@ if not SS.get("config_loaded"):
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Sensor Analysis Studio")
-    st.radio("Section", ["Amperometry", "Solid-State", "Cyclic Voltammetry", "Assay"], key="mode")
+    st.radio("Section", list(MODES), key="mode")
     st.divider()
     st.subheader("Configuration")
     st.caption(
@@ -231,11 +239,4 @@ st.title("Sensor Analysis Studio")
 # ─────────────────────────────────────────────────────────────────────────────
 # Mode dispatch
 # ─────────────────────────────────────────────────────────────────────────────
-if SS.mode == "Cyclic Voltammetry":
-    modes.cyclic_voltammetry.render()
-elif SS.mode == "Assay":
-    modes.assay.render()
-elif SS.mode == "Solid-State":
-    modes.solid_state.render()
-else:
-    modes.amperometry.render()
+MODES.get(SS.mode, modes.amperometry.render)()

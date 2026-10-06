@@ -1,0 +1,170 @@
+<!-- cyclic_voltammetry mode: loaded into <section id="mode-cyclic_voltammetry"> by js/app.js.
+     Element ids are the contract with js/cyclic_voltammetry.js. -->
+<div class="tabs">
+  <button class="tab-btn active" data-tab="import">① Import</button>
+  <button class="tab-btn" data-tab="plot">② Plot &amp; Peaks</button>
+  <button class="tab-btn" data-tab="scanrate">③ Scan Rate Analysis</button>
+  <button class="tab-btn" data-tab="export">④ Export</button>
+</div>
+
+<!-- ① Import -->
+<div class="tab-page active" data-tab-page="import">
+  <div class="two-col">
+    <div>
+      <div class="row">
+        <label for="cv-file-input" class="button-like primary">Browse CV files&hellip;</label>
+        <input id="cv-file-input" type="file" multiple accept=".csv,.txt,.tsv" hidden />
+      </div>
+      <p class="hint">One file per scan rate. The scan rate is guessed from the last number in the file name (e.g. <code>run_50mVs.csv</code> → 50).</p>
+      <div id="cv-dropzone" class="dropzone">Drop CV CSV files here</div>
+      <fieldset class="group">
+        <legend>Units</legend>
+        <div class="form-grid">
+          <label>Potential <input id="cv-volt-unit" type="text" size="6" value="V" /></label>
+          <label>Current <input id="cv-cur-unit" type="text" size="6" value="µA" /></label>
+          <label>Scan rate <input id="cv-sr-unit" type="text" size="6" value="mV/s" /></label>
+        </div>
+      </fieldset>
+      <details class="collapsible">
+        <summary>File format &mdash; only needed if auto-detection guesses wrong</summary>
+        <div class="group-body form-grid">
+          <label>Format
+            <select id="cv-fmt">
+              <option value="standard">Standard CSV</option>
+              <option value="multichannel">Multi-channel instrument</option>
+            </select>
+          </label>
+          <label>Delimiter
+            <select id="cv-delim">
+              <option value="auto">Auto-detect</option>
+              <option value="comma">Comma</option>
+              <option value="tab">Tab</option>
+              <option value="semicolon">Semicolon</option>
+              <option value="space">Space</option>
+            </select>
+          </label>
+          <label>Rows to skip <input id="cv-skip-rows" type="number" value="0" min="0" /></label>
+        </div>
+      </details>
+    </div>
+    <div>
+      <div class="row spread">
+        <h3>Loaded runs</h3>
+        <button id="cv-clear-btn" class="danger" hidden>Remove all</button>
+      </div>
+      <p class="empty-note needs-data">No runs loaded yet.</p>
+      <table id="cv-runs-table" class="editable-table"></table>
+      <details class="collapsible">
+        <summary>Channel assignment</summary>
+        <div class="group-body">
+          <label>Run <select id="cv-channel-run-select"></select></label>
+          <div id="cv-channel-assignment"></div>
+          <button id="cv-apply-channels-btn" class="primary">Apply channel assignment</button>
+        </div>
+      </details>
+    </div>
+  </div>
+</div>
+
+<!-- ② Plot & Peaks -->
+<div class="tab-page" data-tab-page="plot">
+  <p class="empty-note needs-data">Load data in ① Import first.</p>
+  <div class="windows-layout">
+    <div class="plot-col">
+      <div class="checklist-label">Scan rates</div>
+      <div id="cv-sr-checklist" class="checklist"></div>
+      <div class="checklist-label">Channels</div>
+      <div id="cv-ch-checklist" class="checklist"></div>
+      <div id="cv-plot" class="plot empty"></div>
+    </div>
+    <div class="side-col">
+      <details class="collapsible" open>
+        <summary>Peak detection</summary>
+        <div class="group-body">
+          <div class="form-grid">
+            <label>Prominence <input id="cv-prom" type="number" step="any" value="0.1" /></label>
+            <label>Min distance (pts) <input id="cv-dist" type="number" value="10" min="1" /></label>
+            <label>Min width (pts) <input id="cv-width" type="number" min="0" placeholder="none" /></label>
+            <label>Min |Ip| <input id="cv-height" type="number" step="any" min="0" placeholder="none" /></label>
+          </div>
+          <div class="checklist-label">Channels to analyse</div>
+          <div id="cv-peak-channels" class="checklist"></div>
+          <button id="cv-find-peaks-btn" class="primary">Find peaks in all runs</button>
+          <div id="cv-peak-status" class="hint"></div>
+        </div>
+      </details>
+      <h4>Detected peaks</h4>
+      <div class="table-scroll tall"><table id="cv-peaks-table" class="stats-table"></table></div>
+    </div>
+  </div>
+</div>
+
+<!-- ③ Scan Rate Analysis -->
+<div class="tab-page" data-tab-page="scanrate">
+  <div class="checklist-label">Channels</div>
+  <div id="cv-sranalysis-channels" class="checklist"></div>
+  <div id="cv-sr-status" class="status"></div>
+  <div class="plot-grid">
+    <div><h4>Peak current vs scan rate</h4><div id="cv-plot-ip-nu" class="plot small empty"></div></div>
+    <div><h4>Randles–Ševčík (Ip vs √ν)</h4><div id="cv-plot-ip-sqrt" class="plot small empty"></div></div>
+    <div><h4>Peak potential vs scan rate</h4><div id="cv-plot-ep-nu" class="plot small empty"></div></div>
+    <div><h4>Peak separation ΔEp vs scan rate</h4><div id="cv-plot-dep-nu" class="plot small empty"></div></div>
+  </div>
+  <h4>Randles–Ševčík fits</h4>
+  <table id="cv-sr-stats-table" class="stats-table"></table>
+</div>
+
+<!-- ④ Export -->
+<div class="tab-page" data-tab-page="export">
+  <div class="two-col">
+    <div>
+      <fieldset class="group">
+    <legend>Image export options</legend>
+    <div class="form-grid">
+      <label>Format <select id="cv-export-fmt"><option value="png" selected>PNG</option><option value="svg">SVG</option><option value="pdf">PDF</option><option value="tiff">TIFF</option></select></label>
+      <label>DPI <select id="cv-export-dpi"><option>150</option><option selected>300</option><option>600</option></select></label>
+      <label>Style
+        <select id="cv-export-style">
+          <option value="default">Default</option>
+          <option value="origin">Origin</option>
+          <option value="minimal">Minimal</option>
+        </select>
+      </label>
+      <label>Width (in) <input id="cv-export-width" type="number" step="0.1" min="1" placeholder="auto" /></label>
+      <label>Height (in) <input id="cv-export-height" type="number" step="0.1" min="1" placeholder="auto" /></label>
+    </div>
+  </fieldset>
+      <fieldset class="group">
+        <legend>Images</legend>
+        <div class="button-grid">
+          <button id="cv-export-plot-btn" class="primary">CV plot</button>
+          <button id="cv-preview-plot-btn">Preview</button>
+          <button id="cv-export-ipnu-btn">Ip vs ν</button>
+          <button id="cv-export-ipsqrt-btn">Ip vs √ν</button>
+          <button id="cv-export-epnu-btn">Ep vs ν</button>
+          <button id="cv-export-depnu-btn">ΔEp vs ν</button>
+        </div>
+        <div class="row">
+          <select id="cv-preview-sr-kind">
+            <option value="ip_nu">Ip vs ν</option>
+            <option value="ip_sqrt_nu">Ip vs √ν</option>
+            <option value="ep_nu">Ep vs ν</option>
+            <option value="delta_ep">ΔEp vs ν</option>
+          </select>
+          <button id="cv-preview-sr-btn">Preview</button>
+        </div>
+      </fieldset>
+      <fieldset class="group">
+        <legend>Data</legend>
+        <div class="button-grid">
+          <button id="cv-export-peaks-csv-btn">All peaks (CSV)</button>
+          <button id="cv-export-sr-csv-btn">Scan-rate analysis (CSV)</button>
+          <button id="cv-export-raw-btn">Raw data (ZIP of CSVs)</button>
+        </div>
+      </fieldset>
+    </div>
+    <div class="preview-box empty" data-message="Click a Preview button to see the exported image here.">
+    <img id="cv-preview-img" alt="Export preview" />
+  </div>
+  </div>
+</div>

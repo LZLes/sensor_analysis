@@ -1,2 +1,8 @@
 -r requirements.txt
+-r requirements-web.txt
 pytest>=7.4
+httpx>=0.25   # FastAPI TestClient, used by tests/web/
+ruff>=0.6     # lint: ruff check .
+
+# Optional, for the real-browser tests in tests/browser/ (skipped without it):
+#   pip install playwright && python -m playwright install chromium

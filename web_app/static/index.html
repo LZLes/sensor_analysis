@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sensor Calibration Studio</title>
+  <link rel="stylesheet" href="/css/app.css" />
+  <script src="/js/plotly.min.js"></script>
+</head>
+<body>
+  <!-- The app shell. The modes come from /api/app/modes (web_app/registry.py):
+       js/app.js adds a nav button and a <section id="mode-<id>"> per mode,
+       fills it from /modes/<id>.html, then loads js/<id>.js. -->
+  <header>
+    <div class="header-row">
+      <div>
+        <h1>Sensor Calibration Studio</h1>
+        <p class="subtitle">Local app &mdash; your data never leaves this computer</p>
+      </div>
+      <div class="session-controls">
+        <button id="undo-btn" class="header-btn icon" title="Undo (⌘Z)" aria-label="Undo" disabled>↶</button>
+        <button id="redo-btn" class="header-btn icon" title="Redo (⇧⌘Z)" aria-label="Redo" disabled>↷</button>
+        <button id="report-btn" class="header-btn" title="Open a printable report of this mode (print or save it as PDF)">Report</button>
+        <button id="session-export-btn" class="header-btn" title="Save every mode's data and settings to one JSON file (opens in the Streamlit app too)">Export session</button>
+        <label for="session-import-input" class="header-btn button-like">Import session&hellip;</label>
+        <input id="session-import-input" type="file" accept="application/json,.json" hidden />
+        <button id="app-quit-btn" class="header-btn" title="Stop the local server">Quit</button>
+      </div>
+    </div>
+    <nav id="mode-nav"></nav>
+  </header>
+
+  <div id="restore-banner" class="restore-banner" hidden>
+    <span id="restore-text"></span>
+    <button id="restore-btn" class="primary">Restore</button>
+    <button id="restore-discard-btn">Discard</button>
+  </div>
+
+  <main id="modes"></main>
+
+  <div id="toasts" aria-live="polite"></div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>

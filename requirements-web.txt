@@ -1,0 +1,14 @@
+# Everything the local (localhost) web app (web_app/) needs to run — on its
+# own, without requirements.txt. The macOS app's bundled environment is built
+# from this file alone.
+fastapi>=0.110.0
+uvicorn>=0.27.0
+python-multipart>=0.0.9
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
+scipy>=1.11.0
+matplotlib>=3.7.0
+
+# web_app/ shares its maths with the Streamlit app through core/ (core/analysis/
+# never imports Streamlit), so Streamlit is NOT needed to run the web app.

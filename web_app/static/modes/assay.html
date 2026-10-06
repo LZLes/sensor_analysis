@@ -1,0 +1,362 @@
+<!-- assay mode: loaded into <section id="mode-assay"> by js/app.js.
+     Element ids are the contract with js/assay.js. -->
+<div class="plates-bar" id="assay-plates-bar">
+  <span class="plates-label">Plates</span>
+  <div id="assay-plate-chips" class="plate-chips"></div>
+  <button id="assay-plate-add-toggle" class="link-btn" title="Add another plate to this experiment">+ Plate</button>
+  <span id="assay-plate-add-form" class="plate-add-form" hidden>
+    <input id="assay-plate-add-name" type="text" size="12" placeholder="Plate 2" />
+    <label class="inline" title="Copy this plate's standards and blank"><input id="assay-plate-add-copy" type="checkbox" checked /> Same standards</label>
+    <label class="inline" title="Only if the new plate holds the same samples: wells with the same subject and timepoint are pooled as replicates"><input id="assay-plate-add-samples" type="checkbox" /> Same sample labels</label>
+    <button id="assay-plate-add-btn" class="primary">Add</button>
+    <button id="assay-plate-add-cancel" class="link-btn">Cancel</button>
+  </span>
+  <span class="hint plates-hint">Each tab works on the selected plate; ④ Results and ⑤ Normalise pool all plates.</span>
+</div>
+
+<div class="tabs">
+  <button class="tab-btn active" data-tab="import">① Import</button>
+  <button class="tab-btn" data-tab="layout">② Plate Layout</button>
+  <button class="tab-btn" data-tab="curve">③ Standard Curve</button>
+  <button class="tab-btn" data-tab="results">④ Results</button>
+  <button class="tab-btn" data-tab="normalise">⑤ Normalise &amp; Export</button>
+</div>
+
+<!-- ① Import -->
+<div class="tab-page active" data-tab-page="import">
+  <div class="two-col">
+    <div>
+      <fieldset class="group">
+        <legend>Paste from Excel / plate-reader software</legend>
+        <div class="group-body">
+          <textarea id="assay-paste" rows="6" placeholder="Copy the 8×12 block of values (with or without the A–H / 1–12 labels) and paste it here — or press ⌘V anywhere on this tab"></textarea>
+          <button id="assay-paste-btn" class="primary">Load pasted values</button>
+        </div>
+      </fieldset>
+      <div class="row">
+        <label for="assay-file-input" class="button-like">Browse plate file&hellip;</label>
+        <input id="assay-file-input" type="file" accept=".csv,.txt,.tsv" hidden />
+        <button id="assay-sample-btn">Load sample plate</button>
+        <button id="assay-clear-btn" class="danger" hidden>Clear plate</button>
+      </div>
+      <div id="assay-dropzone" class="dropzone">Drop a plate-reader file here (TECAN, Synergy, generic CSV/TSV with rows A–H)</div>
+      <fieldset class="group">
+        <legend>Readout &amp; units</legend>
+        <div class="form-grid">
+          <label>Readout
+            <select id="assay-readout-type">
+              <option value="absorbance">Absorbance (colourimetric)</option>
+              <option value="fluorescence">Fluorescence</option>
+              <option value="luminescence">Luminescence</option>
+              <option value="other">Other</option>
+            </select>
+          </label>
+          <label data-readout="absorbance">Wavelength (nm) <input id="assay-readout-wl" type="text" size="6" placeholder="450" /></label>
+          <label data-readout="fluorescence">Ex (nm) <input id="assay-readout-ex" type="text" size="6" placeholder="485" /></label>
+          <label data-readout="fluorescence">Em (nm) <input id="assay-readout-em" type="text" size="6" placeholder="528" /></label>
+          <label>Signal unit <input id="assay-sig-unit" type="text" size="8" title="e.g. Abs, RFU, RLU" /></label>
+          <label>Concentration unit <input id="assay-conc-unit" type="text" size="8" title="e.g. µM, nM, ng/mL" /></label>
+        </div>
+        <p class="hint">The readout is recorded in the exported CSVs. It doesn't change the maths; the curve fits work whether the signal rises or falls with concentration.</p>
+      </fieldset>
+      <div id="assay-plate-status" class="hint"></div>
+    </div>
+    <div>
+      <h3>Plate map</h3>
+      <p class="empty-note needs-data">Paste, load or type in plate data to see the plate map.</p>
+      <div id="assay-plate-map" class="plot plate empty"></div>
+    </div>
+  </div>
+  <details class="collapsible">
+    <summary>Edit values by hand</summary>
+    <div class="group-body">
+      <div class="table-scroll"><table id="assay-grid" class="plate-grid"></table></div>
+      <button id="assay-grid-apply-btn" class="primary" disabled>Apply manual values</button>
+    </div>
+  </details>
+</div>
+
+<!-- ② Plate Layout -->
+<div class="tab-page" data-tab-page="layout">
+  <p class="hint">Select wells on the plate (click, drag a box, shift-click to extend, ⌘/Ctrl-click to add; click a row letter or column number to take the whole row or column). Then assign them on the right.</p>
+  <div class="layout-cols">
+    <div>
+      <div id="assay-plate-canvas" class="plate-canvas"></div>
+      <div class="row plate-legend">
+        <span class="legend-swatch role-blank"></span>Blank
+        <span class="legend-swatch role-std"></span>Standard
+        <span class="legend-swatch role-sample"></span>Sample (coloured by subject)
+        <span class="legend-swatch role-data"></span>Unassigned
+        <span class="legend-swatch excluded"></span>Excluded
+      </div>
+      <div class="row">
+        <span id="assay-sel-info" class="hint">No wells selected.</span>
+        <button id="assay-sel-clear-btn" class="link-btn">Clear selection</button>
+      </div>
+      <ul id="assay-layout-problems" class="problems"></ul>
+    </div>
+    <div class="assign-panel">
+      <div class="seg" id="assay-assign-seg">
+        <button class="seg-btn active" data-assign="samples">Samples</button>
+        <button class="seg-btn" data-assign="standards">Standards</button>
+        <button class="seg-btn" data-assign="blank">Blank</button>
+        <button class="seg-btn" data-assign="exclude">Exclude</button>
+        <button class="seg-btn" data-assign="clear">Clear</button>
+      </div>
+
+      <div class="assign-form" data-assign-form="samples">
+        <label class="stack">Subjects
+          <input id="assay-subjects" type="text" placeholder="e.g. P01-P12 or Mouse A, Mouse B" />
+        </label>
+        <label class="stack">Timepoints <span class="hint">(optional)</span>
+          <input id="assay-timepoints" type="text" placeholder="e.g. D0, D3, D7 or 0-24h by 6" />
+        </label>
+        <div class="form-grid">
+          <label>Replicates <input id="assay-reps" type="number" min="1" max="12" value="2" /></label>
+          <label>Fill order
+            <select id="assay-fill-order">
+              <option value="rows">Along rows (A1, A2, …)</option>
+              <option value="columns">Down columns (A1, B1, …)</option>
+            </select>
+          </label>
+          <label>Keep together
+            <select id="assay-nesting">
+              <option value="subject">Each subject's timepoints</option>
+              <option value="timepoint">Each timepoint's subjects</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">Ranges expand automatically: <code>P01-P12</code>, <code>Day 0 - Day 14 by 7</code>. Separate items with commas or new lines. Replicates are consecutive wells in the fill order.</p>
+        <button id="assay-assign-samples-btn" class="primary">Label selected wells</button>
+      </div>
+
+      <div class="assign-form" data-assign-form="standards" hidden>
+        <div class="form-grid">
+          <label>Replicates are
+            <select id="assay-std-direction">
+              <option value="across">Down a column (levels go across)</option>
+              <option value="down">Along a row (levels go down)</option>
+            </select>
+          </label>
+          <label>Concentrations
+            <select id="assay-std-mode">
+              <option value="serial">Serial dilution</option>
+              <option value="list">Type a list</option>
+            </select>
+          </label>
+        </div>
+        <div class="form-grid" data-std-mode="serial">
+          <label>Top conc <input id="assay-std-top" type="number" step="any" min="0" value="100" /></label>
+          <label>Dilution factor <input id="assay-std-factor" type="number" step="any" min="1" value="2" /></label>
+          <label class="inline"><input id="assay-std-blank" type="checkbox" checked /> Last level is a 0 blank</label>
+          <label class="inline"><input id="assay-std-lowfirst" type="checkbox" /> Lowest concentration first</label>
+        </div>
+        <label class="stack" data-std-mode="list" hidden>Concentrations, in level order
+          <input id="assay-std-list" type="text" placeholder="e.g. 0, 1, 2, 5, 10, 20, 50, 100" />
+        </label>
+        <p class="hint">Up to 12 replicates per level (the Streamlit app reads the first 3). A level at 0 becomes the blank, which is subtracted from every well. This replaces the current standards.</p>
+        <button id="assay-assign-standards-btn" class="primary">Set as standards</button>
+      </div>
+
+      <div class="assign-form" data-assign-form="blank" hidden>
+        <p class="hint">Select the wells containing only buffer or diluent (at least 2 for LOD/LOQ). Their mean signal is subtracted from every well before fitting.</p>
+        <button id="assay-assign-blank-btn" class="primary">Mark as blank</button>
+      </div>
+
+      <div class="assign-form" data-assign-form="exclude" hidden>
+        <p class="hint">Leave outlier wells (a bubble, a pipetting error) out of every calculation: the standard curve, the blank and the sample means. They stay on the plate, struck through, and can be put back at any time. The curve refits straight away.</p>
+        <div class="row">
+          <button id="assay-exclude-btn" class="primary">Exclude selected wells</button>
+          <button id="assay-include-btn">Include them again</button>
+        </div>
+      </div>
+
+      <div class="assign-form" data-assign-form="clear" hidden>
+        <p class="hint">Remove the selected wells from the standards and samples. Wells with data but no label still get a concentration in ④, listed by well.</p>
+        <button id="assay-assign-clear-btn" class="danger">Clear selected wells</button>
+      </div>
+
+      <div id="assay-assign-preview" class="status"></div>
+
+      <details class="collapsible">
+        <summary>Paste a layout from Excel</summary>
+        <div class="group-body">
+          <p class="hint">An 8×12 block of labels, laid out like the plate. <code>Blank</code> marks blanks, <code>Std 10</code> marks a standard at 10, and anything else is a sample split into subject and timepoint (e.g. <code>P01_D7</code>). Empty cells are skipped.</p>
+          <textarea id="assay-layout-paste" rows="5"></textarea>
+          <div class="row">
+            <label>Subject/timepoint separator
+              <select id="assay-layout-sep">
+                <option value="auto">Auto (_ / | or space)</option>
+                <option value="_">_</option>
+                <option value="/">/</option>
+                <option value="|">|</option>
+                <option value=" ">space</option>
+                <option value="-">-</option>
+                <option value="none">None (whole cell is the subject)</option>
+              </select>
+            </label>
+            <button id="assay-layout-paste-btn">Apply pasted layout</button>
+          </div>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <details class="collapsible" id="assay-templates-details">
+    <summary>Layout templates</summary>
+    <div class="group-body">
+      <p class="hint">Save this plate's layout (standards, sample labels), readout and units to reuse on the next run. Templates are kept on this computer, and can be downloaded to share.</p>
+      <div class="row">
+        <select id="assay-template-select"></select>
+        <button id="assay-template-apply-btn" class="primary">Apply to this plate</button>
+        <button id="assay-template-download-btn">Download</button>
+        <button id="assay-template-delete-btn" class="danger">Delete</button>
+      </div>
+      <div class="row">
+        <input id="assay-template-name" type="text" size="20" placeholder="Template name" />
+        <button id="assay-template-save-btn">Save current layout</button>
+        <label for="assay-template-upload" class="button-like">Add from file&hellip;</label>
+        <input id="assay-template-upload" type="file" accept="application/json,.json" hidden />
+      </div>
+    </div>
+  </details>
+
+  <details class="collapsible" id="assay-tables-details">
+    <summary>Edit the layout as tables</summary>
+    <div class="group-body two-col">
+      <div>
+        <h4>Standards</h4>
+        <p class="hint">One row per level. <strong>The first row is the blank.</strong></p>
+        <div id="assay-std-table" class="table-scroll"></div>
+        <button id="assay-std-add-btn">+ Level</button>
+        <button id="assay-std-addrep-btn" title="Add a replicate column (Set 4, Set 5, …)">+ Replicate</button>
+      </div>
+      <div>
+        <h4>Samples</h4>
+        <p class="hint">Pasting several lines from Excel into a cell fills the cells below it.</p>
+        <div id="assay-sample-table" class="table-scroll tall"></div>
+        <button id="assay-sample-add-btn">+ Sample</button>
+      </div>
+    </div>
+    <div class="row sticky-actions">
+      <button id="assay-layout-apply-btn" class="primary">Apply table edits</button>
+      <button id="assay-layout-reset-btn">Discard changes</button>
+      <span id="assay-layout-dirty" class="dirty-badge" hidden>unsaved changes</span>
+    </div>
+  </details>
+</div>
+
+<!-- ③ Standard Curve -->
+<div class="tab-page" data-tab-page="curve">
+  <p class="empty-note needs-data">Import plate data in ① first.</p>
+  <div class="row" id="assay-curve-source-row" hidden>
+    <label>Standards <select id="assay-curve-source"></select></label>
+    <span class="hint">A plate without its own standards can use another plate's curve; its own blank is used if it has one.</span>
+  </div>
+  <div class="row">
+    <label>Fit type <select id="assay-fit-type"></select></label>
+    <label class="inline"><input id="assay-show-reps" type="checkbox" checked /> Show individual replicates</label>
+    <button id="assay-compute-btn" class="primary">Compute standard curve</button>
+  </div>
+  <div id="assay-curve-status" class="status"></div>
+  <div id="assay-equation" class="equation"></div>
+  <div id="assay-qc" class="qc-strip" hidden></div>
+  <div id="assay-curve-plot" class="plot empty"></div>
+  <h4>Standards</h4>
+  <p class="hint">Recovery = back-calculated ÷ nominal concentration; ⚠ marks levels outside 80–120%. To leave out an outlier replicate, use Exclude on ② Plate Layout.</p>
+  <div class="table-scroll"><table id="assay-standards-table" class="stats-table"></table></div>
+</div>
+
+<!-- ④ Results -->
+<div class="tab-page" data-tab-page="results">
+  <div id="assay-results-status" class="status"></div>
+  <h3>Per sample</h3>
+  <p class="hint">Mean ± SD of the replicate wells' back-calculated concentrations. Wells that can't be back-calculated or are excluded are left out of the mean; flags show replicates outside the standard range or below the LOD/LOQ.</p>
+  <div class="two-col">
+    <div class="table-scroll tall"><table id="assay-groups-table" class="stats-table"></table></div>
+    <div id="assay-groups-plot" class="plot empty"></div>
+  </div>
+  <div class="two-col">
+    <div>
+      <h3>Per well</h3>
+      <p class="hint">Highlighted rows are flagged. Untick <b>Use</b> to exclude a well (from this plate's means and, for standards, its curve).</p>
+      <div class="table-scroll tall"><table id="assay-results-table" class="stats-table"></table></div>
+    </div>
+    <div>
+      <h3>Results plate map</h3>
+      <p class="hint">Sample wells show back-calculated concentration.</p>
+      <div id="assay-results-map" class="plot plate empty"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ⑤ Normalise & Export -->
+<div class="tab-page" data-tab-page="normalise">
+  <div id="assay-norm-status" class="status"></div>
+  <div class="two-col">
+    <div>
+      <h3>Normalise by area</h3>
+      <p class="hint">Per sample: <b>sample conc</b> = well conc × dilution, <b>amount</b> = sample conc × volume (when a volume is given), <b>per area</b> = amount (or sample conc) ÷ area. Leave dilution blank for 1. Pasting a column from Excel into a cell fills the cells below it.</p>
+      <div class="form-grid">
+        <label>Volume unit <input id="assay-norm-vol-unit" type="text" size="6" /></label>
+        <label>Area unit <input id="assay-norm-area-unit" type="text" size="6" /></label>
+      </div>
+      <div class="row">
+        <label>Fill all: <select id="assay-norm-fill-col"><option>Dilution</option><option>Volume</option><option>Area</option></select></label>
+        <input id="assay-norm-fill-val" type="text" size="8" placeholder="value" />
+        <button id="assay-norm-fill-btn">Fill column</button>
+      </div>
+      <div id="assay-norm-inputs" class="table-scroll tall"></div>
+      <div class="row">
+        <button id="assay-norm-apply-btn" class="primary">Apply</button>
+        <span id="assay-norm-dirty" class="dirty-badge" hidden>unsaved changes</span>
+      </div>
+    </div>
+    <div>
+      <div id="assay-norm-plot" class="plot empty"></div>
+    </div>
+  </div>
+  <div class="table-scroll"><table id="assay-norm-table" class="stats-table"></table></div>
+
+  <h3>Export</h3>
+  <div class="two-col">
+    <div>
+      <fieldset class="group">
+        <legend>Data (CSV)</legend>
+        <div class="button-grid">
+          <button id="assay-export-summary-btn" class="primary">Per-sample summary</button>
+          <button id="assay-export-wide-btn">Summary, subjects × timepoints</button>
+          <button id="assay-export-normalised-btn">Normalised results</button>
+          <button id="assay-export-results-btn">Per-well results</button>
+          <button id="assay-export-standards-btn">Standard-curve data</button>
+        </div>
+      </fieldset>
+      <fieldset class="group">
+        <legend>Image export options</legend>
+        <div class="form-grid">
+          <label>Format <select id="assay-export-fmt"><option value="png" selected>PNG</option><option value="svg">SVG</option><option value="pdf">PDF</option><option value="tiff">TIFF</option></select></label>
+          <label>DPI <select id="assay-export-dpi"><option>150</option><option selected>300</option><option>600</option></select></label>
+          <label>Style
+            <select id="assay-export-style">
+              <option value="default">Default</option>
+              <option value="origin">Origin</option>
+              <option value="minimal">Minimal</option>
+            </select>
+          </label>
+          <label>Width (in) <input id="assay-export-width" type="number" step="0.1" min="1" placeholder="auto" /></label>
+          <label>Height (in) <input id="assay-export-height" type="number" step="0.1" min="1" placeholder="auto" /></label>
+        </div>
+      </fieldset>
+      <fieldset class="group">
+        <legend>Standard-curve image</legend>
+        <div class="button-grid">
+          <button id="assay-export-curve-btn" class="primary">Download image</button>
+          <button id="assay-preview-curve-btn">Preview</button>
+        </div>
+      </fieldset>
+    </div>
+    <div class="preview-box empty" data-message="Click a Preview button to see the exported image here.">
+      <img id="assay-preview-img" alt="Export preview" />
+    </div>
+  </div>
+</div>

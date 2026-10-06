@@ -13,39 +13,11 @@ from core.constants import PAL, _MIME, _plot_theme, fmt
 from core.numeric import to_num, lin_reg
 from core.parsing import parse_potentiostat_csv
 from core.plotting import _ORIGIN_RC, _MINIMAL_RC, _apply_spine_style
+from core.analysis.cv import (  # noqa: F401  (re-exported)
+    find_cv_peaks,
+)
 
 SS = st.session_state
-
-
-def find_cv_peaks(voltage: np.ndarray, current: np.ndarray,
-                  prominence: float, distance: int,
-                  width: int | None = None,
-                  height: float | None = None) -> dict:
-    """
-    Detect anodic (local maxima) and cathodic (local minima) peaks in a CV trace.
-    prominence : min height relative to surrounding baseline (0 = no filter,
-                 same convention as width/height below)
-    distance   : min data-points between peaks
-    width      : min peak width in data-points (None = no filter)
-    height     : min absolute |Ip| (applied to both anodic and cathodic; None = no filter)
-    Returns {anodic: [{Ep, Ip}, …], cathodic: [{Ep, Ip}, …]}.
-    """
-    import scipy.signal  # type: ignore[import-untyped]
-    mask = ~(np.isnan(voltage) | np.isnan(current))
-    v, i = voltage[mask], current[mask]
-    if len(v) < 5:
-        return {"anodic": [], "cathodic": []}
-    _kw: dict = dict(distance=max(1, distance))
-    if prominence > 0:                     _kw["prominence"] = prominence
-    if width  is not None and width  > 0:  _kw["width"]  = width
-    if height is not None and height > 0:  _kw["height"] = height
-    anodic_idx,   _ = scipy.signal.find_peaks(i,  **_kw)
-    cathodic_idx, _ = scipy.signal.find_peaks(-i, **_kw)
-    return {
-        "anodic":   [{"Ep": float(v[k]), "Ip": float(i[k])} for k in anodic_idx],
-        "cathodic": [{"Ep": float(v[k]), "Ip": float(i[k])} for k in cathodic_idx],
-    }
-
 
 
 def render() -> None:
@@ -76,11 +48,11 @@ def render() -> None:
     
         def _render_cv_plot(figsize, fmt, dpi, rc, style):
             """All-runs CV plot (Viridis by scan rate, dash by channel)."""
-            import matplotlib.cm as _mcm
             with matplotlib.rc_context(rc):
                 _fg, _ax = plt.subplots(figsize=figsize)
                 _n = len(SS.cv_runs)
-                _cm = _mcm.get_cmap("viridis", max(1, _n))
+                # matplotlib.cm.get_cmap was removed in Matplotlib 3.9.
+                _cm = matplotlib.colormaps["viridis"].resampled(max(1, _n))
                 for _ri, _rn in enumerate(SS.cv_runs):
                     _cl = _cm(_ri / max(1, _n - 1))
                     for _ci, _ch in enumerate(_rn["channels"]):
