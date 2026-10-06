@@ -3,7 +3,6 @@
 import os
 
 import numpy as np
-import streamlit as st
 
 
 APP_VERSION = "1.0.0"
@@ -24,6 +23,7 @@ _SAMPLE_DATA_DIR = os.path.join(
 
 def _plot_theme() -> dict:
     """Plotly styling that adapts to the user's actual Streamlit theme (light/dark)."""
+    import streamlit as st  # only here: the rest of core/ stays importable without Streamlit
     is_dark = st.context.theme.type != "light"   # None (unknown) treated as dark, today's default
     return dict(
         template   = "plotly_dark" if is_dark else "plotly_white",

@@ -32,8 +32,12 @@ def _patch_apptest_segmented_control_bug() -> None:
     widget is on screen. Reproduced with a 3-line script containing only
     st.segmented_control + st.button — confirmed independent of this
     app's code. Patched here (test-harness only, real browser users never
-    hit this code path) so e2e tests can drive multi-step flows normally."""
-    from streamlit.testing.v1 import element_tree
+    hit this code path) so e2e tests can drive multi-step flows normally.
+    A no-op without Streamlit (the web-only test run doesn't install it)."""
+    try:
+        from streamlit.testing.v1 import element_tree
+    except ImportError:
+        return
 
     def _patched_indices(self):
         v = self.value
@@ -96,7 +100,6 @@ def make_mode_apptest(mode_module: str):
 def amp_sample_files():
     """Two synthetic amperometry runs (2 channels each), matching the
     shape modes.amperometry._load_sample_data() builds from sample_data/."""
-    from core.calibration_table import _default_cpdf
 
     def _one(name, seed):
         rng = np.random.default_rng(seed)

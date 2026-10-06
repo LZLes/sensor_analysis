@@ -3,9 +3,11 @@ Pure plate-layout, grouping and normalisation helpers for the web app's Assay
 mode (no FastAPI/session code here, so they're unit-testable on their own).
 
 Layout model, shared with the Streamlit app's session keys:
-  * std_df (Label, Conc, S1, S2, S3): one row per concentration level, up to
-    3 replicate wells. Row 0 is the blank (its mean is subtracted from every
-    well), exactly as in modes/assay.py.
+  * std_df (Label, Conc, S1, S2, S3[, S4 …]): one row per concentration
+    level. Row 0 is the blank (its mean is subtracted from every well),
+    exactly as in modes/assay.py. The Streamlit app reads S1–S3 only; the web
+    app allows up to MAX_REPS replicate columns and its session export keeps
+    the Streamlit keys to S1–S3 (web_app/api/assay.py).
   * sample_df (Well, Label, Subject, Timepoint): one row per sample well.
     Streamlit only reads Well/Label; Subject/Timepoint ride along as extra
     columns. Label is composed from them ("P01 · D7") when left blank, so a
@@ -24,7 +26,8 @@ import numpy as np
 import pandas as pd
 
 ROWS = "ABCDEFGH"
-STD_COLUMNS = ["Label", "Conc", "S1", "S2", "S3"]
+STD_COLUMNS = ["Label", "Conc", "S1", "S2", "S3"]   # the Streamlit schema; S4+ are web-only
+MAX_REPS = 12
 SAMPLE_COLUMNS = ["Well", "Label", "Subject", "Timepoint"]
 NORM_COLUMNS = ["Subject", "Timepoint", "Dilution", "Volume", "Area"]
 _WELL_RE = re.compile(r"^([A-H])(1[0-2]|0?[1-9])$")
@@ -73,6 +76,30 @@ def sort_wells(wells: list[str], order: str = "rows") -> list[str]:
     return sorted(wells, key=key)
 
 
+def rep_cols(std_df: pd.DataFrame | None) -> list[str]:
+    """Replicate columns in order: S1–S3 always, plus any S4… present."""
+    extra = sorted((c for c in (std_df.columns if std_df is not None else [])
+                    if re.fullmatch(r"S\d+", str(c)) and int(str(c)[1:]) > 3), key=lambda c: int(c[1:]))
+    return ["S1", "S2", "S3", *extra]
+
+
+def std_columns(n_reps: int) -> list[str]:
+    return ["Label", "Conc", *[f"S{i + 1}" for i in range(max(3, n_reps))]]
+
+
+def trim_reps(std_df: pd.DataFrame) -> pd.DataFrame:
+    """Drop trailing replicate columns beyond S3 that no row uses."""
+    cols = rep_cols(std_df)
+    while len(cols) > 3 and not any(txt(v) for v in std_df[cols[-1]]):
+        std_df = std_df.drop(columns=cols.pop())
+    return std_df
+
+
+def _std_frame(rows: list[dict]) -> pd.DataFrame:
+    n = max([int(k[1:]) for r in rows for k in r if re.fullmatch(r"S\d+", k)] + [3])
+    return pd.DataFrame(rows, columns=std_columns(n)).fillna({f"S{i + 1}": "" for i in range(n)})
+
+
 def compose_label(subject: str, timepoint: str) -> str:
     return " · ".join(p for p in (subject, timepoint) if p)
 
@@ -99,11 +126,12 @@ def normalize_sample_df(df: pd.DataFrame | None) -> pd.DataFrame:
 def _without_wells_std(std_df: pd.DataFrame, wells: set[str]) -> pd.DataFrame:
     """Blank out the given wells in the standards table; drop non-blank
     levels left with no wells at all."""
-    std = std_df.reindex(columns=STD_COLUMNS).copy()
-    for c in ("S1", "S2", "S3"):
+    cols = rep_cols(std_df)
+    std = std_df.reindex(columns=["Label", "Conc", *cols]).copy()
+    for c in cols:
         std[c] = std[c].map(lambda v: "" if txt(v).upper() in wells else txt(v).upper())
-    keep = [i == 0 or any(std.iloc[i][c] for c in ("S1", "S2", "S3")) for i in range(len(std))]
-    return std[keep].reset_index(drop=True)
+    keep = [i == 0 or any(std.iloc[i][c] for c in cols) for i in range(len(std))]
+    return trim_reps(std[keep].reset_index(drop=True))
 
 
 def _without_wells_samples(sample_df: pd.DataFrame, wells: set[str]) -> pd.DataFrame:
@@ -190,11 +218,11 @@ def assign_standards(std_df: pd.DataFrame, sample_df: pd.DataFrame, wells, direc
     elsewhere on the plate is kept."""
     wells = clean_wells(wells)
     levels = group_levels(wells, direction)
-    too_many = [i + 1 for i, lv in enumerate(levels) if len(lv) > 3]
+    too_many = [i + 1 for i, lv in enumerate(levels) if len(lv) > MAX_REPS]
     if too_many:
         along = "rows" if direction == "across" else "columns"
-        raise ValueError(f"Each level can have at most 3 replicate wells (Set 1–3), but the selection spans "
-                         f"{max(len(lv) for lv in levels)} {along}. Select at most 3 {along}, or switch the "
+        raise ValueError(f"Each level can have at most {MAX_REPS} replicate wells, but the selection spans "
+                         f"{max(len(lv) for lv in levels)} {along}. Select fewer {along}, or switch the "
                          "replicate direction.")
     if len(concs) != len(levels):
         raise ValueError(f"The selection has {len(levels)} concentration level(s) but {len(concs)} "
@@ -211,38 +239,40 @@ def assign_standards(std_df: pd.DataFrame, sample_df: pd.DataFrame, wells, direc
     if blank:
         rows.append({"Label": "Blank", "Conc": 0.0, **_sets(blank[0][1])})
     else:
-        old = std_df.reindex(columns=STD_COLUMNS)
-        old_blank_wells = [txt(old.iloc[0][c]).upper() for c in ("S1", "S2", "S3")] if len(old) else []
+        old = std_df.reindex(columns=["Label", "Conc", *rep_cols(std_df)])
+        old_blank_wells = [txt(old.iloc[0][c]).upper() for c in rep_cols(std_df)] if len(old) else []
         old_conc = pd.to_numeric(old.iloc[0]["Conc"], errors="coerce") if len(old) else np.nan
         if old_conc == 0 and any(old_blank_wells) and not (set(old_blank_wells) & sel):
-            rows.append({"Label": "Blank", "Conc": 0.0, **{f"S{i + 1}": w for i, w in enumerate(old_blank_wells)}})
+            rows.append({"Label": "Blank", "Conc": 0.0, **_sets([w for w in old_blank_wells if w])})
             note = f" Kept the existing blank ({', '.join(w for w in old_blank_wells if w)})."
         else:
             note = " No blank yet — select the blank wells and use Mark as blank."
     rows += [{"Label": f"Std {fmt_conc(c)}", "Conc": float(c), **_sets(lv)} for c, lv in stds]
-    std = pd.DataFrame(rows, columns=STD_COLUMNS)
+    std = _std_frame(rows)
     msg = (f"{len(levels)} level(s) × up to {max(len(lv) for lv in levels)} replicate(s) assigned as standards."
            + note)
     return std, _without_wells_samples(sample_df, sel), msg
 
 
 def _sets(level_wells: list[str]) -> dict:
-    return {f"S{i + 1}": (level_wells[i] if i < len(level_wells) else "") for i in range(3)}
+    return {f"S{i + 1}": (level_wells[i] if i < len(level_wells) else "") for i in range(max(3, len(level_wells)))}
 
 
 def assign_blank(std_df: pd.DataFrame, sample_df: pd.DataFrame, wells) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     wells = clean_wells(wells)
-    if len(wells) > 3:
-        raise ValueError(f"The blank can have at most 3 replicate wells; {len(wells)} are selected.")
+    if len(wells) > MAX_REPS:
+        raise ValueError(f"The blank can have at most {MAX_REPS} replicate wells; {len(wells)} are selected.")
     sel = set(wells)
     std = _without_wells_std(std_df, sel)
     blank_row = {"Label": "Blank", "Conc": 0.0, **_sets(sort_wells(wells))}
     has_blank = len(std) and pd.to_numeric(std.iloc[0]["Conc"], errors="coerce") == 0
     body = std.iloc[1:] if has_blank else std
-    std = pd.concat([pd.DataFrame([blank_row], columns=STD_COLUMNS), body], ignore_index=True)
+    std = pd.concat([_std_frame([blank_row]), body], ignore_index=True)
+    cols = rep_cols(std)
+    std[cols] = std[cols].map(txt)
     # A level emptied by moving its wells to the blank isn't useful any more.
-    keep = [i == 0 or any(txt(std.iloc[i][c]) for c in ("S1", "S2", "S3")) for i in range(len(std))]
-    std = std[keep].reset_index(drop=True)
+    keep = [i == 0 or any(std.iloc[i][c] for c in cols) for i in range(len(std))]
+    std = trim_reps(std[keep].reset_index(drop=True))
     return std, _without_wells_samples(sample_df, sel), f"Blank set to {', '.join(sort_wells(wells))}."
 
 
@@ -382,15 +412,16 @@ def apply_layout_grid(std_df: pd.DataFrame, cells: list[tuple[str, str]], sep: s
         s, t = split_label(cell, sep)
         samples.append({"Well": well, "Subject": s, "Timepoint": t, "Label": compose_label(s, t)})
     for conc, ws in std_cells.items():
-        if len(ws) > 3:
-            raise ValueError(f"Standard {fmt_conc(conc)} appears in {len(ws)} wells; at most 3 replicates are supported.")
+        if len(ws) > MAX_REPS:
+            raise ValueError(f"Standard {fmt_conc(conc)} appears in {len(ws)} wells; "
+                             f"at most {MAX_REPS} replicates are supported.")
     sample_wells = {p["Well"] for p in samples}
     if std_cells:
         rows = []
         if 0.0 in std_cells:
             rows.append({"Label": "Blank", "Conc": 0.0, **_sets(sort_wells(std_cells.pop(0.0)))})
         rows += [{"Label": f"Std {fmt_conc(c)}", "Conc": c, **_sets(sort_wells(ws))} for c, ws in sorted(std_cells.items())]
-        std = pd.DataFrame(rows, columns=STD_COLUMNS)
+        std = _std_frame(rows)
         std_msg = f"{len(rows)} standard level(s)"
     else:
         std = _without_wells_std(std_df, sample_wells)
@@ -415,20 +446,29 @@ def group_key(row: dict) -> tuple[str, str]:
 
 def group_results(rows: list[dict]) -> list[dict]:
     """Per-well results -> one row per sample: n, mean/SD/CV of the
-    back-calculated concentration (undefined wells excluded)."""
+    back-calculated concentration. Undefined wells don't count; wells marked
+    Excluded are listed but left out of n and the statistics. Rows from
+    several plates (a "Plate" key) group together by sample."""
     groups: dict[tuple[str, str], list[dict]] = {}
     for r in rows:
         groups.setdefault(group_key(r), []).append(r)
     out = []
     for (s, t), rs in groups.items():
-        vals = np.array([r["Conc"] for r in rs if r["Conc"] is not None and np.isfinite(r["Conc"])], dtype=float)
+        used = [r for r in rs if not r.get("Excluded")]
+        vals = np.array([r["Conc"] for r in used if r["Conc"] is not None and np.isfinite(r["Conc"])], dtype=float)
         n = len(vals)
         mean = float(vals.mean()) if n else np.nan
         sd = float(vals.std(ddof=1)) if n > 1 else np.nan
         cv = abs(sd / mean) * 100 if n > 1 and mean else np.nan
-        flags = sorted({r["Flag"] for r in rs if r["Flag"]})
+        flags = sorted({f for r in used for f in txt(r["Flag"]).split(", ") if f})
+        n_excl = len(rs) - len(used)
+        if n_excl:
+            flags.append(f"{n_excl} excluded")
+        multi_plate = len({r.get("Plate") for r in rs}) > 1
+        wells = ", ".join((f"{r['Plate']}:{r['Well']}" if multi_plate else r["Well"]) + (" (excl.)" if r.get("Excluded") else "")
+                          for r in rs)
         out.append({"Subject": s, "Timepoint": t, "n": n, "Mean": mean, "SD": sd, "CV": cv,
-                    "Wells": ", ".join(r["Well"] for r in rs), "Flag": ", ".join(flags)})
+                    "Wells": wells, "Flag": ", ".join(flags)})
     return out
 
 

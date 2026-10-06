@@ -1,4 +1,4 @@
-"""Pure-function tests for web_app/api/assay_layout.py (plate layout,
+"""Pure-function tests for core/analysis/assay_layout.py (plate layout,
 subject/timepoint labelling, grouping, normalisation)."""
 import numpy as np
 import pandas as pd
@@ -6,7 +6,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from web_app.api import assay_layout as lay  # noqa: E402
+from core.analysis import assay_layout as lay  # noqa: E402
 from web_app.session import default_assay_sample_df, default_assay_std_df  # noqa: E402
 
 
@@ -39,10 +39,21 @@ def test_assign_standards_puts_blank_first_and_removes_sample_labels():
     assert s.empty
 
 
-def test_assign_standards_rejects_more_than_three_replicates_and_count_mismatch():
-    wells = [f"{r}1" for r in "ABCD"]
-    with pytest.raises(ValueError, match="at most 3"):
-        lay.assign_standards(default_assay_std_df(), default_assay_sample_df(), wells, "across", [1])
+def test_assign_standards_allows_extra_replicate_columns_up_to_the_limit():
+    wells = [f"{r}{c}" for r in "ABCD" for c in (1, 2)]
+    std, _, _ = lay.assign_standards(default_assay_std_df(), default_assay_sample_df(), wells, "across", [0, 5])
+    assert lay.rep_cols(std) == ["S1", "S2", "S3", "S4"]
+    assert std.iloc[1][["S1", "S4"]].tolist() == ["A2", "D2"]
+    # Removing the 4th replicate drops the now-empty S4 column again.
+    std2, _ = lay.clear_wells(std, default_assay_sample_df(), ["D1", "D2"])
+    assert lay.rep_cols(std2) == ["S1", "S2", "S3"]
+    # A pasted layout can name more wells per level than one plate row holds.
+    too_many = "\n".join("\t".join(["Std 5"] * 12) for _ in range(2))
+    with pytest.raises(ValueError, match=f"at most {lay.MAX_REPS}"):
+        lay.apply_layout_grid(default_assay_std_df(), lay.parse_layout_grid(too_many), "auto")
+
+
+def test_assign_standards_rejects_count_mismatch():
     with pytest.raises(ValueError, match="2 concentration"):
         lay.assign_standards(default_assay_std_df(), default_assay_sample_df(), ["A1", "A2", "A3"], "across", [1, 2])
 
@@ -79,8 +90,10 @@ def test_assign_blank_replaces_row_zero_and_drops_emptied_levels():
     std, _, _ = lay.assign_blank(default_assay_std_df(), default_assay_sample_df(), ["A2", "B2", "C2"])
     assert std.iloc[0][["Label", "Conc", "S1"]].tolist() == ["Blank", 0.0, "A2"]
     assert "Std 2" not in std["Label"].tolist() and len(std) == 7
+    std4, _, _ = lay.assign_blank(default_assay_std_df(), default_assay_sample_df(), ["H1", "H2", "H3", "H4"])
+    assert std4.iloc[0][["S1", "S4"]].tolist() == ["H1", "H4"]
     with pytest.raises(ValueError):
-        lay.assign_blank(default_assay_std_df(), default_assay_sample_df(), ["H1", "H2", "H3", "H4"])
+        lay.assign_blank(default_assay_std_df(), default_assay_sample_df(), [f"H{c}" for c in range(1, 13)] + ["G1"])
 
 
 def test_layout_grid_paste_with_headers_standards_and_samples():

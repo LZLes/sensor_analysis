@@ -5,7 +5,7 @@
 # The app is a small stay-open AppleScript applet (packaging/app.applescript)
 # that starts the server (packaging/start-server.sh) and stays in the Dock
 # while it runs. It carries its own copy of the code (web_app/, core/,
-# modes/, sample_data/) and its own Python virtualenv under
+# sample_data/) and its own Python virtualenv under
 # Contents/Resources, so it keeps working if this repo folder moves and never
 # reads from ~/Documents at launch (which macOS privacy protection would block
 # or prompt for). It uses this Mac's installed Python, so it's built for THIS
@@ -83,8 +83,9 @@ plutil -replace NSHighResolutionCapable -bool true "$PLIST"
 
 # -- 3. App code + server start script ------------------------------------------------------
 mkdir -p "$RES/app"
-for d in web_app core modes sample_data; do
-  rsync -a --exclude '__pycache__' --exclude '*.pyc' "$REPO/$d" "$RES/app/"
+rm -rf "$RES/app/modes"   # bundled by older builds; the web app no longer imports it
+for d in web_app core sample_data; do
+  rsync -a --delete --exclude '__pycache__' --exclude '*.pyc' "$REPO/$d" "$RES/app/"
 done
 install -m 755 "$PKG/start-server.sh" "$RES/start-server.sh"
 

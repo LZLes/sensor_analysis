@@ -4,7 +4,6 @@ import io
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 
 from core.numeric import _is_float
 
@@ -223,6 +222,8 @@ def _parse_one_file(_up, _fi: int, key_prefix: str = "amp") -> tuple[pd.DataFram
     """Parse one uploaded file, returning (df, auto_channels). key_prefix
     keeps this file's format/delimiter/skip widgets independent when the
     same import UI is reused across modes (Amperometry vs Solid-State)."""
+    import streamlit as st  # Streamlit-only UI; the parsers above don't need it
+
     if _up.name.lower().endswith(".pssession"):
         _df, _auto = parse_pssession(_up.read())
         return _df, _auto

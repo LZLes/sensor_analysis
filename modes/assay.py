@@ -1,9 +1,5 @@
 """Assay (microplate / 4PL) mode: import, standards, standard curve, results."""
 
-import io
-
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -11,110 +7,12 @@ import streamlit as st
 
 from core.constants import PAL, _MIME, _plot_theme, fmt
 from core.numeric import lin_reg
-from core.plotting import _ORIGIN_RC, _MINIMAL_RC, _apply_spine_style
+from core.analysis.assay import (  # noqa: F401  (re-exported)
+    _4pl_inv, _PLATE_ROWS, _fit_4pl, _is_plate_num, _plate_get, _well_rc, parse_plate_csv,
+    render_assay_curve,
+)
 
 SS = st.session_state
-
-
-_PLATE_ROWS = list("ABCDEFGH")
-
-
-def _well_rc(well: str) -> tuple[int, int] | None:
-    """'A1' → (0, 0), 'H12' → (7, 11). None if invalid."""
-    w = well.strip().upper()
-    if not w or w[0] not in _PLATE_ROWS:
-        return None
-    try:
-        c = int(w[1:]) - 1
-    except ValueError:
-        return None
-    return (_PLATE_ROWS.index(w[0]), c) if 0 <= c < 12 else None
-
-
-def _plate_get(plate_df: pd.DataFrame | None, well: str) -> float:
-    rc = _well_rc(well)
-    if rc is None or plate_df is None:
-        return np.nan
-    try:
-        return float(plate_df.iat[rc[0], rc[1]])  # type: ignore[arg-type]
-    except Exception:
-        return np.nan
-
-
-def _is_plate_num(s: str) -> bool:
-    try:
-        float(s.strip().replace(",", "."))
-        return True
-    except ValueError:
-        return False
-
-
-def parse_plate_csv(raw: str) -> pd.DataFrame:
-    """
-    Parse a microplate reader export into an 8×12 DataFrame (index A–H, cols 1–12).
-    Handles TECAN/Synergy/generic grid formats (tab, comma, semicolon delimited).
-    Only 96-well plates are supported — raises rather than silently returning
-    a truncated subset if the file looks like a larger (e.g. 384-well) plate.
-    """
-    import re as _re
-    row_re      = _re.compile(r'^\s*([A-Ha-h])(?:[,;\t]|\s)')
-    oversize_re = _re.compile(r'^\s*([I-Pi-p])(?:[,;\t]|\s)')
-    grid: dict[str, list[float]] = {}
-    oversize_rows: set[str] = set()
-    for line in raw.splitlines():
-        m = row_re.match(line)
-        if not m:
-            om = oversize_re.match(line)
-            if om:
-                parts_o = _re.split(r'[,;\t]+', line.strip())
-                nums_o  = sum(1 for p in parts_o[1:] if _is_plate_num(p))
-                if nums_o >= 3:   # looks like a real data row, not a stray label
-                    oversize_rows.add(om.group(1).upper())
-            continue
-        letter = m.group(1).upper()
-        # Split on ONE delimiter (not a run of them) so an empty well keeps
-        # its column position — "A,0.1,,0.3" is A1=0.1, A2=empty, A3=0.3,
-        # not A2=0.3. Semicolon before comma: semicolon-delimited exports
-        # use comma decimals.
-        stripped = line.strip()
-        delim = next((d for d in ("\t", ";", ",") if d in stripped), None)
-        parts = stripped.split(delim) if delim else stripped.split()
-        cells = parts[1:]
-        while cells and not _is_plate_num(cells[-1]):   # trailing delimiters / row labels
-            cells.pop()
-        nums: list[float] = []
-        for p in cells:
-            try:
-                nums.append(float(p.strip().replace(",", ".")))
-            except ValueError:
-                nums.append(np.nan)   # blank / "OVER" / text: keep the slot
-        if any(np.isfinite(nums)):
-            if len(nums) > 12:
-                raise ValueError(
-                    f"Row {letter} has {len(nums)} numeric columns — this parser "
-                    "only supports 96-well plates (columns 1-12). 384-well "
-                    "plates aren't supported yet."
-                )
-            grid[letter] = nums
-    if oversize_rows:
-        raise ValueError(
-            f"Found row(s) beyond H ({', '.join(sorted(oversize_rows))}) — this "
-            "parser only supports 96-well plates (rows A-H). 384-well plates "
-            "aren't supported yet."
-        )
-    if not grid:
-        raise ValueError(
-            "No plate rows found — expected rows labeled A–H. "
-            "Check the file has a standard grid layout."
-        )
-    data = {}
-    for r in _PLATE_ROWS:
-        row_vals = (grid.get(r, []) + [np.nan] * 12)[:12]
-        data[r] = row_vals
-    df = pd.DataFrame(data, index=range(1, 13)).T
-    df.index   = pd.Index(_PLATE_ROWS, name="Row")
-    df.columns = pd.Index(range(1, 13), name="Col")
-    return df
 
 
 def _plate_fig(plate_df: pd.DataFrame | None, std_wells: dict,
@@ -191,95 +89,6 @@ def _plate_fig(plate_df: pd.DataFrame | None, std_wells: dict,
         hoverlabel=dict(bgcolor="rgba(30,30,30,0.92)"),
     )
     return fig
-
-
-def _fit_4pl(x: np.ndarray, y: np.ndarray) -> dict | None:
-    """4-parameter logistic: y = d + (a − d) / (1 + (x/c)^b)."""
-    from scipy.optimize import curve_fit as _cf
-
-    def _model(xv, a, b, c, d):
-        return d + (a - d) / (1.0 + (np.asarray(xv) / c) ** b)
-
-    xpos = x[x > 0]
-    c0 = float(np.median(xpos)) if xpos.size else 1.0
-    try:
-        popt, _ = _cf(_model, x, y,
-                       p0=[float(y.min()), 1.0, c0, float(y.max())],
-                       maxfev=10000,
-                       bounds=([-np.inf, 0.01, 1e-12, -np.inf],
-                               [ np.inf, 10.0,  np.inf,  np.inf]))
-        yp = _model(x, *popt)
-        ss_res = float(np.sum((y - yp) ** 2))
-        ss_tot = float(np.sum((y - y.mean()) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-        return dict(type="4pl", a=popt[0], b=popt[1], c=popt[2], d=popt[3], r2=r2)
-    except Exception:
-        return None
-
-
-def _4pl_inv(y_val: float, p: dict) -> float:
-    a, b, c, d = p["a"], p["b"], p["c"], p["d"]
-    try:
-        ratio = (a - d) / (float(y_val) - d)
-        return float(c * (ratio - 1.0) ** (1.0 / b)) if ratio > 0 else np.nan
-    except Exception:
-        return np.nan
-
-
-def render_assay_curve(res: dict, show_reps: bool, conc_unit: str, sig_unit: str,
-                       dpi: int = 150, fmt: str = "png",
-                       figsize: tuple | None = None, style: str = "default") -> bytes:
-    _rc  = {"origin": _ORIGIN_RC, "minimal": _MINIMAL_RC}.get(style, {})
-    _lfs = 9 if style == "minimal" else 11
-    fit  = res["fit"]
-    cx   = np.array(res["concs"], float)
-    my   = np.array(res["means"], float)
-    sy   = np.array(res["sds"],   float)
-    darr = np.array(res["delta_arr"], float)
-    vm   = np.isfinite(my) & np.isfinite(cx)
-    with matplotlib.rc_context(_rc):
-        fig, ax = plt.subplots(figsize=figsize or (7, 5))
-        if show_reps:
-            for si, rc in enumerate([PAL[0], PAL[1], PAL[2]]):
-                ry = darr[:, si]
-                vr = np.isfinite(ry) & np.isfinite(cx)
-                if vr.any():
-                    ax.scatter(cx[vr], ry[vr], color=rc, s=22, alpha=0.6,
-                               marker="o", facecolors="none", linewidths=1.2,
-                               zorder=3, label=f"Set {si + 1}")
-        ax.errorbar(cx[vm], my[vm], yerr=sy[vm], fmt="o", color="#4c96d7",
-                    capsize=4, markersize=7, linewidth=1.4, elinewidth=1.2,
-                    zorder=4, label="Mean")
-        xp = np.linspace(max(0.0, cx[vm].min()), cx[vm].max(), 400)
-        if fit["type"] == "linear":
-            yp   = fit["slope"] * xp + fit["intercept"]
-            b    = fit["intercept"]
-            _eq  = (f"y = {fit['slope']:.3g}x {'+ ' if b >= 0 else '− '}{abs(b):.3g}"
-                    f"\nR² = {fit['r2']:.4f}")
-        elif fit["type"] == "quad":
-            yp  = fit["a"]*xp**2 + fit["b"]*xp + fit["c"]
-            _eq = (f"y = {fit['a']:.3g}x² + {fit['b']:.3g}x + {fit['c']:.3g}"
-                   f"\nR² = {fit['r2']:.4f}")
-        else:
-            yp  = fit["d"] + (fit["a"] - fit["d"]) / (1 + (xp / fit["c"]) ** fit["b"])
-            _eq = (f"4PL  a={fit['a']:.3g}  b={fit['b']:.3g}\n"
-                   f"c={fit['c']:.3g}  d={fit['d']:.3g}  R²={fit['r2']:.4f}")
-        ax.plot(xp, yp, "--", color="#ff9230", linewidth=2, label="Fit")
-        ax.set_xlabel(f"Concentration ({conc_unit})", fontsize=_lfs)
-        ax.set_ylabel(f"ΔSignal ({sig_unit})", fontsize=_lfs)
-        ax.legend(fontsize=7, loc="upper left",
-                  bbox_to_anchor=(1.02, 1), borderaxespad=0)
-        _apply_spine_style(ax, style)
-        fig.tight_layout()
-        ax.text(0.5, -0.22, _eq, transform=ax.transAxes, fontsize=7,
-                va="top", ha="center", family="monospace",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
-                          alpha=0.88, edgecolor="#cccccc", linewidth=0.8))
-        buf = io.BytesIO()
-        fig.savefig(buf, format=fmt, dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
 
 
 def render() -> None:
