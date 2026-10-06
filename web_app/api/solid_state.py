@@ -47,8 +47,9 @@ from web_app.session import SessionData
 
 router = APIRouter(prefix="/api/solid_state", tags=["solid_state"])
 
-# Session fields an undo step restores (web_app/history.py).
-UNDO_FIELDS = ("solid_files", "solid_cal_results")
+# Session fields an undo step restores (web_app/history.py). Not the
+# calibration results: those always reflect the last Compute, as ③ shows.
+UNDO_FIELDS = ("solid_files",)
 
 _FILES_KEY = "solid_files"
 _CPDF_COLUMNS = ["Label", "Concentration", "t_start", "t_end", "avg_duration", "Reading_mV"]

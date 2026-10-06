@@ -226,3 +226,48 @@ def test_templates_save_apply_download_upload_delete(client):
     assert [x["name"] for x in up["templates"]] == ["ELISA 8pt"]
     bad = client.post("/api/assay/templates/upload", files={"file": ("x.json", b"{}", "application/json")})
     assert bad.status_code == 400
+
+
+# -- regressions found in review -----------------------------------------------------------
+def test_unit_changes_are_their_own_undo_step(client):
+    _ok(client.post("/api/assay/plate/sample"))
+    _ok(client.post("/api/assay/assign/clear", json={"wells": ["H8"]}))
+    _ok(client.post("/api/assay/units", json={"sig_unit": "RFU"}))
+    st = _ok(client.post("/api/history/assay/undo"))   # undoes the unit change only
+    assert st["sig_unit"] == "Abs" and not any(r["Well"] == "H8" for r in st["sample_rows"])
+
+
+def test_plate_names_stay_unique_and_sample_labels_are_opt_in(client):
+    _ok(client.post("/api/assay/plate/sample"))
+    assert client.post("/api/assay/plates", json={"name": "Plate 1"}).status_code == 400
+    st = _ok(client.post("/api/assay/plates", json={}))
+    assert [p["name"] for p in st["plates"]] == ["Plate 1", "Plate 2"]
+    assert st["sample_rows"] == [] and st["std_rows"][0]["Label"] == "Blank"   # standards copied, labels not
+    _ok(client.post("/api/assay/plates/0/activate"))   # copies come from the selected plate
+    st = _ok(client.post("/api/assay/plates", json={"copy_samples": True}))
+    assert len(st["sample_rows"]) == 40 and st["plates"][-1]["name"] == "Plate 3"
+
+
+def test_reading_plates_never_writes_the_session(client):
+    """The autosave thread reads plates while requests switch them."""
+    from web_app.api.assay import plates
+    from web_app.session import SessionData
+    s = SessionData()
+    before = list(s.assay_plates)
+    plates(s)
+    assert s.assay_plates == before == []
+
+
+def test_an_empty_standards_table_exports_with_its_columns(client):
+    _ok(client.post("/api/assay/plates", json={"copy_layout": False}))
+    std = _export(client)["assay_std_df"]
+    assert std and set(std[0]) == {"Label", "Conc", "S1", "S2", "S3"}
+
+
+def test_template_names_with_slashes_work_through_their_id(client):
+    _ok(client.post("/api/assay/plate/sample"))
+    t = _ok(client.post("/api/assay/templates", json={"name": "ELISA 1/2"}))["templates"][0]
+    assert t["name"] == "ELISA 1/2" and "/" not in t["id"]
+    assert client.get(f"/api/assay/templates/{t['id']}/download").status_code == 200
+    _ok(client.post("/api/assay/templates/apply", json={"name": t["id"]}))
+    assert _ok(client.delete(f"/api/assay/templates/{t['id']}"))["templates"] == []

@@ -127,6 +127,7 @@ onClick("assay-plate-add-btn", async () => {
   await assayPlateAction(() => apiPostJson(`${ASSAY_API}/plates`, {
     name: document.getElementById("assay-plate-add-name").value,
     copy_layout: document.getElementById("assay-plate-add-copy").checked,
+    copy_samples: document.getElementById("assay-plate-add-samples").checked,
   }));
   assayHideAddPlate();
   showTab(document.getElementById("mode-assay"), "import");
@@ -816,8 +817,9 @@ async function assayLoadTemplates(payload) {
   const keep = sel.value;
   sel.innerHTML = "";
   if (!r.templates.length) sel.add(new Option("No templates saved yet", ""));
-  r.templates.forEach((t) => sel.add(new Option(`${t.name} — ${t.n_levels} levels, ${t.n_samples} samples (${t.saved_at})`, t.name)));
-  if (r.templates.some((t) => t.name === keep)) sel.value = keep;
+  // Options are keyed by the template's file id, which is safe in URLs.
+  r.templates.forEach((t) => sel.add(new Option(`${t.name} — ${t.n_levels} levels, ${t.n_samples} samples (${t.saved_at})`, t.id)));
+  if (r.templates.some((t) => t.id === keep)) sel.value = keep;
   ["assay-template-apply-btn", "assay-template-download-btn", "assay-template-delete-btn"].forEach((id) => {
     document.getElementById(id).disabled = !r.templates.length;
   });
@@ -833,7 +835,8 @@ onClick("assay-template-save-btn", async () => {
   if (assayLayoutDirty) await assayApplyTables(true);
   const r = await apiPostJson(`${ASSAY_API}/templates`, { name });
   await assayLoadTemplates(r);
-  document.getElementById("assay-template-select").value = name;
+  const saved = r.templates.find((t) => t.name === name);
+  if (saved) document.getElementById("assay-template-select").value = saved.id;
   document.getElementById("assay-template-name").value = "";
   toast(r.message, "success");
 });
@@ -849,8 +852,9 @@ onClick("assay-template-apply-btn", async () => {
 });
 
 onClick("assay-template-delete-btn", async () => {
-  const name = document.getElementById("assay-template-select").value;
-  if (!name || !confirm(`Delete the template "${name}"?`)) return;
+  const sel = document.getElementById("assay-template-select");
+  const name = sel.value;
+  if (!name || !confirm(`Delete the template "${sel.selectedOptions[0].text.split(" — ")[0]}"?`)) return;
   await assayLoadTemplates(await apiDelete(`${ASSAY_API}/templates/${encodeURIComponent(name)}`));
 });
 
@@ -1069,5 +1073,9 @@ document.getElementById("assay-export-standards-btn").addEventListener("click", 
 document.getElementById("assay-export-curve-btn").addEventListener("click", () => download(`${ASSAY_API}/export/curve`, assayCurveBody()));
 document.getElementById("assay-preview-curve-btn").addEventListener("click", () => previewExport("assay-preview-img", `${ASSAY_API}/export/curve`, assayCurveBody()));
 
-registerMode("assay", { refresh: (state) => assayRefresh(state, { resetLayout: true }) });
+registerMode("assay", {
+  refresh: (state) => assayRefresh(state, { resetLayout: true }),
+  confirmDiscard: () => (!assayLayoutDirty && !assayNormDirty)
+    || confirm("Undo will discard your unsaved table edits. Continue?"),
+});
 sessionReady.then(() => assayRefresh()).catch((err) => toast(err.message, "error"));

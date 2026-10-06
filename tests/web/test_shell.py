@@ -157,3 +157,28 @@ def test_amperometry_report_after_compute(client):
     _ok(client.post("/api/amperometry/compute", json={"selected": st["channel_labels"], "fit_type": "Linear"}))
     html = client.get("/api/report/amperometry").text
     assert "Sensor statistics" in html and "data:image/png;base64," in html
+
+
+def test_cv_channel_averaging_leaves_the_imported_frame_alone(client):
+    import numpy as np
+    v = np.linspace(-0.2, 0.6, 50)
+    csv = "V,I1,I2\n" + "\n".join(f"{a},{a * 2},{a * 3}" for a in v)
+    _ok(client.post("/api/cyclic_voltammetry/files", files=[("files", ("r_10.csv", csv, "text/csv"))]))
+    from web_app.deps import store
+    from web_app.session import SESSION_COOKIE_NAME
+    sess = store.peek(client.cookies.get(SESSION_COOKIE_NAME))
+    raw = sess.cv_runs[0]["df"]
+    _ok(client.post("/api/cyclic_voltammetry/runs/0/channels",
+                    json={"channels": [{"name": "avg", "vc": "V", "ic_cols": ["I1", "I2"]}]}))
+    assert list(raw.columns) == ["V", "I1", "I2"]   # undo snapshots share this frame
+    assert any(c.startswith("__avg_") for c in sess.cv_runs[0]["df"].columns)
+
+
+def test_trace_undo_keeps_the_last_computed_results(client):
+    st = _ok(client.post("/api/amperometry/files/sample"))
+    rows = st["files"][0]["cpdf"]
+    rows[1]["Concentration"] = 999
+    _ok(client.post("/api/amperometry/files/0/table", json={"rows": rows}))
+    _ok(client.post("/api/amperometry/compute", json={"selected": st["channel_labels"], "fit_type": "Linear"}))
+    after_undo = _ok(client.post("/api/history/amperometry/undo"))
+    assert after_undo["cal_results"] is not None   # ③ and Export still agree

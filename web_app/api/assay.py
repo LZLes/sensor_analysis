@@ -10,7 +10,9 @@ in the flat SessionData fields that mirror the Streamlit app's keys
 (assay_plate, assay_std_df, assay_sample_df, assay_std_res) plus the
 web-only assay_excluded / assay_plate_name / assay_plate_id /
 assay_std_source; `plates(session)` returns every plate with the active one
-refreshed from those fields. Every endpoint except Results/Normalise acts on
+taken from those fields (without writing to the session, so the autosave
+thread can call it safely); endpoints that change the list of plates store
+it back with `_store_plates`. Every endpoint except Results/Normalise acts on
 the active plate; those two pool all plates, grouping replicates by
 Subject × Timepoint. A plate without standards can use another plate's
 curve (assay_std_source); its own blank is subtracted when it has one.
@@ -104,23 +106,31 @@ def _empty_std_df() -> pd.DataFrame:
 
 
 # -- plates --------------------------------------------------------------------------
+def _active_index(session: SessionData) -> int:
+    return min(max(session.assay_active, 0), max(len(session.assay_plates) - 1, 0))
+
+
 def plates(session: SessionData) -> list[dict]:
-    """Every plate, as dicts of PLATE_FIELDS, the active one refreshed."""
-    if not session.assay_plates:
-        session.assay_plates = [{}]
-        session.assay_active = 0
-    session.assay_active = min(max(session.assay_active, 0), len(session.assay_plates) - 1)
-    session.assay_plates[session.assay_active] = {f: getattr(session, f) for f in PLATE_FIELDS}
-    return session.assay_plates
+    """Every plate, as dicts of PLATE_FIELDS: a new list whose active entry
+    is built from the session fields. Read-only — never writes the session."""
+    ps = list(session.assay_plates) or [{}]
+    ps[_active_index(session)] = {f: getattr(session, f) for f in PLATE_FIELDS}
+    return ps
+
+
+def _store_plates(session: SessionData, ps: list[dict], active: int) -> None:
+    """Make `ps` the session's plates and load plate `active` into the fields."""
+    session.assay_plates = ps
+    session.assay_active = active
+    for f in PLATE_FIELDS:
+        setattr(session, f, ps[active][f])
 
 
 def _activate(session: SessionData, index: int) -> None:
     ps = plates(session)
     if not 0 <= index < len(ps):
         raise HTTPException(status_code=404, detail="No such plate.")
-    for f in PLATE_FIELDS:
-        setattr(session, f, ps[index][f])
-    session.assay_active = index
+    _store_plates(session, ps, index)
 
 
 def _plate_by_id(ps: list[dict], plate_id: str | None) -> dict | None:
@@ -329,7 +339,7 @@ def _state(session: SessionData) -> dict:
     samples = sample_map(session.assay_sample_df)
     plate = session.assay_plate
     ps = plates(session)
-    res, src_name = _curve_for(ps, ps[session.assay_active])
+    res, src_name = _curve_for(ps, ps[_active_index(session)])
     sdf = lay.normalize_sample_df(session.assay_sample_df)
     all_sdf = [lay.normalize_sample_df(p["assay_sample_df"]) for p in ps]
     return {
@@ -338,7 +348,7 @@ def _state(session: SessionData) -> dict:
         "readout": session.assay_readout,
         "readout_text": readout_text(session.assay_readout),
         "plates": _plates_summary(session),
-        "active": session.assay_active,
+        "active": _active_index(session),
         "wells": well_layout(plate, session.assay_std_df, session.assay_sample_df, session.assay_excluded),
         "excluded": list(session.assay_excluded),
         "subjects": lay.ordered_unique(x for d in all_sdf for x in d["Subject"] if x),
@@ -438,6 +448,7 @@ class UnitsBody(BaseModel):
 
 
 @router.post("/units")
+@tracked("assay", UNDO_FIELDS)
 def set_units(body: UnitsBody, session: SessionData = Depends(get_session)) -> dict:
     if body.sig_unit is not None:
         session.assay_sig_unit = body.sig_unit
@@ -454,6 +465,7 @@ class ReadoutBody(BaseModel):
 
 
 @router.post("/readout")
+@tracked("assay", UNDO_FIELDS)
 def set_readout(body: ReadoutBody, session: SessionData = Depends(get_session)) -> dict:
     """Changing the readout kind also switches the signal unit to its usual
     one (Abs/RFU/RLU) — unless the user had typed a custom unit."""
@@ -468,7 +480,8 @@ def set_readout(body: ReadoutBody, session: SessionData = Depends(get_session)) 
 # -- Plates ----------------------------------------------------------------------------
 class NewPlateBody(BaseModel):
     name: str = ""
-    copy_layout: bool = True
+    copy_layout: bool = True     # the current plate's standards and blank
+    copy_samples: bool = False   # …and its sample labels (same samples → pooled as replicates)
 
 
 class RenameBody(BaseModel):
@@ -483,18 +496,28 @@ class CurveSourceBody(BaseModel):
 @tracked("assay", UNDO_FIELDS)
 def add_plate(body: NewPlateBody, session: SessionData = Depends(get_session)) -> dict:
     """A new, empty plate (made active). copy_layout reuses the current
-    plate's standards and sample labels, for plates run with one layout."""
+    plate's standards and blank; copy_samples also its sample labels — only
+    right when the plate holds the same samples, since Results pools wells
+    with the same subject and timepoint as replicates."""
     ps = plates(session)
     ids = {p["assay_plate_id"] for p in ps}
+    names = {p["assay_plate_name"] for p in ps}
     n = len(ps) + 1
     while f"p{n}" in ids:
         n += 1
+    name = body.name.strip()
+    if not name:
+        k = len(ps) + 1
+        while f"Plate {k}" in names:
+            k += 1
+        name = f"Plate {k}"
+    elif name in names:
+        raise HTTPException(status_code=400, detail=f"Another plate is already called {name!r}.")
     std = session.assay_std_df.copy() if body.copy_layout else _empty_std_df()
-    samples = session.assay_sample_df.copy() if body.copy_layout else default_assay_sample_df()
+    samples = session.assay_sample_df.copy() if body.copy_samples else default_assay_sample_df()
     ps.append({"assay_plate": None, "assay_std_df": std, "assay_sample_df": samples, "assay_std_res": None,
-               "assay_excluded": [], "assay_plate_name": body.name.strip() or f"Plate {len(ps) + 1}",
-               "assay_plate_id": f"p{n}", "assay_std_source": None})
-    _activate(session, len(ps) - 1)
+               "assay_excluded": [], "assay_plate_name": name, "assay_plate_id": f"p{n}", "assay_std_source": None})
+    _store_plates(session, ps, len(ps) - 1)
     return _state(session)
 
 
@@ -516,9 +539,8 @@ def rename_plate(index: int, body: RenameBody, session: SessionData = Depends(ge
         raise HTTPException(status_code=400, detail="A plate name can't be empty.")
     if any(p["assay_plate_name"] == name for i, p in enumerate(ps) if i != index):
         raise HTTPException(status_code=400, detail=f"Another plate is already called {name!r}.")
-    ps[index]["assay_plate_name"] = name
-    if index == session.assay_active:
-        session.assay_plate_name = name
+    ps[index] = {**ps[index], "assay_plate_name": name}
+    _store_plates(session, ps, _active_index(session))
     return _state(session)
 
 
@@ -531,17 +553,13 @@ def delete_plate(index: int, session: SessionData = Depends(get_session)) -> dic
     if len(ps) == 1:
         raise HTTPException(status_code=400, detail="The last plate can't be removed — use Clear on ① Import instead.")
     gone = ps.pop(index)
-    for p in ps:
-        if p["assay_std_source"] == gone["assay_plate_id"]:
-            p["assay_std_source"] = None
-    active = session.assay_active
+    ps = [{**p, "assay_std_source": None} if p["assay_std_source"] == gone["assay_plate_id"] else p for p in ps]
+    active = _active_index(session)
     if index < active:
         active -= 1
     elif index == active:
         active = min(index, len(ps) - 1)
-    session.assay_active = active
-    for f in PLATE_FIELDS:
-        setattr(session, f, ps[active][f])
+    _store_plates(session, ps, active)
     return _state(session)
 
 
@@ -815,7 +833,7 @@ def compute(body: ComputeBody, session: SessionData = Depends(get_session)) -> d
 def get_curve(show_reps: bool = True, session: SessionData = Depends(get_session)) -> dict:
     """Re-render the stored curve (tab revisit, units change, imported session)."""
     ps = plates(session)
-    res, src_name = _curve_for(ps, ps[session.assay_active])
+    res, src_name = _curve_for(ps, ps[_active_index(session)])
     if res is None:
         return {"figure": None, "source": src_name}
     return _curve_payload(session, res, show_reps, source=src_name)
@@ -1008,7 +1026,7 @@ def export_normalised_csv(session: SessionData = Depends(get_session)):
 
 def _active_curve(session: SessionData) -> dict:
     ps = plates(session)
-    res, _ = _curve_for(ps, ps[session.assay_active])
+    res, _ = _curve_for(ps, ps[_active_index(session)])
     if res is None:
         raise HTTPException(status_code=400, detail="Compute the standard curve first.")
     return res
@@ -1105,7 +1123,7 @@ def list_templates() -> dict:
             t = _read_template(path)
         except HTTPException:
             continue
-        out.append({"name": t.get("name") or path.stem, "saved_at": t.get("saved_at", ""),
+        out.append({"id": path.stem, "name": t.get("name") or path.stem, "saved_at": t.get("saved_at", ""),
                     "n_levels": len(t.get("std_df") or []), "n_samples": len(t.get("sample_df") or [])})
     return {"templates": out}
 
@@ -1208,14 +1226,17 @@ def _export_bundle(session: SessionData) -> dict:
     return {
         "assay_sig_unit": session.assay_sig_unit, "assay_conc_unit": session.assay_conc_unit,
         "assay_plate": _plate_df_to_csv(session.assay_plate),
-        "assay_std_df": _jsonify(std.reindex(columns=lay.STD_COLUMNS).to_dict(orient="records")),
+        # Never empty: Streamlit builds its table from these records and
+        # needs the columns (an empty list gives it a table without them).
+        "assay_std_df": _jsonify(std.reindex(columns=lay.STD_COLUMNS).to_dict(orient="records"))
+        or [{"Label": "Blank", "Conc": 0.0, "S1": "", "S2": "", "S3": ""}],
         "assay_sample_df": _jsonify(session.assay_sample_df.to_dict(orient="records")),
         "assay_std_res": _jsonify(session.assay_std_res) if portable_fit else None,
         # Web-only extras: the Streamlit app ignores keys it doesn't know.
         "assay_norm": _jsonify(session.assay_norm),
         "assay_readout": dict(session.assay_readout),
         "assay_plates": [_plate_to_json(p) for p in ps],
-        "assay_active": session.assay_active,
+        "assay_active": _active_index(session),
     }
 
 
@@ -1226,10 +1247,8 @@ def _apply_bundle(session: SessionData, d: dict) -> None:
     if d.get("assay_plates"):
         if not isinstance(d["assay_plates"], list):
             raise ValueError("assay_plates must be a list")
-        session.assay_plates = [_plate_from_json(p, i) for i, p in enumerate(d["assay_plates"])]
-        session.assay_active = min(max(int(d.get("assay_active") or 0), 0), len(session.assay_plates) - 1)
-        for f in PLATE_FIELDS:
-            setattr(session, f, session.assay_plates[session.assay_active][f])
+        ps = [_plate_from_json(p, i) for i, p in enumerate(d["assay_plates"])]
+        _store_plates(session, ps, min(max(int(d.get("assay_active") or 0), 0), len(ps) - 1))
     else:
         # A Streamlit bundle (or an older web one): a single plate.
         if "assay_plate" in d:

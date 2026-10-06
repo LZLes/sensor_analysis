@@ -251,7 +251,9 @@ class ChannelsBody(BaseModel):
 @tracked("cyclic_voltammetry", UNDO_FIELDS)
 def set_channels(index: int, body: ChannelsBody, session: SessionData = Depends(get_session)) -> dict:
     run = require_file_index(session.cv_runs, index)
-    df = run["df"]
+    # A copy: averaged channels add columns, and the imported frame is shared
+    # with undo snapshots (web_app/history.py), so it must never change in place.
+    df = run["df"].copy()
     for spec in body.channels:
         missing = [c for c in [spec.get("vc"), *(spec.get("ic_cols") or [])] if c not in df.columns]
         if missing:

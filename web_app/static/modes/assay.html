@@ -6,7 +6,8 @@
   <button id="assay-plate-add-toggle" class="link-btn" title="Add another plate to this experiment">+ Plate</button>
   <span id="assay-plate-add-form" class="plate-add-form" hidden>
     <input id="assay-plate-add-name" type="text" size="12" placeholder="Plate 2" />
-    <label class="inline"><input id="assay-plate-add-copy" type="checkbox" checked /> Same layout</label>
+    <label class="inline" title="Copy this plate's standards and blank"><input id="assay-plate-add-copy" type="checkbox" checked /> Same standards</label>
+    <label class="inline" title="Only if the new plate holds the same samples: wells with the same subject and timepoint are pooled as replicates"><input id="assay-plate-add-samples" type="checkbox" /> Same sample labels</label>
     <button id="assay-plate-add-btn" class="primary">Add</button>
     <button id="assay-plate-add-cancel" class="link-btn">Cancel</button>
   </span>

@@ -51,8 +51,9 @@ from web_app.session import SessionData
 
 router = APIRouter(prefix="/api/amperometry", tags=["amperometry"])
 
-# Session fields an undo step restores (web_app/history.py).
-UNDO_FIELDS = ("amp_files", "cal_results")
+# Session fields an undo step restores (web_app/history.py). Not the
+# calibration results: those always reflect the last Compute, as ③ shows.
+UNDO_FIELDS = ("amp_files",)
 
 _FILES_KEY = "amp_files"
 _CPDF_COLUMNS = ["Label", "Concentration", "Spike Vol", "Stock Conc", "t_start", "t_end", "avg_duration", "Baseline"]

@@ -11,7 +11,8 @@ const MODE_HANDLERS = {};  // id -> {refresh(state?)} from registerMode
 let currentMode = null;
 
 // Called by each mode script. refresh(state) re-renders the mode, from the
-// given state or by fetching it.
+// given state or by fetching it. Optional confirmDiscard() returns false to
+// cancel an undo/redo that would throw away unsaved edits.
 function registerMode(id, handlers) {
   MODE_HANDLERS[id] = handlers;
 }
@@ -416,6 +417,8 @@ async function historyStep(direction) {
   if (!mode || !MODE_HANDLERS[mode]) return;
   const c = undoCounts[mode] || {};
   if (!c[direction]) return;
+  const h = MODE_HANDLERS[mode];
+  if (h.confirmDiscard && !h.confirmDiscard()) return;
   try {
     const state = await apiPostJson(`/api/history/${mode}/${direction}`, {});
     await MODE_HANDLERS[mode].refresh(state);
