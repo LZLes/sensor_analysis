@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import secrets
 from dataclasses import dataclass, field
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -36,7 +37,7 @@ def default_assay_std_df() -> pd.DataFrame:
 
 def default_assay_sample_df() -> pd.DataFrame:
     # Streamlit's default has only Well/Label; Subject/Timepoint are extra
-    # columns it carries along untouched (see web_app/api/assay_layout.py).
+    # columns it carries along untouched (see core/analysis/assay_layout.py).
     return pd.DataFrame({c: pd.Series([], dtype=str) for c in ("Well", "Label", "Subject", "Timepoint")})
 
 
@@ -84,10 +85,35 @@ class SessionData:
     assay_std_res: dict | None = None
     assay_norm: dict = field(default_factory=default_assay_norm)
     assay_readout: dict = field(default_factory=default_assay_readout)
+    # Web-only, per plate (the fields above from assay_plate to assay_std_res
+    # plus these three describe the ACTIVE plate; see web_app/api/assay.py):
+    assay_excluded: list[str] = field(default_factory=list)   # wells left out of every calculation
+    assay_plate_name: str = "Plate 1"
+    assay_plate_id: str = "p1"
+    assay_std_source: str | None = None   # another plate's id whose standard curve this plate uses
+    # Every plate, as dicts of the per-plate fields; the entry at assay_active
+    # is refreshed from the fields above whenever the list is read.
+    assay_plates: list[dict] = field(default_factory=list)
+    assay_active: int = 0
 
     # Per-file-list UI state (autodetect preview edges etc.), namespaced by
     # files_key ("amp_files"/"solid_files").
     ts_ui: dict[str, dict] = field(default_factory=dict)
+
+    # State for modes that don't share keys with the Streamlit app, keyed by
+    # mode id (see mode_state). Included in deep copies and the bundle only
+    # through each mode's own export/apply hooks.
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    # Undo/redo stacks per mode id (web_app/history.py). Not session data:
+    # never exported, and reset when a session file is imported.
+    history: dict[str, dict] = field(default_factory=dict, repr=False)
+
+    def mode_state(self, mode_id: str, factory: Callable[[], Any]) -> Any:
+        """A mode's own state object, created by `factory` on first use."""
+        if mode_id not in self.extra:
+            self.extra[mode_id] = factory()
+        return self.extra[mode_id]
 
 
 class SessionStore:
@@ -109,6 +135,10 @@ class SessionStore:
         data = SessionData()
         self._sessions[new_id] = data
         return new_id, data
+
+    def peek(self, session_id: str | None) -> SessionData | None:
+        """The session for an id, without creating one."""
+        return self._sessions.get(session_id) if session_id else None
 
 
 store = SessionStore()

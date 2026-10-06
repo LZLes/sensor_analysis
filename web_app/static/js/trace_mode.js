@@ -325,6 +325,7 @@ function createTraceMode(cfg) {
     if (e.detail.tab === "compare" && state && state.files.length) renderComparison().catch((err) => toast(err.message, "error"));
   });
 
+  registerMode(cfg.mode, { refresh });
   sessionReady.then(() => refresh()).catch((err) => toast(err.message, "error"));
   return { refresh };
 }

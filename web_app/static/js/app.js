@@ -1,23 +1,32 @@
-// Shared shell: mode switcher, per-mode tabs, and the small helpers every
-// mode module (solid_state.js, amperometry.js, cyclic_voltammetry.js,
-// assay.js) uses. Each mode module self-initializes once `sessionReady`
-// resolves.
+// The app shell: boots the modes listed by /api/app/modes (web_app/registry.py),
+// switches modes and tabs, and holds the small helpers every mode script
+// uses. Each mode script (js/<id>.js) is loaded after its markup
+// (/modes/<id>.html) is in the page, calls registerMode(id, {refresh}), and
+// self-initializes once `sessionReady` resolves.
 
-// -- Mode + tab switching ----------------------------------------------------------
+// -- Mode registry ------------------------------------------------------------------------
 const MODE_KEY = "sensor-studio-mode";
+const MODES = {};          // id -> {id, label, scripts, report, undo} from the server
+const MODE_HANDLERS = {};  // id -> {refresh(state?)} from registerMode
+let currentMode = null;
+
+// Called by each mode script. refresh(state) re-renders the mode, from the
+// given state or by fetching it.
+function registerMode(id, handlers) {
+  MODE_HANDLERS[id] = handlers;
+}
 
 function showMode(mode) {
   const btn = document.querySelector(`.mode-btn[data-mode="${mode}"]`);
   if (!btn) return;
+  currentMode = mode;
   document.querySelectorAll(".mode-btn").forEach((b) => b.classList.toggle("active", b === btn));
   document.querySelectorAll(".mode-page").forEach((p) => p.classList.toggle("active", p.id === `mode-${mode}`));
   try { localStorage.setItem(MODE_KEY, mode); } catch (_e) { /* storage unavailable */ }
   resizePlotsIn(document.getElementById(`mode-${mode}`));
+  document.getElementById("report-btn").hidden = !(MODES[mode] && MODES[mode].report);
+  refreshUndoButtons();
 }
-
-document.querySelectorAll(".mode-btn").forEach((btn) => {
-  btn.addEventListener("click", () => showMode(btn.dataset.mode));
-});
 
 function showTab(scopeEl, tab) {
   scopeEl.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
@@ -26,15 +35,10 @@ function showTab(scopeEl, tab) {
   scopeEl.dispatchEvent(new CustomEvent("tabshown", { detail: { tab } }));
 }
 
-document.querySelectorAll(".mode-page").forEach((scopeEl) => {
-  scopeEl.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => showTab(scopeEl, btn.dataset.tab));
-  });
-});
-
 // Plotly sizes a chart from its container at draw time; a chart drawn into a
 // hidden tab comes out the wrong size, so re-fit visible charts on show.
 function resizePlotsIn(el) {
+  if (!el) return;
   requestAnimationFrame(() => {
     el.querySelectorAll(".js-plotly-plot").forEach((p) => {
       if (p.offsetParent !== null) Plotly.Plots.resize(p);
@@ -42,10 +46,55 @@ function resizePlotsIn(el) {
   });
 }
 
-try {
-  const saved = localStorage.getItem(MODE_KEY);
-  if (saved) showMode(saved);
-} catch (_e) { /* storage unavailable */ }
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement("script");
+    el.src = src;
+    el.onload = resolve;
+    el.onerror = () => reject(new Error(`Could not load ${src}`));
+    document.body.appendChild(el);
+  });
+}
+
+// Builds the nav and one <section> per mode, then loads the scripts in
+// order (shared ones once, before the first mode that needs them).
+async function bootModes() {
+  const { modes } = await (await fetch("/api/app/modes")).json();
+  const nav = document.getElementById("mode-nav");
+  const main = document.getElementById("modes");
+  const fragments = await Promise.all(modes.map((m) => fetch(`/modes/${m.id}.html`).then((r) => {
+    if (!r.ok) throw new Error(`Missing /modes/${m.id}.html`);
+    return r.text();
+  })));
+  modes.forEach((m, i) => {
+    MODES[m.id] = m;
+    const btn = document.createElement("button");
+    btn.className = "mode-btn";
+    btn.dataset.mode = m.id;
+    btn.textContent = m.label;
+    btn.addEventListener("click", () => showMode(m.id));
+    nav.appendChild(btn);
+    const section = document.createElement("section");
+    section.id = `mode-${m.id}`;
+    section.className = "mode-page";
+    section.innerHTML = fragments[i];
+    section.querySelectorAll(".tab-btn").forEach((tb) => {
+      tb.addEventListener("click", () => showTab(section, tb.dataset.tab));
+    });
+    main.appendChild(section);
+  });
+  let saved = null;
+  try { saved = localStorage.getItem(MODE_KEY); } catch (_e) { /* storage unavailable */ }
+  showMode(MODES[saved] ? saved : modes[0].id);
+  const loaded = new Set();
+  for (const m of modes) {
+    for (const src of [...m.scripts, `${m.id}.js`]) {
+      if (loaded.has(src)) continue;
+      loaded.add(src);
+      await loadScript(`/js/${src}`);
+    }
+  }
+}
 
 // -- Notifications -------------------------------------------------------------------
 function toast(message, kind = "info") {
@@ -78,6 +127,7 @@ function formatDetail(detail, fallback) {
 
 async function apiCall(path, opts) {
   const res = await fetch(path, opts);
+  noteUndoHeader(res);
   if (!res.ok) {
     let detail = res.statusText || `HTTP ${res.status}`;
     try {
@@ -340,10 +390,71 @@ async function previewExport(imgId, path, body) {
   }
 }
 
+// -- Undo / redo -------------------------------------------------------------------------------
+// Every mode response carries X-Undo: "<undo>,<redo>" for that mode
+// (web_app/main.py), so the buttons stay current without extra requests.
+const undoCounts = {};
+
+function noteUndoHeader(res) {
+  const mode = res.headers.get("X-Undo-Mode");
+  const counts = res.headers.get("X-Undo");
+  if (!mode || !counts) return;
+  const [undo, redo] = counts.split(",").map(Number);
+  undoCounts[mode] = { undo, redo };
+  if (mode === currentMode) refreshUndoButtons();
+}
+
+function refreshUndoButtons() {
+  const c = undoCounts[currentMode] || { undo: 0, redo: 0 };
+  const supported = !!(MODES[currentMode] && MODES[currentMode].undo);
+  document.getElementById("undo-btn").disabled = !supported || !c.undo;
+  document.getElementById("redo-btn").disabled = !supported || !c.redo;
+}
+
+async function historyStep(direction) {
+  const mode = currentMode;
+  if (!mode || !MODE_HANDLERS[mode]) return;
+  const c = undoCounts[mode] || {};
+  if (!c[direction]) return;
+  try {
+    const state = await apiPostJson(`/api/history/${mode}/${direction}`, {});
+    await MODE_HANDLERS[mode].refresh(state);
+    toast(direction === "undo" ? "Undone." : "Redone.");
+  } catch (err) {
+    toast(err.message, "error");
+  }
+}
+
+document.getElementById("undo-btn").addEventListener("click", () => historyStep("undo"));
+document.getElementById("redo-btn").addEventListener("click", () => historyStep("redo"));
+
+// ⌘Z / ⇧⌘Z (Ctrl on other systems), except while typing in a field, where
+// the browser's own text undo applies.
+document.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "z" || e.altKey) return;
+  const t = e.target;
+  if (t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName))) return;
+  e.preventDefault();
+  historyStep(e.shiftKey ? "redo" : "undo");
+});
+
+// -- Report ----------------------------------------------------------------------------------
+document.getElementById("report-btn").addEventListener("click", () => {
+  if (currentMode) window.open(`/api/report/${currentMode}`, "_blank");
+});
+
 // -- Session bootstrap + Tier 2 persistence (Export/Import Session JSON) ---------------------
 // Ping once before any mode fires its parallel /state requests, so they all
 // share one session cookie.
 const sessionReady = fetch("/api/session/ping").catch(() => null);
+
+async function refreshAllModes() {
+  await Promise.all(Object.values(MODE_HANDLERS).map((h) => h.refresh()));
+}
+
+function loadedText(loaded) {
+  return loaded && loaded.length ? loaded.join(", ") : "no data";
+}
 
 document.getElementById("session-export-btn").addEventListener("click", () => {
   download("/api/session/export");
@@ -357,12 +468,36 @@ document.getElementById("session-import-input").addEventListener("change", async
   form.append("file", file);
   try {
     const r = await apiCall("/api/session/import", { method: "POST", body: form });
-    toast(`Session imported: ${r.amp_files} amperometry file(s), ${r.solid_files} solid-state file(s), `
-      + `${r.cv_runs} CV run(s)${r.assay_plate ? ", 1 assay plate" : ""}.`, "success");
-    await Promise.all([ssRefresh(), ampRefresh(), cvRefresh(), assayRefresh(undefined, { resetLayout: true })]);
+    toast(`Session imported: ${loadedText(r.loaded)}.`, "success");
+    document.getElementById("restore-banner").hidden = true;
+    await refreshAllModes();
   } catch (err) {
     toast("Import failed: " + err.message, "error");
   }
+});
+
+// -- Autosave restore -------------------------------------------------------------------------
+// The server autosaves the session (web_app/autosave.py); after a restart a
+// fresh page is offered the previous run's work.
+async function offerRestore() {
+  let info;
+  try { info = await apiCall("/api/autosave"); } catch (_e) { return; }
+  if (!info || !info.available) return;
+  document.getElementById("restore-text").textContent =
+    `Restore your previous session from ${info.saved_at} (${loadedText(info.summary)})?`;
+  document.getElementById("restore-banner").hidden = false;
+}
+
+onClick("restore-btn", async () => {
+  const r = await apiPostJson("/api/autosave/restore", {});
+  document.getElementById("restore-banner").hidden = true;
+  await refreshAllModes();
+  toast(`Restored: ${loadedText(r.loaded)}.`, "success");
+});
+
+onClick("restore-discard-btn", async () => {
+  await apiPostJson("/api/autosave/discard", {});
+  document.getElementById("restore-banner").hidden = true;
 });
 
 // -- App lifecycle: heartbeat + Quit -------------------------------------------------------
@@ -373,8 +508,14 @@ setInterval(() => fetch("/api/app/heartbeat", { method: "POST" }).catch(() => {}
 fetch("/api/app/heartbeat", { method: "POST" }).catch(() => {});
 
 document.getElementById("app-quit-btn").addEventListener("click", async () => {
-  if (!confirm("Quit Sensor Calibration Studio?\n\nLoaded data is kept only in memory — use Export session first if you want to keep it.")) return;
+  if (!confirm("Quit Sensor Calibration Studio?\n\nYour work is autosaved and offered back next time; "
+    + "use Export session to keep a copy you can share.")) return;
   try { await fetch("/api/app/quit", { method: "POST" }); } catch (_e) { /* already gone */ }
   document.body.innerHTML = '<div class="quit-screen"><h2>Sensor Calibration Studio has stopped.</h2>'
     + "<p>You can close this tab. Open the app again from your Applications folder.</p></div>";
 });
+
+bootModes()
+  .then(() => sessionReady)
+  .then(offerRestore)
+  .catch((err) => toast(err.message, "error"));

@@ -1,7 +1,7 @@
 """
 Cyclic Voltammetry mode API. CV stays self-contained (inline CSV parsing,
-not core/shared_tabs.py), as modes/cyclic_voltammetry.py itself is; the peak
-finder (find_cv_peaks) is imported from there unmodified.
+not the trace modes' import code), as modes/cyclic_voltammetry.py itself is;
+the peak finder (find_cv_peaks) comes from core/analysis/cv.py.
 
 Import is a single step (no preview-then-load): a browser file upload can't be cheaply re-read the way a local path can, so
 files are parsed with best-guess defaults immediately and usable right away,
@@ -9,9 +9,9 @@ matching the "import now, refine channel assignment after" model the other
 two modes already use — refining channel mapping happens via a follow-up
 endpoint instead of a second upload.
 
-_render_cv_plot_png/_render_sr_plot_png are new matplotlib builders (not
-imports from modes/cyclic_voltammetry.py, whose real closures aren't
-importable), styled with core/plotting.py's shared export presets.
+_render_cv_plot_png/_render_sr_plot_png are matplotlib builders written for
+the web app (the Streamlit app's are closures inside its render()), styled
+with core/plotting.py's shared export presets.
 """
 
 from __future__ import annotations
@@ -28,16 +28,21 @@ import plotly.graph_objects as go
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from core.analysis.cv import find_cv_peaks
 from core.constants import PAL
 from core.numeric import lin_reg, to_num
 from core.parsing import parse_potentiostat_csv
-from core.plotting import _ORIGIN_RC, _MINIMAL_RC, _apply_spine_style
-from modes.cyclic_voltammetry import find_cv_peaks
+from core.plotting import _MINIMAL_RC, _ORIGIN_RC, _apply_spine_style
 from web_app.api.common import ExportFmt, ExportStyle, export_media_type, figure_json, png_response, require_file_index
 from web_app.deps import get_session
+from web_app.history import tracked
+from web_app.modespec import ModeSpec
 from web_app.session import SessionData
 
-router = APIRouter(prefix="/api/cv", tags=["cyclic_voltammetry"])
+router = APIRouter(prefix="/api/cyclic_voltammetry", tags=["cyclic_voltammetry"])
+
+# Session fields an undo step restores (web_app/history.py).
+UNDO_FIELDS = ("cv_runs",)
 
 _DELIM_MAP = {"auto": None, "comma": ",", "tab": "\t", "semicolon": ";", "space": r"\s+"}
 
@@ -166,6 +171,7 @@ def set_units(body: UnitsBody, session: SessionData = Depends(get_session)) -> d
 
 # -- Import ---------------------------------------------------------------------
 @router.post("/files")
+@tracked("cyclic_voltammetry", UNDO_FIELDS)
 async def upload_files(
     files: list[UploadFile] = File(...),
     fmt: str = Form("standard"),
@@ -212,6 +218,7 @@ class ScanRateBody(BaseModel):
 
 
 @router.post("/runs/{index}/scan-rate")
+@tracked("cyclic_voltammetry", UNDO_FIELDS)
 def set_scan_rate(index: int, body: ScanRateBody, session: SessionData = Depends(get_session)) -> dict:
     run = require_file_index(session.cv_runs, index)
     if not (np.isfinite(body.scan_rate) and body.scan_rate > 0):
@@ -222,6 +229,7 @@ def set_scan_rate(index: int, body: ScanRateBody, session: SessionData = Depends
 
 
 @router.delete("/runs/{index}")
+@tracked("cyclic_voltammetry", UNDO_FIELDS)
 def remove_run(index: int, session: SessionData = Depends(get_session)) -> dict:
     require_file_index(session.cv_runs, index)
     session.cv_runs = [r for i, r in enumerate(session.cv_runs) if i != index]
@@ -229,6 +237,7 @@ def remove_run(index: int, session: SessionData = Depends(get_session)) -> dict:
 
 
 @router.delete("/runs")
+@tracked("cyclic_voltammetry", UNDO_FIELDS)
 def clear_runs(session: SessionData = Depends(get_session)) -> dict:
     session.cv_runs = []
     return _state(session)
@@ -239,6 +248,7 @@ class ChannelsBody(BaseModel):
 
 
 @router.post("/runs/{index}/channels")
+@tracked("cyclic_voltammetry", UNDO_FIELDS)
 def set_channels(index: int, body: ChannelsBody, session: SessionData = Depends(get_session)) -> dict:
     run = require_file_index(session.cv_runs, index)
     df = run["df"]
@@ -330,6 +340,7 @@ def get_peaks(session: SessionData = Depends(get_session)) -> dict:
 
 
 @router.post("/peaks/detect")
+@tracked("cyclic_voltammetry", UNDO_FIELDS)
 def detect_peaks(body: PeaksBody, session: SessionData = Depends(get_session)) -> dict:
     if not body.channels:
         raise HTTPException(status_code=400, detail="Select at least one channel.")
@@ -626,3 +637,54 @@ def export_raw(session: SessionData = Depends(get_session)):
             zf.writestr(f"cv_raw_{safe}.csv", r["df"].to_csv(index=False))
     buf.seek(0)
     return png_response(buf.getvalue(), "cv_raw_data.zip", "application/zip")
+
+
+# -- Mode registration -----------------------------------------------------------
+# Bundle keys match core/persistence.py's _build_session_bundle.
+def _export_bundle(session: SessionData) -> dict:
+    return {
+        "volt_unit": session.volt_unit, "cv_cur_unit": session.cv_cur_unit, "cv_sr_unit": session.cv_sr_unit,
+        "cv_runs": [{"scan_rate": r["scan_rate"], "label": r["label"], "filename": r["filename"],
+                     "csv": r["df"].to_csv(index=False), "channels": r["channels"], "peaks": r["peaks"]}
+                    for r in session.cv_runs],
+    }
+
+
+def _apply_bundle(session: SessionData, d: dict) -> None:
+    for key in ("volt_unit", "cv_cur_unit", "cv_sr_unit"):
+        if key in d:
+            setattr(session, key, d[key])
+    if "cv_runs" in d:
+        session.cv_runs = [
+            {"scan_rate": float(r["scan_rate"]), "label": r["label"], "filename": r["filename"],
+             "df": pd.read_csv(io.StringIO(r["csv"])), "channels": r["channels"], "peaks": r.get("peaks", {})}
+            for r in d["cv_runs"]
+        ]
+
+
+def _summary(session: SessionData) -> str | None:
+    n = len(session.cv_runs)
+    return f"{n} CV run{'s' if n != 1 else ''}" if n else None
+
+
+def _report(session: SessionData) -> list:
+    runs = session.cv_runs
+    sections: list = [("table", "Runs", [
+        {"File": r["filename"], "Scan rate": r["label"], "Rows": len(r["df"]),
+         "Channels": ", ".join(c["name"] for c in r["channels"])} for r in runs])]
+    if runs:
+        srs = {r["label"] for r in runs}
+        chs = {c["name"] for r in runs for c in r["channels"]}
+        sections.append(("image", "Cyclic voltammograms",
+                         _render_cv_plot_png(runs, srs, chs, session.volt_unit, session.cv_cur_unit, dpi=150)))
+    peaks = _peak_rows(runs)
+    sections.append(("table", f"Peaks (Ep in {session.volt_unit}, Ip in {session.cv_cur_unit})", peaks) if peaks
+                    else ("note", "Peaks", "No peaks detected yet."))
+    return sections
+
+
+MODE = ModeSpec(
+    id="cyclic_voltammetry", label="Cyclic Voltammetry", router=router, state=_state,
+    export_bundle=_export_bundle, apply_bundle=_apply_bundle, summary=_summary,
+    undo_fields=UNDO_FIELDS, report=_report,
+)

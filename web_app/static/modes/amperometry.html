@@ -1,0 +1,180 @@
+<!-- amperometry mode: loaded into <section id="mode-amperometry"> by js/app.js.
+     Element ids are the contract with js/amperometry.js. -->
+<div class="tabs">
+  <button class="tab-btn active" data-tab="import">① Import</button>
+  <button class="tab-btn" data-tab="windows">② Time Series &amp; Windows</button>
+  <button class="tab-btn" data-tab="results">③ Calibration</button>
+  <button class="tab-btn" data-tab="export">④ Export</button>
+  <button class="tab-btn" data-tab="compare">⑤ Compare Files</button>
+</div>
+
+<!-- ① Import -->
+<div class="tab-page active" data-tab-page="import">
+  <div class="two-col">
+    <div>
+      <div class="row">
+        <label for="amp-file-input" class="button-like primary">Browse files&hellip;</label>
+        <input id="amp-file-input" type="file" multiple accept=".csv,.txt,.tsv,.pssession" hidden />
+        <button id="amp-sample-btn">Load sample data</button>
+      </div>
+      <p class="hint">Two synthetic amperometric runs (2 channels each) with a ready-made calibration table.</p>
+      <div id="amp-dropzone" class="dropzone">Drop CSV / TXT / .pssession files here</div>
+      <fieldset class="group">
+        <legend>Units</legend>
+        <div class="form-grid">
+          <label>Concentration <input id="amp-conc-unit" type="text" size="8" /></label>
+          <label>Current <input id="amp-signal-unit" type="text" size="8" /></label>
+        </div>
+      </fieldset>
+    </div>
+    <div>
+      <div class="row spread">
+        <h3>Loaded files</h3>
+        <button id="amp-clear-btn" class="danger" hidden>Remove all</button>
+      </div>
+      <ul id="amp-files-list" class="files-list"></ul>
+    </div>
+  </div>
+</div>
+
+<!-- ② Time Series & Windows -->
+<div class="tab-page" data-tab-page="windows">
+  <p class="empty-note needs-data">Load data in ① Import first.</p>
+  <div class="windows-layout">
+    <div class="plot-col">
+      <div id="amp-channel-checklist" class="checklist"></div>
+      <div id="amp-plot" class="plot empty"></div>
+    </div>
+    <div class="side-col">
+      <label class="dataset-pick">File being edited <select id="amp-dataset-select"></select></label>
+
+      <details class="collapsible" open>
+        <summary>Calibration windows</summary>
+        <div class="group-body">
+          <p class="hint">Each row averages the trace between t start and t end (or only the last <em>avg last</em> seconds, if set).</p>
+          <div id="amp-cal-table" class="table-scroll"></div>
+          <details class="sub-collapsible">
+            <summary>Auto-detect step times from the trace</summary>
+            <div class="form-grid">
+              <label>Channel <select id="amp-autodetect-channel"></select></label>
+              <label>Sensitivity <input id="amp-autodetect-sensitivity" type="number" value="1.0" step="0.1" min="0.3" max="3.0" /></label>
+              <label>Min. gap (s) <input id="amp-autodetect-mingap" type="number" value="30" min="1" /></label>
+              <label>Expected steps <input id="amp-autodetect-maxsteps" type="number" value="0" min="0" title="0 = keep all" /></label>
+            </div>
+            <label class="inline"><input id="amp-autodetect-baseline" type="checkbox" checked /> Add a leading Baseline row (0 → first step)</label>
+            <div class="row">
+              <button id="amp-autodetect-btn">Detect</button>
+              <button id="amp-autodetect-apply-btn" disabled>Use detected steps (replaces table)</button>
+            </div>
+            <div id="amp-autodetect-result" class="hint"></div>
+          </details>
+        </div>
+      </details>
+
+      <details class="collapsible">
+        <summary>Effective concentration (serial dilution)</summary>
+        <div class="group-body">
+          <p class="hint">Fills Concentration from each row's Spike Vol and Stock Conc, accounting for the growing volume.</p>
+          <div class="form-grid">
+            <label>Initial volume <input id="amp-initial-volume" type="number" step="any" min="0" value="1.0" /></label>
+            <label>Volume unit <input id="amp-vol-unit" type="text" size="6" value="µL" /></label>
+          </div>
+          <button id="amp-effconc-btn">Recalculate concentrations</button>
+        </div>
+      </details>
+
+      <details class="collapsible">
+        <summary>Signal smoothing</summary>
+        <div class="group-body form-grid">
+          <label>Method
+            <select id="amp-smooth-method">
+              <option>None</option>
+              <option>Moving average</option>
+              <option>Savitzky-Golay</option>
+            </select>
+          </label>
+          <label>Window (samples) <input id="amp-smooth-window" type="number" value="11" min="3" step="2" /></label>
+          <label>Polynomial order <input id="amp-smooth-polyorder" type="number" value="2" min="1" max="5" /></label>
+        </div>
+      </details>
+
+      <details class="collapsible">
+        <summary>Channel assignment</summary>
+        <div class="group-body">
+          <div id="amp-channel-assignment"></div>
+          <button id="amp-apply-channels-btn" class="primary">Apply channel assignment</button>
+        </div>
+      </details>
+    </div>
+  </div>
+</div>
+
+<!-- ③ Calibration -->
+<div class="tab-page" data-tab-page="results">
+  <p class="empty-note needs-data">Load data in ① Import first.</p>
+  <fieldset class="group">
+    <legend>Analysis settings</legend>
+    <p class="hint">Channels analysed = the ticked traces in ② Time Series &amp; Windows.</p>
+    <div class="form-grid">
+      <label>Fit type
+        <select id="amp-fit-type">
+          <option>Linear</option>
+          <option>Segmented Linear</option>
+        </select>
+      </label>
+      <label>Segments <input id="amp-n-seg" type="number" value="2" min="2" max="4" disabled /></label>
+      <label class="inline"><input id="amp-show-avg" type="checkbox" /> Add channel-average trace</label>
+    </div>
+  </fieldset>
+  <button id="amp-compute-btn" class="primary">Compute calibration</button>
+  <div id="amp-cal-status" class="status"></div>
+  <div id="amp-cal-plot" class="plot empty"></div>
+  <table id="amp-stats-table" class="stats-table"></table>
+</div>
+
+<!-- ④ Export -->
+<div class="tab-page" data-tab-page="export">
+  <div class="two-col">
+    <div>
+      <fieldset class="group">
+    <legend>Image export options</legend>
+    <div class="form-grid">
+      <label>Format <select id="amp-export-fmt"><option value="png" selected>PNG</option><option value="svg">SVG</option><option value="pdf">PDF</option><option value="tiff">TIFF</option></select></label>
+      <label>DPI <select id="amp-export-dpi"><option>150</option><option selected>300</option><option>600</option></select></label>
+      <label>Style
+        <select id="amp-export-style">
+          <option value="default">Default</option>
+          <option value="origin">Origin</option>
+          <option value="minimal">Minimal</option>
+        </select>
+      </label>
+      <label>Width (in) <input id="amp-export-width" type="number" step="0.1" min="1" placeholder="auto" /></label>
+      <label>Height (in) <input id="amp-export-height" type="number" step="0.1" min="1" placeholder="auto" /></label>
+    </div>
+  </fieldset>
+      <fieldset class="group">
+        <legend>Downloads</legend>
+        <div class="button-grid">
+          <button id="amp-export-curve-btn" class="primary">Calibration curve image</button>
+          <button id="amp-preview-curve-btn">Preview</button>
+          <button id="amp-export-ts-btn" class="primary">Time-series image</button>
+          <button id="amp-preview-ts-btn">Preview</button>
+          <button id="amp-export-csv-btn">Calibration data (CSV)</button>
+        </div>
+        <p class="hint">The calibration curve and CSV need ③ Calibration to have been computed.</p>
+      </fieldset>
+    </div>
+    <div class="preview-box empty" data-message="Click a Preview button to see the exported image here.">
+    <img id="amp-preview-img" alt="Export preview" />
+  </div>
+  </div>
+</div>
+
+<!-- ⑤ Compare Files -->
+<div class="tab-page" data-tab-page="compare">
+  <p class="hint">An independent linear fit per loaded file (first channel only), overlaid on one chart.</p>
+  <button id="amp-compare-btn">Refresh comparison</button>
+  <div id="amp-compare-status" class="status"></div>
+  <div id="amp-compare-plot" class="plot empty"></div>
+  <table id="amp-compare-table" class="stats-table"></table>
+</div>

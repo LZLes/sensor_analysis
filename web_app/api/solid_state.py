@@ -1,11 +1,13 @@
 """
 Solid-State (potentiometric / Nernstian) mode API. Parsing, the Nernstian
-LOD fit and PNG/SVG/PDF export reuse the core/*.py and modes/solid_state.py
-functions the Streamlit app uses, unmodified. Each endpoint mutates the
+LOD fit and PNG/SVG/PDF export use the same core/ functions as the Streamlit
+app (core/analysis/solid_state.py, core/analysis/traces.py). Each endpoint mutates the
 session in place and returns the new state.
 """
 
 from __future__ import annotations
+
+import io
 
 import numpy as np
 import pandas as pd
@@ -13,19 +15,19 @@ import plotly.graph_objects as go
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from core.calibration_table import _default_solid_cpdf
-from core.constants import PAL, fmt
-from core.numeric import _eff_t_start, smooth_signal, to_num
-from core.parsing import parse_with_options
-from core.shared_tabs import _amp_label, render_ts_png
-from core.step_detection import detect_step_edges, edges_to_windows
-from modes.solid_state import (
+from core.analysis.solid_state import (
     _cpdf_from_autodetect_windows,
     _load_solid_sample_data,
     ideal_slope_in_signal_unit,
     nernstian_lod_fit,
     render_solid_cal_png,
 )
+from core.analysis.traces import _amp_label, render_ts_png, window_stats
+from core.calibration_table import _default_solid_cpdf, _solid_cpdf_from_records
+from core.constants import PAL, fmt
+from core.numeric import _eff_t_start, smooth_signal, to_num
+from core.parsing import parse_with_options
+from core.step_detection import detect_step_edges, edges_to_windows
 from web_app.api.common import (
     ExportFmt,
     ExportStyle,
@@ -39,9 +41,14 @@ from web_app.api.common import (
     require_file_index,
 )
 from web_app.deps import get_session
+from web_app.history import tracked
+from web_app.modespec import ModeSpec
 from web_app.session import SessionData
 
 router = APIRouter(prefix="/api/solid_state", tags=["solid_state"])
+
+# Session fields an undo step restores (web_app/history.py).
+UNDO_FIELDS = ("solid_files", "solid_cal_results")
 
 _FILES_KEY = "solid_files"
 _CPDF_COLUMNS = ["Label", "Concentration", "t_start", "t_end", "avg_duration", "Reading_mV"]
@@ -88,6 +95,7 @@ def get_state(session: SessionData = Depends(get_session)) -> dict:
 
 # -- Import ---------------------------------------------------------------------
 @router.post("/files")
+@tracked("solid_state", UNDO_FIELDS)
 async def upload_files(files: list[UploadFile] = File(...), session: SessionData = Depends(get_session)) -> dict:
     existing = list(session.solid_files)
     by_name = {f["filename"]: f for f in existing}
@@ -117,6 +125,7 @@ async def upload_files(files: list[UploadFile] = File(...), session: SessionData
 
 
 @router.delete("/files/{index}")
+@tracked("solid_state", UNDO_FIELDS)
 def remove_file(index: int, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.solid_files, index)
     session.solid_files = [f for i, f in enumerate(session.solid_files) if i != index]
@@ -126,6 +135,7 @@ def remove_file(index: int, session: SessionData = Depends(get_session)) -> dict
 
 
 @router.delete("/files")
+@tracked("solid_state", UNDO_FIELDS)
 def clear_files(session: SessionData = Depends(get_session)) -> dict:
     session.solid_files = []
     session.ts_ui.pop(_FILES_KEY, None)
@@ -135,6 +145,7 @@ def clear_files(session: SessionData = Depends(get_session)) -> dict:
 
 
 @router.post("/files/sample")
+@tracked("solid_state", UNDO_FIELDS)
 def load_sample(session: SessionData = Depends(get_session)) -> dict:
     sample_files = _load_solid_sample_data()
     if sample_files is None:
@@ -165,6 +176,7 @@ class ChannelsBody(BaseModel):
 
 
 @router.post("/files/{index}/channels")
+@tracked("solid_state", UNDO_FIELDS)
 def set_channels(index: int, body: ChannelsBody, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.solid_files, index)
     if not body.channels:
@@ -184,6 +196,7 @@ class TableBody(BaseModel):
 
 
 @router.post("/files/{index}/table")
+@tracked("solid_state", UNDO_FIELDS)
 def set_table(index: int, body: TableBody, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.solid_files, index)
     session.solid_files[index] = {**frec, "cpdf": records_to_df(body.rows, _CPDF_COLUMNS, bool_cols=())}
@@ -220,6 +233,7 @@ class AutodetectApplyBody(BaseModel):
 
 
 @router.post("/files/{index}/autodetect/apply")
+@tracked("solid_state", UNDO_FIELDS)
 def autodetect_apply(index: int, body: AutodetectApplyBody, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.solid_files, index)
     edges = session.ts_ui.get(_FILES_KEY, {}).get("autodetect_edges", {}).get(frec["filename"], [])
@@ -349,19 +363,7 @@ def compute(body: ComputeBody, session: SessionData = Depends(get_session)) -> d
         t_arr = to_num(frec["df"][ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
         e_arr = to_num(frec["df"][ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
 
-        readings = []
-        for _, row in cpdf.iterrows():
-            if pd.notna(row.get("Reading_mV")):
-                readings.append(float(row["Reading_mV"]))
-                continue
-            ets = _eff_t_start(row)
-            if ets is None or pd.isna(row.get("t_end")):
-                readings.append(np.nan)
-                continue
-            mask = (t_arr >= ets) & (t_arr <= row["t_end"])
-            pts = e_arr[mask]
-            pts = pts[~np.isnan(pts)]
-            readings.append(float(np.mean(pts)) if pts.size > 0 else np.nan)
+        readings, _ = window_stats(t_arr, e_arr, cpdf, override_col="Reading_mV")
 
         log_conc = np.log10(cpdf["Concentration"].astype(float).to_numpy())
         potential = np.array(readings, dtype=float)
@@ -544,19 +546,7 @@ def _compute_file_fit(frec: dict, session: SessionData) -> dict | None:
     t_arr = to_num(df[ch["tc"]]).to_numpy(dtype=float, na_value=np.nan)
     e_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
 
-    readings = []
-    for _, row in cpdf.iterrows():
-        if pd.notna(row.get("Reading_mV")):
-            readings.append(float(row["Reading_mV"]))
-            continue
-        ets = _eff_t_start(row)
-        if ets is None or pd.isna(row.get("t_end")):
-            readings.append(np.nan)
-            continue
-        mask = (t_arr >= ets) & (t_arr <= row["t_end"])
-        pts = e_arr[mask]
-        pts = pts[~np.isnan(pts)]
-        readings.append(float(np.mean(pts)) if pts.size > 0 else np.nan)
+    readings, _ = window_stats(t_arr, e_arr, cpdf, override_col="Reading_mV")
 
     log_conc = np.log10(cpdf["Concentration"].astype(float).to_numpy())
     potential = np.array(readings, dtype=float)
@@ -605,3 +595,55 @@ def comparison(session: SessionData = Depends(get_session)) -> dict:
         hovermode="closest", height=480, template="plotly_white",
     )
     return {"figure": figure_json(fig) if stat_rows else None, "stats": stat_rows}
+
+
+# -- Mode registration -----------------------------------------------------------
+# Bundle keys match core/persistence.py's _build_session_bundle.
+def _export_bundle(session: SessionData) -> dict:
+    return {
+        "solid_conc_unit": session.solid_conc_unit, "solid_unit": session.solid_unit,
+        "solid_files": [{"filename": f["filename"], "csv": f["df"].to_csv(index=False), "channels": f["channels"],
+                         "cpdf": f["cpdf"].to_dict(orient="records")} for f in session.solid_files],
+    }
+
+
+def _apply_bundle(session: SessionData, d: dict) -> None:
+    for key in ("solid_conc_unit", "solid_unit"):
+        if key in d:
+            setattr(session, key, d[key])
+    if "solid_files" in d:
+        session.solid_files = [
+            {"filename": f["filename"], "df": pd.read_csv(io.StringIO(f["csv"])),
+             "channels": f["channels"], "cpdf": _solid_cpdf_from_records(f.get("cpdf"))}
+            for f in d["solid_files"]
+        ]
+    session.solid_cal_results = None  # stale: the user re-runs Compute explicitly
+
+
+def _summary(session: SessionData) -> str | None:
+    n = len(session.solid_files)
+    return f"{n} solid-state file{'s' if n != 1 else ''}" if n else None
+
+
+def _report(session: SessionData) -> list:
+    sections: list = [("table", "Files", [
+        {"File": f["filename"], "Rows": len(f["df"]), "Channels": ", ".join(c["name"] for c in f["channels"])}
+        for f in session.solid_files])]
+    for f in session.solid_files:
+        sections.append(("table", f"{f['filename']} — calibration table", df_records(f["cpdf"])))
+    cr = session.solid_cal_results
+    if not cr:
+        sections.append(("note", "Calibration", "Not computed yet — run ③ Calibration first."))
+        return sections
+    sections.append(("image", "Calibration curve", render_solid_cal_png(cr["results"], session.solid_conc_unit,
+                                                                        session.solid_unit, dpi=150)))
+    _, stat_rows = _render_calibration_curve(cr["results"], session)
+    sections.append(("table", "Sensor statistics", stat_rows))
+    return sections
+
+
+MODE = ModeSpec(
+    id="solid_state", label="Solid-State", router=router, state=_state,
+    export_bundle=_export_bundle, apply_bundle=_apply_bundle, summary=_summary,
+    undo_fields=UNDO_FIELDS, scripts=("trace_mode.js",), report=_report,
+)

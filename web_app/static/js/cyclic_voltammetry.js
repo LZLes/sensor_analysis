@@ -2,7 +2,7 @@
 // runs are keyed by scan rate, and peak detection plays the role the
 // calibration windows play in the other two modes.
 
-const CV_API = "/api/cv";
+const CV_API = "/api/cyclic_voltammetry";
 
 let cvState = null;
 let cvChannelsDraft = [];
@@ -271,4 +271,5 @@ document.getElementById("cv-export-sr-csv-btn").addEventListener("click", () => 
 });
 document.getElementById("cv-export-raw-btn").addEventListener("click", () => download(`${CV_API}/export/raw`));
 
+registerMode("cyclic_voltammetry", { refresh: cvRefresh });
 sessionReady.then(() => cvRefresh()).catch((err) => toast(err.message, "error"));

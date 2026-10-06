@@ -1,7 +1,7 @@
 """
 Amperometry mode API. Parsing, fitting (piecewise_fit), autodetect and
-PNG/SVG/PDF export reuse the core/*.py and modes/amperometry.py functions
-the Streamlit app uses, unmodified.
+PNG/SVG/PDF export use the same core/ functions as the Streamlit app
+(core/analysis/amperometry.py, core/analysis/traces.py).
 
 Differs from solid_state.py by: baseline subtraction, segmented-linear
 fits, the channel-average trace, and the effective-concentration
@@ -11,25 +11,27 @@ docstring on what sets it apart from Solid-State.
 
 from __future__ import annotations
 
+import io
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from core.calibration_table import _baseline_keep_mask, _default_cpdf
-from core.constants import AVG_COLOR, PAL, fmt
-from core.numeric import _eff_t_start, smooth_signal, to_num
-from core.parsing import parse_with_options
-from core.shared_tabs import _amp_label, render_ts_png
-from core.step_detection import detect_step_edges, edges_to_windows
-from modes.amperometry import (
+from core.analysis.amperometry import (
     _apply_effective_concentration,
     _cpdf_from_autodetect_windows,
     _load_sample_data,
     piecewise_fit,
     render_cal_png,
 )
+from core.analysis.traces import _amp_label, render_ts_png, window_stats
+from core.calibration_table import _baseline_keep_mask, _cpdf_from_records, _default_cpdf
+from core.constants import AVG_COLOR, PAL, fmt
+from core.numeric import _eff_t_start, smooth_signal, to_num
+from core.parsing import parse_with_options
+from core.step_detection import detect_step_edges, edges_to_windows
 from web_app.api.common import (
     ExportFmt,
     ExportStyle,
@@ -43,9 +45,14 @@ from web_app.api.common import (
     require_file_index,
 )
 from web_app.deps import get_session
+from web_app.history import tracked
+from web_app.modespec import ModeSpec
 from web_app.session import SessionData
 
 router = APIRouter(prefix="/api/amperometry", tags=["amperometry"])
+
+# Session fields an undo step restores (web_app/history.py).
+UNDO_FIELDS = ("amp_files", "cal_results")
 
 _FILES_KEY = "amp_files"
 _CPDF_COLUMNS = ["Label", "Concentration", "Spike Vol", "Stock Conc", "t_start", "t_end", "avg_duration", "Baseline"]
@@ -89,6 +96,7 @@ def get_state(session: SessionData = Depends(get_session)) -> dict:
 # -- Import ---------------------------------------------------------------------
 
 @router.post("/files")
+@tracked("amperometry", UNDO_FIELDS)
 async def upload_files(files: list[UploadFile] = File(...), session: SessionData = Depends(get_session)) -> dict:
     existing = list(session.amp_files)
     by_name = {f["filename"]: f for f in existing}
@@ -118,6 +126,7 @@ async def upload_files(files: list[UploadFile] = File(...), session: SessionData
 
 
 @router.delete("/files/{index}")
+@tracked("amperometry", UNDO_FIELDS)
 def remove_file(index: int, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.amp_files, index)
     session.amp_files = [f for i, f in enumerate(session.amp_files) if i != index]
@@ -127,6 +136,7 @@ def remove_file(index: int, session: SessionData = Depends(get_session)) -> dict
 
 
 @router.delete("/files")
+@tracked("amperometry", UNDO_FIELDS)
 def clear_files(session: SessionData = Depends(get_session)) -> dict:
     session.amp_files = []
     session.ts_ui.pop(_FILES_KEY, None)
@@ -135,6 +145,7 @@ def clear_files(session: SessionData = Depends(get_session)) -> dict:
 
 
 @router.post("/files/sample")
+@tracked("amperometry", UNDO_FIELDS)
 def load_sample(session: SessionData = Depends(get_session)) -> dict:
     sample_files = _load_sample_data()
     if sample_files is None:
@@ -165,6 +176,7 @@ class ChannelsBody(BaseModel):
 
 
 @router.post("/files/{index}/channels")
+@tracked("amperometry", UNDO_FIELDS)
 def set_channels(index: int, body: ChannelsBody, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.amp_files, index)
     if not body.channels:
@@ -184,6 +196,7 @@ class TableBody(BaseModel):
 
 
 @router.post("/files/{index}/table")
+@tracked("amperometry", UNDO_FIELDS)
 def set_table(index: int, body: TableBody, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.amp_files, index)
     session.amp_files[index] = {**frec, "cpdf": records_to_df(body.rows, _CPDF_COLUMNS, bool_cols=("Baseline",))}
@@ -197,6 +210,7 @@ class EffConcBody(BaseModel):
 
 
 @router.post("/files/{index}/effective-concentration")
+@tracked("amperometry", UNDO_FIELDS)
 def apply_effective_concentration(index: int, body: EffConcBody, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.amp_files, index)
     session.initial_volume = body.initial_volume
@@ -237,6 +251,7 @@ class AutodetectApplyBody(BaseModel):
 
 
 @router.post("/files/{index}/autodetect/apply")
+@tracked("amperometry", UNDO_FIELDS)
 def autodetect_apply(index: int, body: AutodetectApplyBody, session: SessionData = Depends(get_session)) -> dict:
     frec = require_file_index(session.amp_files, index)
     edges = session.ts_ui.get(_FILES_KEY, {}).get("autodetect_edges", {}).get(frec["filename"], [])
@@ -367,18 +382,7 @@ def compute(body: ComputeBody, session: SessionData = Depends(get_session)) -> d
         i_arr = to_num(frec["df"][ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
         i_arr = smooth_signal(i_arr, session.smooth_method, session.smooth_window, session.smooth_polyorder)
 
-        avgs, sigs = [], []
-        for _, row in cpdf.iterrows():
-            ets = _eff_t_start(row)
-            if ets is None:
-                avgs.append(np.nan)
-                sigs.append(np.nan)
-                continue
-            mask = (t_arr >= ets) & (t_arr <= row["t_end"])
-            pts = i_arr[mask]
-            pts = pts[~np.isnan(pts)]
-            avgs.append(float(np.mean(pts)) if pts.size > 0 else np.nan)
-            sigs.append(float(np.std(pts, ddof=1)) if pts.size >= 2 else np.nan)
+        avgs, sigs = window_stats(t_arr, i_arr, cpdf)
 
         base_val = avgs[base_idx]
         sigma_bl = sigs[base_idx]
@@ -554,16 +558,7 @@ def _compute_file_fit(frec: dict, session: SessionData) -> dict | None:
     i_arr = to_num(df[ch["ic"]]).to_numpy(dtype=float, na_value=np.nan)
     i_arr = smooth_signal(i_arr, session.smooth_method, session.smooth_window, session.smooth_polyorder)
 
-    avgs = []
-    for _, row in cpdf.iterrows():
-        ets = _eff_t_start(row)
-        if ets is None:
-            avgs.append(np.nan)
-            continue
-        mask = (t_arr >= ets) & (t_arr <= row["t_end"])
-        pts = i_arr[mask]
-        pts = pts[~np.isnan(pts)]
-        avgs.append(float(np.mean(pts)) if pts.size > 0 else np.nan)
+    avgs, _ = window_stats(t_arr, i_arr, cpdf)
 
     base_val = avgs[base_idx]
     if np.isnan(base_val):
@@ -611,3 +606,61 @@ def comparison(session: SessionData = Depends(get_session)) -> dict:
         hovermode="closest", height=480, template="plotly_white",
     )
     return {"figure": figure_json(fig) if stat_rows else None, "stats": stat_rows}
+
+
+# -- Mode registration -----------------------------------------------------------
+# Bundle keys match core/persistence.py's _build_session_bundle.
+def _export_bundle(session: SessionData) -> dict:
+    return {
+        "conc_unit": session.conc_unit, "cur_unit": session.cur_unit, "vol_unit": session.vol_unit,
+        "initial_volume": session.initial_volume,
+        "amp_files": [{"filename": f["filename"], "csv": f["df"].to_csv(index=False), "channels": f["channels"],
+                       "cpdf": f["cpdf"].to_dict(orient="records")} for f in session.amp_files],
+    }
+
+
+def _apply_bundle(session: SessionData, d: dict) -> None:
+    for key in ("conc_unit", "cur_unit", "vol_unit"):
+        if key in d:
+            setattr(session, key, d[key])
+    if "initial_volume" in d:
+        session.initial_volume = float(d["initial_volume"])
+    if "amp_files" in d:
+        session.amp_files = [
+            {"filename": f["filename"], "df": pd.read_csv(io.StringIO(f["csv"])),
+             "channels": f["channels"], "cpdf": _cpdf_from_records(f.get("cpdf"))}
+            for f in d["amp_files"]
+        ]
+    session.cal_results = None  # stale: the user re-runs Compute explicitly
+
+
+def _summary(session: SessionData) -> str | None:
+    n = len(session.amp_files)
+    return f"{n} amperometry file{'s' if n != 1 else ''}" if n else None
+
+
+def _report(session: SessionData) -> list:
+    sections: list = [("table", "Files", [
+        {"File": f["filename"], "Rows": len(f["df"]), "Channels": ", ".join(c["name"] for c in f["channels"])}
+        for f in session.amp_files])]
+    for f in session.amp_files:
+        sections.append(("table", f"{f['filename']} — calibration table", df_records(f["cpdf"])))
+    cr = session.cal_results
+    if not cr:
+        sections.append(("note", "Calibration", "Not computed yet — run ③ Calibration first."))
+        return sections
+    sections.append(("kv", "Settings", {"Fit": cr["fit_type"] + (f" ({cr['n_seg']} segments)" if cr["fit_type"] == "Segmented Linear" else ""),
+                                         "Units": f"{session.cur_unit} vs {session.conc_unit}",
+                                         "Smoothing": session.smooth_method}))
+    sections.append(("image", "Calibration curve", render_cal_png(cr["results"], cr["fit_type"], int(cr["n_seg"]),
+                                                                  session.conc_unit, session.cur_unit, dpi=150)))
+    _, stat_rows = _render_calibration_curve(cr["results"], cr["fit_type"], int(cr["n_seg"]), session)
+    sections.append(("table", "Sensor statistics", stat_rows))
+    return sections
+
+
+MODE = ModeSpec(
+    id="amperometry", label="Amperometry", router=router, state=_state,
+    export_bundle=_export_bundle, apply_bundle=_apply_bundle, summary=_summary,
+    undo_fields=UNDO_FIELDS, scripts=("trace_mode.js",), report=_report,
+)

@@ -2,9 +2,8 @@
 Entry point for the local (localhost) web app.
 
 Run from the repo root with:  python -m web_app.main
-(Requires requirements-web.txt installed, in addition to requirements.txt
-since core/ and modes/*.py are imported directly — the fit math, parsers and
-export builders are reused rather than duplicated.)
+(Requires requirements-web.txt. The fit maths, parsers and export builders
+come from core/, shared with the Streamlit app; Streamlit itself isn't needed.)
 
 Starts a Uvicorn server bound to localhost only and opens the default
 browser to it. No auth — this is a single-user local tool, not a hosted
@@ -19,10 +18,15 @@ Environment variables:
   WEB_APP_NO_BROWSER=1          don't open a browser tab automatically
   WEB_APP_IDLE_SHUTDOWN_MIN=15  exit after this many minutes with no open tab
                                 (set by the macOS launcher; off by default)
+  SCS_DATA_DIR=/path            where state, autosaves and templates live
+                                (default: see web_app/storage.py)
+
+The modes it serves come from web_app/registry.py; nothing here names one.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -32,6 +36,7 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
+from contextlib import asynccontextmanager
 
 import plotly.offline as pyo
 import uvicorn
@@ -39,20 +44,37 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from web_app.api import amperometry, assay, cyclic_voltammetry, session, solid_state
+from web_app import autosave, history, storage
+from web_app.api import session, shell
+from web_app.registry import MODES, get_mode
+from web_app.session import SESSION_COOKIE_NAME, store
 
 APP_ID = "sensor-calibration-studio"
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
-if sys.platform == "darwin":
-    STATE_DIR = os.path.expanduser("~/Library/Application Support/Sensor Calibration Studio")
-else:
-    STATE_DIR = os.path.expanduser("~/.sensor-calibration-studio")
-STATE_FILE = os.path.join(STATE_DIR, "server.json")
 
-app = FastAPI(title="Sensor Calibration Studio (local)")
+
+def _state_file() -> str:
+    return str(storage.data_dir() / "server.json")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    autosave.rotate()
+    task = asyncio.create_task(autosave.run_forever())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            autosave.save_now()
+        except Exception as exc:  # noqa: BLE001
+            print(f"Final autosave failed: {exc!r}", flush=True)
+
+
+app = FastAPI(title="Sensor Calibration Studio (local)", lifespan=_lifespan)
 
 # Binding to 127.0.0.1 keeps other machines out, but not other *websites*
 # open in the same browser. Two checks close that gap:
@@ -77,14 +99,40 @@ async def _local_only(request: Request, call_next):
     return await call_next(request)
 
 
+# Mode-scoped requests: /api/<mode>/… and /api/history/<mode>/…
+_MODE_IDS = {m.id for m in MODES}
+
+
+@app.middleware("http")
+async def _undo_and_autosave(request: Request, call_next):
+    """Tags mode responses with that mode's undo/redo counts (X-Undo:
+    "<undo>,<redo>"), and marks the session changed for autosave after any
+    successful state-changing request."""
+    response = await call_next(request)
+    parts = request.url.path.split("/")
+    if len(parts) < 3 or parts[1] != "api":
+        return response
+    mode_id = parts[3] if parts[2] == "history" and len(parts) > 3 else parts[2]
+    sess = store.peek(request.cookies.get(SESSION_COOKIE_NAME))
+    if sess is None:
+        return response
+    if mode_id in _MODE_IDS and get_mode(mode_id).undo_fields:
+        undo, redo = history.counts(sess, mode_id)
+        response.headers["X-Undo"] = f"{undo},{redo}"
+        response.headers["X-Undo-Mode"] = mode_id
+    changed = mode_id in _MODE_IDS or request.url.path in ("/api/session/import", "/api/autosave/restore")
+    if changed and request.method not in _SAFE_METHODS and response.status_code < 400:
+        autosave.mark_dirty(sess)
+    return response
+
+
 # Routers are registered before the catch-all static mount below —
 # Starlette matches routes in registration order, so /api/* always resolves
 # to these handlers rather than falling through to StaticFiles.
-app.include_router(solid_state.router)
-app.include_router(amperometry.router)
-app.include_router(cyclic_voltammetry.router)
-app.include_router(assay.router)
+for _mode in MODES:
+    app.include_router(_mode.router)
 app.include_router(session.router)
+app.include_router(shell.router)
 
 _server: uvicorn.Server | None = None
 _last_heartbeat = time.monotonic()
@@ -107,6 +155,10 @@ def heartbeat() -> dict:
 def quit_app() -> dict:
     """The page's Quit button — there's no terminal to Ctrl-C when the
     server was started from the macOS app."""
+    try:
+        autosave.save_now()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Autosave on quit failed: {exc!r}", flush=True)
     if _server is not None:
         threading.Timer(0.3, lambda: setattr(_server, "should_exit", True)).start()
     return {"ok": True}
@@ -149,7 +201,7 @@ def _pick_port(preferred: int, attempts: int = 20) -> int:
 def _running_instance_url() -> str | None:
     """URL of an already-running instance of this app, if there is one."""
     try:
-        with open(STATE_FILE, encoding="utf-8") as fh:
+        with open(_state_file(), encoding="utf-8") as fh:
             port = int(json.load(fh)["port"])
         url = f"http://{HOST}:{port}"
         with urllib.request.urlopen(f"{url}/api/app/info", timeout=1.5) as resp:
@@ -161,17 +213,16 @@ def _running_instance_url() -> str | None:
 
 
 def _write_state(port: int) -> None:
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as fh:
+    with open(_state_file(), "w", encoding="utf-8") as fh:
         json.dump({"port": port, "pid": os.getpid()}, fh)
 
 
 def _clear_state() -> None:
     try:
-        with open(STATE_FILE, encoding="utf-8") as fh:
+        with open(_state_file(), encoding="utf-8") as fh:
             if json.load(fh).get("pid") != os.getpid():
                 return  # another instance owns it now
-        os.remove(STATE_FILE)
+        os.remove(_state_file())
     except Exception:  # noqa: BLE001
         pass
 

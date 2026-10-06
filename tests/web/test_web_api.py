@@ -1,6 +1,5 @@
 """HTTP-level tests for the local web app (web_app/), driven through
 FastAPI's TestClient against the real core/ and modes/ code."""
-import io
 import os
 import json
 
@@ -91,27 +90,27 @@ def _cv_csv(scale=1.0):
 
 def test_cv_reupload_replaces_and_averaged_channel_survives_reassignment(client):
     files = [("files", ("run_50.csv", _cv_csv(), "text/csv"))]
-    _ok(client.post("/api/cv/files", files=files))
-    state = _ok(client.post("/api/cv/files", files=files))
+    _ok(client.post("/api/cyclic_voltammetry/files", files=files))
+    state = _ok(client.post("/api/cyclic_voltammetry/files", files=files))
     assert len(state["runs"]) == 1  # re-upload replaces, doesn't duplicate
 
-    state = _ok(client.post("/api/cv/runs/0/channels",
+    state = _ok(client.post("/api/cyclic_voltammetry/runs/0/channels",
                             json={"channels": [{"name": "avg", "vc": "V", "ic_cols": ["I1", "I2"]}]}))
-    cols = _ok(client.get("/api/cv/runs/0/columns"))
+    cols = _ok(client.get("/api/cyclic_voltammetry/runs/0/columns"))
     assert cols["channels"][0]["ic_cols"] == ["I1", "I2"]
     assert not any(c.startswith("__avg_") for c in cols["columns"])
     # re-applying the mapping as shown must keep the averaged channel
-    again = _ok(client.post("/api/cv/runs/0/channels", json={"channels": cols["channels"]}))
+    again = _ok(client.post("/api/cyclic_voltammetry/runs/0/channels", json={"channels": cols["channels"]}))
     assert [c["name"] for c in again["runs"][0]["channels"]] == ["avg"]
 
 
 def test_cv_scan_rate_edit_resorts_and_unit_relabels(client):
-    _ok(client.post("/api/cv/files", files=[("files", ("a_10.csv", _cv_csv(), "text/csv")),
+    _ok(client.post("/api/cyclic_voltammetry/files", files=[("files", ("a_10.csv", _cv_csv(), "text/csv")),
                                             ("files", ("b_100.csv", _cv_csv(2), "text/csv"))]))
-    state = _ok(client.post("/api/cv/runs/0/scan-rate", json={"scan_rate": 500}))
+    state = _ok(client.post("/api/cyclic_voltammetry/runs/0/scan-rate", json={"scan_rate": 500}))
     assert [r["scan_rate"] for r in state["runs"]] == [100, 500]
-    assert client.post("/api/cv/runs/0/scan-rate", json={"scan_rate": -1}).status_code == 400
-    state = _ok(client.post("/api/cv/units", json={"sr_unit": "V/s"}))
+    assert client.post("/api/cyclic_voltammetry/runs/0/scan-rate", json={"scan_rate": -1}).status_code == 400
+    state = _ok(client.post("/api/cyclic_voltammetry/units", json={"sr_unit": "V/s"}))
     assert state["scan_rate_labels"] == ["100 V/s", "500 V/s"]
 
 
@@ -203,7 +202,7 @@ def test_malformed_session_import_leaves_session_untouched(client):
 
 def test_streamlit_bundle_assay_result_with_nan_renders(client):
     """Streamlit exports assay_std_res arrays with NaN (not null) — must still work."""
-    from modes.assay import parse_plate_csv
+    from core.analysis.assay import parse_plate_csv
     from web_app.api.assay import SAMPLE_PLATE, compute_standard_curve
     from web_app.session import default_assay_std_df
     plate = parse_plate_csv(open(SAMPLE_PLATE).read())
@@ -250,7 +249,7 @@ def test_assay_assign_layout_summary_and_normalise(client):
     d = {w["well"]: w for w in st["wells"]}
     assert (d["D3"]["subject"], d["D3"]["timepoint"]) == ("S1", "post")
     # Bad requests are 400s; a bad preview is a message, not an error
-    assert client.post("/api/assay/assign/blank", json={"wells": ["H1", "H2", "H3", "H4"]}).status_code == 400
+    assert client.post("/api/assay/assign/blank", json={"wells": [f"H{c}" for c in range(1, 13)] + ["G1"]}).status_code == 400
     assert client.post("/api/assay/assign/samples", json={"wells": ["Z9"], "subjects": "x"}).status_code == 400
     assert _ok(client.post("/api/assay/assign/standards", json={**body, "concs_text": "1 2", "preview": True}))["error"]
 
